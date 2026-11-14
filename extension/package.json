@@ -1,0 +1,81 @@
+{
+  "name": "rursor-ai",
+  "displayName": "Rursor AI",
+  "description": "Built-in AI editing, codebase context, and Gemini-powered agent runtime for Rursor.",
+  "publisher": "rursor",
+  "version": "0.1.0",
+  "engines": {
+    "vscode": "^1.95.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "rursor-sidebar",
+          "title": "Rursor AI",
+          "icon": "$(sparkle)"
+        }
+      ]
+    },
+    "views": {
+      "rursor-sidebar": [
+        {
+          "type": "webview",
+          "id": "rursor.agentView",
+          "name": "Agent"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "rursor.setApiKey",
+        "title": "Rursor: Set Gemini API Key"
+      },
+      {
+        "command": "rursor.status",
+        "title": "Rursor: Show Sidecar Status"
+      },
+      {
+        "command": "rursor.reindex",
+        "title": "Rursor: Reindex Workspace"
+      },
+      {
+        "command": "rursor.inlineEdit",
+        "title": "Rursor: Inline Edit"
+      },
+      {
+        "command": "rursor.openAgent",
+        "title": "Rursor: Open Agent Panel"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "rursor.inlineEdit",
+        "key": "cmd+k",
+        "mac": "cmd+k",
+        "when": "editorTextFocus"
+      },
+      {
+        "command": "rursor.openAgent",
+        "key": "cmd+l",
+        "mac": "cmd+l"
+      }
+    ]
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/vscode": "^1.95.0",
+    "typescript": "^5.6.0"
+  }
+}

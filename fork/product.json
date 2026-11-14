@@ -1,0 +1,24 @@
+{
+  "nameShort": "Rursor",
+  "nameLong": "Rursor",
+  "applicationName": "rursor",
+  "dataFolderName": ".rursor",
+  "win32MutexName": "rursor",
+  "licenseName": "MIT",
+  "licenseUrl": "https://github.com/microsoft/vscode/blob/main/LICENSE.txt",
+  "serverApplicationName": "rursor-server",
+  "serverDataFolderName": ".rursor-server",
+  "darwinBundleIdentifier": "com.rursor.editor",
+  "urlProtocol": "rursor",
+  "extensionsGallery": {
+    "serviceUrl": "https://open-vsx.org/vscode/gallery",
+    "itemUrl": "https://open-vsx.org/vscode/item",
+    "resourceUrlTemplate": "https://open-vsx.org/vscode/unpkg/{publisher}/{name}/{version}/{path}",
+    "controlUrl": ""
+  },
+  "extensionEnabledApiProposals": {
+    "rursor.rursor-ai": [
+      "inlineCompletionsAdditions"
+    ]
+  }
+}

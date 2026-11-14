@@ -1,0 +1,7 @@
+sidecar/target/
+extension/node_modules/
+extension/out/
+extension/bin/
+fork/.vscode-src/
+fork/VSCode-darwin-arm64/
+.DS_Store
