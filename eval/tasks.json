@@ -190,6 +190,36 @@
       "description": "Measure APFS Copy-on-Write (`cp -c -R`) clone -> isolated mutation -> diff -> destroy round-trip."
     },
     {
+      "id": "swarm_dag_wave_planner",
+      "category": "omni_swarm",
+      "kind": "swarm_wave_check",
+      "description": "Verify topological diamond DAG wave scheduler (`plan_swarm_waves`) computes 3 parallel execution waves."
+    },
+    {
+      "id": "media_pptx_deck_generation",
+      "category": "omni_media",
+      "kind": "pptx_deck_check",
+      "description": "Generate native OpenXML PowerPoint `.pptx` + interactive `.deck.html` slide deck and verify ZIP archive integrity."
+    },
+    {
+      "id": "media_mp4_video_generation",
+      "category": "omni_media",
+      "kind": "mp4_video_check",
+      "description": "Render programmatic `.mp4` explainer video via Rust frame rasterizer + ffmpeg and verify ISO BMFF `ftyp` header."
+    },
+    {
+      "id": "media_xlsx_docx_generation",
+      "category": "omni_media",
+      "kind": "xlsx_docx_check",
+      "description": "Generate native `.xlsx` spreadsheet with `=SUM(...)` formula + `.docx` specification document."
+    },
+    {
+      "id": "docs_crawler_and_mcp_catalog",
+      "category": "omni_research",
+      "kind": "docs_and_mcp_check",
+      "description": "Index documentation pages into persistent SQLite FTS5+vector `@docs` store (`Recall@1`) and verify 1-Click MCP catalog."
+    },
+    {
       "id": "live_gemini_inline_edit_clamp",
       "category": "live_gemini",
       "kind": "live_inline_edit",

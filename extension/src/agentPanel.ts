@@ -600,7 +600,7 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
       const requestedSource = docsMatch[1]?.trim() || undefined;
       try {
         const docsRes = await this.client.request<{
-          chunks: Array<{
+          hits: Array<{
             sourceName: string;
             url: string;
             title: string;
@@ -609,10 +609,10 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
           }>;
         }>('search_docs', {
           query: prompt.replace(/@docs(?::[a-zA-Z0-9_-]+)?/gi, '').trim() || prompt,
-          sourceName: requestedSource,
+          source: requestedSource,
           limit: 5,
         }).promise;
-        const hits = docsRes.chunks ?? [];
+        const hits = docsRes.hits ?? [];
         if (hits.length > 0) {
           const formattedDocs = hits
             .map(

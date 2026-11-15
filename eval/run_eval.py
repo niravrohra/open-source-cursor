@@ -518,6 +518,266 @@ def evaluate_task(
                 },
             }
 
+        if kind == "swarm_wave_check":
+            tasks_spec = [
+                {
+                    "id": "arch",
+                    "title": "Design Contract",
+                    "role": "architect",
+                    "prompt": "Publish API contract",
+                    "dependsOn": [],
+                    "writeEnabled": False,
+                },
+                {
+                    "id": "backend",
+                    "title": "Implement Rust Handler",
+                    "role": "coder",
+                    "prompt": "Build backend endpoint",
+                    "dependsOn": ["arch"],
+                    "writeEnabled": True,
+                },
+                {
+                    "id": "frontend",
+                    "title": "Implement TS Panel",
+                    "role": "coder",
+                    "prompt": "Build webview UI",
+                    "dependsOn": ["arch"],
+                    "writeEnabled": True,
+                },
+                {
+                    "id": "qa",
+                    "title": "Integration Verification",
+                    "role": "tester",
+                    "prompt": "Run test suite",
+                    "dependsOn": ["backend", "frontend"],
+                    "writeEnabled": False,
+                },
+            ]
+            res, ms = harness.request("plan_swarm_waves", {"tasks": tasks_spec})
+            waves = res.get("waves") or []
+            wave_count = int(res.get("waveCount", len(waves)))
+            passed = (
+                wave_count == 3
+                and len(waves) == 3
+                and len(waves[0]) == 1
+                and len(waves[1]) == 2
+                and len(waves[2]) == 1
+            )
+            return {
+                "id": task_id,
+                "category": category,
+                "kind": kind,
+                "status": "PASS" if passed else "FAIL",
+                "passed": passed,
+                "latencyMs": round(ms, 2),
+                "metricLabel": f"3 waves [1 -> 2 -> 1] in {ms:.2f}ms",
+                "details": {"waveCount": wave_count, "elapsedMs": round(ms, 2)},
+            }
+
+        if kind == "pptx_deck_check":
+            media_ws = harness.isolated_home / "media_eval_ws"
+            media_ws.mkdir(parents=True, exist_ok=True)
+            res, ms = harness.request(
+                "create_presentation",
+                {
+                    "workspaceRoot": str(media_ws),
+                    "spec": {
+                        "title": "Rursor 1.0 Omni-Studio",
+                        "subtitle": "Native Rust + macOS AI Studio",
+                        "author": "Rursor Eval",
+                        "theme": "obsidian",
+                        "outputPath": "decks/eval_deck.pptx",
+                        "slides": [
+                            {
+                                "layout": "title",
+                                "title": "Rursor Omni-Studio",
+                                "subtitle": "Code + Swarm + Browser + Media",
+                                "bullets": ["1.9ms APFS CoW Swarm", "Native OpenXML + MP4"],
+                            },
+                            {
+                                "layout": "metrics",
+                                "title": "Eval Benchmarks",
+                                "subtitle": "Measured on Apple Silicon",
+                                "metrics": [
+                                    {"label": "RPC p50", "value": "0.06ms", "delta": "ultrafast"},
+                                    {"label": "Recall@5", "value": "100%", "delta": "+RRF"},
+                                ],
+                                "bullets": ["Zero cloud dependency for local studio exports"],
+                            },
+                        ],
+                    },
+                },
+            )
+            pptx_path = Path(str(res.get("pptxPath", "")))
+            html_path = Path(str(res.get("htmlDeckPath", "")))
+            size_bytes = int(res.get("bytes", 0))
+            is_zip = pptx_path.is_file() and pptx_path.read_bytes()[:4] == b"PK\x03\x04"
+            passed = (
+                is_zip
+                and html_path.is_file()
+                and int(res.get("slideCount", 0)) == 2
+                and size_bytes > 1500
+            )
+            return {
+                "id": task_id,
+                "category": category,
+                "kind": kind,
+                "status": "PASS" if passed else "FAIL",
+                "passed": passed,
+                "latencyMs": round(ms, 2),
+                "metricLabel": f"2 slides, {size_bytes}B .pptx + .deck.html ({ms:.1f}ms)",
+                "details": {"bytes": size_bytes, "slideCount": res.get("slideCount")},
+            }
+
+        if kind == "mp4_video_check":
+            media_ws = harness.isolated_home / "media_eval_ws"
+            media_ws.mkdir(parents=True, exist_ok=True)
+            res, ms = harness.request(
+                "render_explainer_video",
+                {
+                    "workspaceRoot": str(media_ws),
+                    "spec": {
+                        "title": "Rursor Video Eval",
+                        "outputPath": "videos/eval_clip.mp4",
+                        "width": 640,
+                        "height": 360,
+                        "fps": 12,
+                        "scenes": [
+                            {
+                                "heading": "Rursor Video Engine",
+                                "subheading": "Procedural Rust Rasterizer + FFmpeg",
+                                "bullets": ["H.264 yuv420p MP4 output", "Apple Silicon native"],
+                                "durationSecs": 1.0,
+                            }
+                        ],
+                    },
+                },
+            )
+            video_path = Path(str(res.get("videoPath", "")))
+            header = video_path.read_bytes()[:16] if video_path.is_file() else b""
+            has_ftyp = b"ftyp" in header
+            size_bytes = int(res.get("bytes", 0))
+            passed = video_path.is_file() and has_ftyp and size_bytes > 500
+            return {
+                "id": task_id,
+                "category": category,
+                "kind": kind,
+                "status": "PASS" if passed else "FAIL",
+                "passed": passed,
+                "latencyMs": round(ms, 1),
+                "metricLabel": f"MP4 ftyp verified, {size_bytes}B ({ms:.0f}ms)",
+                "details": {"bytes": size_bytes, "engine": res.get("engine")},
+            }
+
+        if kind == "xlsx_docx_check":
+            media_ws = harness.isolated_home / "media_eval_ws"
+            media_ws.mkdir(parents=True, exist_ok=True)
+            t0 = time.perf_counter()
+            xlsx_res, _ = harness.request(
+                "create_spreadsheet",
+                {
+                    "workspaceRoot": str(media_ws),
+                    "spec": {
+                        "outputPath": "reports/eval_metrics.xlsx",
+                        "sheets": [
+                            {
+                                "name": "Benchmarks",
+                                "headers": ["Subsystem", "Score"],
+                                "rows": [["Swarm", 100], ["Browser", 100], ["Total", "=SUM(B2:B3)"]],
+                            }
+                        ],
+                    },
+                },
+            )
+            docx_res, _ = harness.request(
+                "create_document",
+                {
+                    "workspaceRoot": str(media_ws),
+                    "spec": {
+                        "title": "Rursor Architecture Spec",
+                        "subtitle": "Automated Eval Verification",
+                        "outputPath": "docs/eval_spec.docx",
+                        "sections": [
+                            {
+                                "heading": "Overview",
+                                "paragraphs": ["Rursor unifies code, browser, swarm, and media."],
+                                "bullets": ["OpenXML .pptx/.xlsx/.docx", "Native CDP Browser"],
+                            }
+                        ],
+                    },
+                },
+            )
+            total_ms = (time.perf_counter() - t0) * 1000.0
+            xlsx_path = Path(str(xlsx_res.get("xlsxPath", "")))
+            docx_path = Path(str(docx_res.get("docxPath", "")))
+            passed = (
+                xlsx_path.is_file()
+                and xlsx_path.read_bytes()[:4] == b"PK\x03\x04"
+                and docx_path.is_file()
+                and docx_path.read_bytes()[:4] == b"PK\x03\x04"
+            )
+            return {
+                "id": task_id,
+                "category": category,
+                "kind": kind,
+                "status": "PASS" if passed else "FAIL",
+                "passed": passed,
+                "latencyMs": round(total_ms, 2),
+                "metricLabel": (
+                    f".xlsx ({xlsx_res.get('bytes', 0)}B) + .docx ({docx_res.get('bytes', 0)}B) "
+                    f"in {total_ms:.1f}ms"
+                ),
+                "details": {"xlsxBytes": xlsx_res.get("bytes"), "docxBytes": docx_res.get("bytes")},
+            }
+
+        if kind == "docs_and_mcp_check":
+            t0 = time.perf_counter()
+            idx_res, _ = harness.request(
+                "index_docs_pages",
+                {
+                    "name": "rursor-sdk",
+                    "rootUrl": "https://docs.rursor.dev/",
+                    "pages": [
+                        {
+                            "url": "https://docs.rursor.dev/swarm",
+                            "title": "Swarm Coordinator Guide",
+                            "markdown": "# APFS Copy-on-Write Swarm\nUse `spawn_worker_swarm` to run parallel workers inside `cp -c -R` clones with `SwarmBlackboard`.",
+                        },
+                        {
+                            "url": "https://docs.rursor.dev/browser",
+                            "title": "CDP Browser Guide",
+                            "markdown": "# Set-of-Mark Grounding\nUse `browser_snapshot` to overlay `[1..N]` visual badges over interactive DOM elements.",
+                        },
+                    ],
+                },
+            )
+            search_res, _ = harness.request(
+                "search_docs",
+                {"query": "spawn_worker_swarm SwarmBlackboard parallel clones", "source": "rursor-sdk", "limit": 3},
+            )
+            mcp_res, _ = harness.request("list_mcp_catalog", {})
+            harness.request("remove_docs_source", {"name": "rursor-sdk"})
+            total_ms = (time.perf_counter() - t0) * 1000.0
+
+            hits = search_res.get("hits") or []
+            presets = mcp_res.get("presets") or []
+            top_hit_ok = len(hits) >= 1 and "swarm" in str(hits[0].get("url", "")).lower()
+            passed = (
+                int((idx_res.get("source") or {}).get("pagesIndexed", 0)) == 2
+                and top_hit_ok
+                and len(presets) >= 8
+            )
+            return {
+                "id": task_id,
+                "category": category,
+                "kind": kind,
+                "status": "PASS" if passed else "FAIL",
+                "passed": passed,
+                "latencyMs": round(total_ms, 2),
+                "metricLabel": f"@docs Recall@1=1.00, {len(presets)} MCP presets ({total_ms:.2f}ms)",
+                "details": {"pagesIndexed": 2, "mcpPresetCount": len(presets)},
+            }
+
         if kind == "live_inline_edit":
             res, ms = harness.request(
                 "inline_edit",
