@@ -1,5 +1,14 @@
 import * as vscode from 'vscode';
+import { collectLspContext, TemporalIntentLedger } from './lspContext';
+import { RursorSessionBaselineTracker } from './nativeForkFeatures';
 import { SidecarClient } from './sidecarClient';
+import { TelemetryTracker } from './voiceAndTelemetry';
+
+export interface InlineEditDeps {
+  intentLedger?: TemporalIntentLedger;
+  telemetry?: TelemetryTracker;
+  baselineTracker?: RursorSessionBaselineTracker;
+}
 
 const CONTEXT_LINES_AROUND = 80;
 const MAX_PROMPT_HISTORY = 8;
@@ -40,8 +49,15 @@ export class InlineEditSessionManager implements vscode.CodeLensProvider, vscode
   public readonly onDidChangeCodeLenses = this.onDidChangeCodeLensesEmitter.event;
   private session: PendingInlineEdit | undefined;
   private promptHistory: string[] = [];
+  private deps: InlineEditDeps;
 
-  constructor(private readonly client: SidecarClient) { }
+  constructor(private readonly client: SidecarClient, deps?: InlineEditDeps) {
+    this.deps = deps ?? {};
+  }
+
+  public setBaselineTracker(tracker: RursorSessionBaselineTracker): void {
+    this.deps.baselineTracker = tracker;
+  }
 
   provideCodeLenses(document: vscode.TextDocument): vscode.CodeLens[] {
     if (!this.session || this.session.uri.toString() !== document.uri.toString()) {
@@ -88,6 +104,20 @@ export class InlineEditSessionManager implements vscode.CodeLensProvider, vscode
     if (this.session) {
       await this.acceptSession();
     }
+
+    // In patched Rursor IDE, pressing Cmd+K with no preset opens the native floating Monaco ZoneWidget
+    // directly above the selection instead of a top-of-window VS Code QuickPick.
+    if (presetOrBridge === undefined) {
+      const availableCommands = await vscode.commands.getCommands(true);
+      if (availableCommands.includes('rursor.inlineEdit.showWidget')) {
+        await vscode.commands.executeCommand('rursor.inlineEdit.showWidget');
+        return;
+      }
+    }
+
+    const fromNativeWidget = Boolean(
+      presetOrBridge && typeof presetOrBridge === 'object' && presetOrBridge.prompt
+    );
 
     const doc = editor.document;
     let selection: vscode.Selection;
@@ -136,7 +166,14 @@ export class InlineEditSessionManager implements vscode.CodeLensProvider, vscode
     }
 
     this.recordPrompt(instruction.trim());
-    await this.executeEdit(editor, selection, instruction.trim(), matchingDiagnostics);
+    await this.executeEdit(
+      editor,
+      selection,
+      instruction.trim(),
+      matchingDiagnostics,
+      undefined,
+      fromNativeWidget
+    );
   }
 
   private async promptInstructionWithQuickPick(diagnosticCount: number): Promise<string | undefined> {
@@ -313,9 +350,13 @@ export class InlineEditSessionManager implements vscode.CodeLensProvider, vscode
     targetRange: vscode.Range,
     instruction: string,
     diagnostics: Array<{ path: string; line: number; severity: string; message: string }>,
-    preservedOriginalText?: string
+    preservedOriginalText?: string,
+    fromNativeWidget = false
   ): Promise<void> {
     const doc = editor.document;
+    const beforeFileContent = doc.getText();
+    this.deps.baselineTracker?.recordBaselineBeforeEdit(doc.uri, beforeFileContent);
+
     const prefixStartLine = Math.max(0, targetRange.start.line - CONTEXT_LINES_AROUND);
     const suffixEndLine = Math.min(doc.lineCount - 1, targetRange.end.line + CONTEXT_LINES_AROUND);
 
@@ -326,15 +367,44 @@ export class InlineEditSessionManager implements vscode.CodeLensProvider, vscode
     );
     const relPath = vscode.workspace.asRelativePath(doc.uri, false);
 
+    const beforeSelectionText = doc.getText(
+      new vscode.Range(new vscode.Position(0, 0), targetRange.start)
+    );
+    const throughSelectionText = doc.getText(
+      new vscode.Range(new vscode.Position(0, 0), targetRange.end)
+    );
+    const selectionStartOffset = Buffer.byteLength(beforeSelectionText, 'utf8');
+    const selectionEndOffset = Buffer.byteLength(throughSelectionText, 'utf8');
+
+    const [lspContext, developerIntent] = await Promise.all([
+      collectLspContext(doc, targetRange, { timeoutMs: 160 }).catch(() => ''),
+      Promise.resolve(this.deps.intentLedger?.formatRecentIntent() ?? ''),
+    ]);
+
+    const model = vscode.workspace
+      .getConfiguration('rursor')
+      .get<string>('defaultModel', 'gemini-2.5-flash');
+    const estInputTokens = Math.ceil(
+      (prefix.length + selectedText.length + suffix.length + lspContext.length + instruction.length) / 4
+    );
+
     await vscode.window.withProgress(
       {
-        location: vscode.ProgressLocation.Notification,
-        title: 'Rursor: Generating inline edit with Gemini…',
+        location: fromNativeWidget
+          ? vscode.ProgressLocation.Window
+          : vscode.ProgressLocation.Notification,
+        title: 'Rursor: Generating inline edit…',
         cancellable: true,
       },
       async (_progress, token) => {
         let streamedSoFar = '';
-        const { id, promise } = this.client.request<{ replacement: string }>(
+        const originalLinesForPreview = (preservedOriginalText ?? selectedText).split('\n');
+        const turnTimer = this.deps.telemetry?.startTurn('inlineEdit', model, estInputTokens, 0);
+
+        const { id, promise } = this.client.request<{
+          replacement: string;
+          syntaxRepaired?: boolean;
+        }>(
           'inline_edit',
           {
             filePath: relPath,
@@ -344,22 +414,26 @@ export class InlineEditSessionManager implements vscode.CodeLensProvider, vscode
             suffix,
             instruction,
             diagnostics,
+            lspContext: lspContext || undefined,
+            developerIntent: developerIntent || undefined,
+            beforeFileContent,
+            selectionStartOffset,
+            selectionEndOffset,
           },
           (delta) => {
+            turnTimer?.markFirstToken();
             streamedSoFar += delta;
+            const liveClean = stripClientCodeFences(streamedSoFar);
+            const liveHunks = computeLineDiff(
+              originalLinesForPreview,
+              liveClean.split('\n')
+            );
             void Promise.resolve(
               vscode.commands.executeCommand('rursor.inlineEdit.updateDiffPreview', {
                 startLineNumber: targetRange.start.line + 1,
                 streaming: true,
                 statusText: 'Streaming Rursor edit…',
-                hunks: [
-                  {
-                    kind: 'added',
-                    startLineNumber: targetRange.start.line + 1,
-                    endLineNumber: targetRange.end.line + 1,
-                    text: streamedSoFar,
-                  },
-                ],
+                hunks: liveHunks,
               })
             ).catch(() => undefined);
           }
@@ -377,6 +451,7 @@ export class InlineEditSessionManager implements vscode.CodeLensProvider, vscode
 
           const originalForDiff = preservedOriginalText ?? selectedText;
           const replacement = result.replacement;
+          turnTimer?.finish(replacement.length);
 
           // Build interleaved red/green diff preview when inline edit spans whole lines.
           const isWholeLineEdit =
@@ -400,6 +475,14 @@ export class InlineEditSessionManager implements vscode.CodeLensProvider, vscode
             vscode.window.showErrorMessage('Rursor could not apply the inline edit.');
             return;
           }
+
+          void Promise.resolve(
+            vscode.commands.executeCommand('rursor.inlineEdit.updateDiffPreview', {
+              startLineNumber: targetRange.start.line + 1,
+              streaming: false,
+              hunks: diffEntries,
+            })
+          ).catch(() => undefined);
 
           const previewLines = previewText.split('\n');
           const endLine = Math.min(
@@ -442,6 +525,13 @@ export class InlineEditSessionManager implements vscode.CodeLensProvider, vscode
             replacementText: replacement,
             lastInstruction: instruction,
           };
+
+          this.deps.baselineTracker?.markFileModified(
+            doc.uri,
+            `${beforeSelectionText}${replacement}${doc.getText(
+              new vscode.Range(diffRange.end, doc.lineAt(doc.lineCount - 1).range.end)
+            )}`
+          );
 
           await vscode.commands.executeCommand('setContext', 'rursor.hasActiveInlineEdit', true);
           this.onDidChangeCodeLensesEmitter.fire();
@@ -525,6 +615,16 @@ export function computeLineDiff(before: string[], after: string[]): DiffLineEntr
     out.push({ kind: 'added', text: after[j++] });
   }
   return out;
+}
+
+function stripClientCodeFences(raw: string): string {
+  const trimmed = raw.trim();
+  if (trimmed.startsWith('```')) {
+    const firstNewline = trimmed.indexOf('\n');
+    const body = firstNewline !== -1 ? trimmed.slice(firstNewline + 1) : '';
+    return body.endsWith('```') ? body.slice(0, -3).replace(/\n$/, '') : body;
+  }
+  return raw;
 }
 
 function collectDiagnosticsNearRange(
