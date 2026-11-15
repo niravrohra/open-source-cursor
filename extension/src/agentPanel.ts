@@ -4,9 +4,43 @@ import { spawn } from 'node:child_process';
 import * as vscode from 'vscode';
 import { SidecarClient, ToolEventPayload, ToolRequestPayload } from './sidecarClient';
 
+interface ImageAttachment {
+  mimeType: string;
+  data: string;
+  name?: string;
+}
+
 interface ChatTurn {
   role: 'user' | 'assistant';
   content: string;
+  images?: ImageAttachment[];
+}
+
+interface SessionSummary {
+  sessionId: string;
+  title: string;
+  updatedAt: number;
+  messageCount: number;
+}
+
+interface StoredSession {
+  sessionId: string;
+  title: string;
+  updatedAt: number;
+  messages: ChatTurn[];
+}
+
+interface McpServerStatus {
+  name: string;
+  connected: boolean;
+  toolCount: number;
+  error?: string;
+}
+
+interface SidecarStatusPayload {
+  hasWorkspaceRules?: boolean;
+  mcpServers?: McpServerStatus[];
+  indexedFiles?: number;
 }
 
 interface PendingEditSnapshot {
@@ -17,6 +51,8 @@ interface PendingEditSnapshot {
   afterContent: string;
   isNewFile: boolean;
   explanation: string;
+  status: 'pending' | 'applied' | 'accepted' | 'rejected' | 'reverted' | 'error';
+  autoAcceptOnApply?: boolean;
   resolveDecision?: (approved: boolean) => void;
 }
 
@@ -24,6 +60,10 @@ interface PendingCommandApproval {
   callId: string;
   command: string;
   resolveDecision: (approved: boolean) => void;
+}
+
+function createSessionId(): string {
+  return `sess_${Date.now()}`;
 }
 
 export class RursorDiffContentProvider implements vscode.TextDocumentContentProvider {
@@ -49,6 +89,7 @@ export class RursorDiffContentProvider implements vscode.TextDocumentContentProv
 export class AgentPanelProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'rursor.agentView';
   private view: vscode.WebviewView | undefined;
+  private currentSessionId: string = createSessionId();
   private history: ChatTurn[] = [];
   private activeRequestId: number | undefined;
   private attachedFiles = new Set<string>();
@@ -70,35 +111,58 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
       async (msg: {
         type: string;
         text?: string;
+        images?: ImageAttachment[];
         model?: string;
         mode?: 'agent' | 'ask';
         includeWorkspace?: boolean;
+        includeGitDiff?: boolean;
         autoApply?: boolean;
         callId?: string;
         filePath?: string;
         code?: string;
+        sessionId?: string;
       }) => {
-        if (msg.type === 'send' && msg.text) {
+        if (msg.type === 'webviewReady') {
+          this.syncContextBar();
+          this.syncReviewBar();
+          await Promise.all([this.refreshSessions(), this.refreshStatus()]);
+        } else if (
+          msg.type === 'send' &&
+          (Boolean(msg.text) || (Array.isArray(msg.images) && msg.images.length > 0))
+        ) {
           await this.handleUserPrompt(
-            msg.text,
+            msg.text ?? '',
+            msg.images ?? [],
             msg.mode ?? 'agent',
             Boolean(msg.includeWorkspace),
+            Boolean(msg.includeGitDiff),
             Boolean(msg.autoApply),
             msg.model
           );
         } else if (msg.type === 'stop') {
           await this.cancelActiveRequest();
         } else if (msg.type === 'clear') {
-          this.history = [];
+          await this.clearCurrentConversation();
+        } else if (msg.type === 'newSession') {
+          await this.createNewSession();
+        } else if (msg.type === 'switchSession' && msg.sessionId) {
+          await this.switchSession(msg.sessionId);
+        } else if (msg.type === 'deleteSession') {
+          await this.deleteCurrentSession();
         } else if (msg.type === 'setKey') {
           await vscode.commands.executeCommand('rursor.setApiKey');
         } else if (msg.type === 'modelChanged' && msg.model) {
           await this.onModelChange(msg.model);
         } else if (msg.type === 'pickFile') {
           await this.pickContextFile();
+        } else if (msg.type === 'attachFile' && msg.filePath) {
+          this.attachedFiles.add(msg.filePath);
+          this.syncContextBar();
         } else if (msg.type === 'removeFile' && msg.filePath) {
           this.attachedFiles.delete(msg.filePath);
           this.syncContextBar();
+        } else if (msg.type === 'listFiles') {
+          await this.sendFilesList();
         } else if (msg.type === 'editDecision' && msg.callId) {
           const snap = this.editSnapshots.get(msg.callId);
           snap?.resolveDecision?.(msg.text === 'approve');
@@ -106,20 +170,152 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
           await this.openDiffForCall(msg.callId);
         } else if (msg.type === 'revertEdit' && msg.callId) {
           await this.revertAppliedEdit(msg.callId);
+        } else if (msg.type === 'acceptAllEdits') {
+          await this.acceptAllEdits();
+        } else if (msg.type === 'revertAllEdits') {
+          await this.revertAllEdits();
         } else if (msg.type === 'commandDecision' && msg.callId) {
           const pending = this.commandApprovals.get(msg.callId);
           pending?.resolveDecision(msg.text === 'approve');
         } else if (msg.type === 'insertCode' && msg.code) {
           await this.insertSnippetAtCursor(msg.code);
+        } else if (msg.type === 'reloadMcp') {
+          await this.reloadMcp();
         }
       }
     );
 
     this.syncContextBar();
+    this.syncReviewBar();
+    void this.refreshSessions();
+    void this.refreshStatus();
+  }
+
+  public async refreshStatus(): Promise<void> {
+    if (!this.view) {
+      return;
+    }
+    try {
+      const { promise } = this.client.request<SidecarStatusPayload>('status');
+      const status = await promise;
+      let mcpServers = status.mcpServers;
+      if (!Array.isArray(mcpServers)) {
+        const mcpRes = await this.client
+          .request<{ servers: McpServerStatus[] }>('mcp_status')
+          .promise.catch(() => ({ servers: [] as McpServerStatus[] }));
+        mcpServers = mcpRes.servers ?? [];
+      }
+      void this.view?.webview.postMessage({
+        type: 'statusSync',
+        mcpServers,
+        hasWorkspaceRules: Boolean(status.hasWorkspaceRules),
+        indexedFiles: status.indexedFiles ?? 0,
+      });
+    } catch {
+      // Ignore if sidecar is not ready yet
+    }
+  }
+
+  private async reloadMcp(): Promise<void> {
+    try {
+      const { promise } = this.client.request<{ servers: McpServerStatus[] }>('reload_mcp');
+      await promise;
+      await this.refreshStatus();
+    } catch (err) {
+      void this.view?.webview.postMessage({
+        type: 'error',
+        text: `Failed to reload MCP: ${err instanceof Error ? err.message : String(err)}`,
+      });
+    }
+  }
+
+  private async refreshSessions(): Promise<void> {
+    if (!this.view) {
+      return;
+    }
+    try {
+      const { promise } = this.client.request<{ sessions: SessionSummary[] }>('list_sessions');
+      const res = await promise;
+      void this.view?.webview.postMessage({
+        type: 'sessionsSync',
+        sessions: res.sessions ?? [],
+        currentSessionId: this.currentSessionId,
+      });
+    } catch {
+      // Ignore if sidecar is not ready yet
+    }
+  }
+
+  private async createNewSession(): Promise<void> {
+    await this.cancelActiveRequest();
+    this.history = [];
+    this.editSnapshots.clear();
+    this.currentSessionId = createSessionId();
+    this.syncReviewBar();
+    void this.view?.webview.postMessage({
+      type: 'sessionLoaded',
+      sessionId: this.currentSessionId,
+      messages: [],
+    });
+    await this.refreshSessions();
+  }
+
+  private async clearCurrentConversation(): Promise<void> {
+    await this.cancelActiveRequest();
+    this.history = [];
+    this.editSnapshots.clear();
+    this.syncReviewBar();
+  }
+
+  private async switchSession(sessionId: string): Promise<void> {
+    if (!sessionId || sessionId === this.currentSessionId) {
+      return;
+    }
+    await this.cancelActiveRequest();
+    try {
+      const { promise } = this.client.request<{ session: StoredSession }>('load_session', {
+        sessionId,
+      });
+      const res = await promise;
+      const session = res.session;
+      this.currentSessionId = session.sessionId;
+      this.history = (session.messages ?? []).map((m) => ({
+        role: m.role === 'assistant' ? 'assistant' : 'user',
+        content: m.content ?? '',
+        ...(Array.isArray(m.images) && m.images.length > 0 ? { images: m.images } : {}),
+      }));
+      this.editSnapshots.clear();
+      this.syncReviewBar();
+      void this.view?.webview.postMessage({
+        type: 'sessionLoaded',
+        sessionId: this.currentSessionId,
+        messages: this.history,
+      });
+    } catch (err) {
+      vscode.window.showErrorMessage(
+        `Failed to load session: ${err instanceof Error ? err.message : String(err)}`
+      );
+      await this.refreshSessions();
+    }
+  }
+
+  private async deleteCurrentSession(): Promise<void> {
+    const targetId = this.currentSessionId;
+    try {
+      const { promise } = this.client.request<{ deleted: boolean }>('delete_session', {
+        sessionId: targetId,
+      });
+      await promise.catch(() => undefined);
+    } finally {
+      await this.createNewSession();
+    }
   }
 
   private async cancelActiveRequest(): Promise<void> {
     for (const snap of this.editSnapshots.values()) {
+      if (snap.status === 'pending') {
+        snap.status = 'rejected';
+      }
       snap.resolveDecision?.(false);
       snap.resolveDecision = undefined;
     }
@@ -127,12 +323,29 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
       cmd.resolveDecision(false);
     }
     this.commandApprovals.clear();
+    this.syncReviewBar();
 
     if (this.activeRequestId !== undefined) {
       await this.client.cancel(this.activeRequestId);
       this.activeRequestId = undefined;
     }
     void this.view?.webview.postMessage({ type: 'done' });
+  }
+
+  private async sendFilesList(): Promise<void> {
+    try {
+      const { promise } = this.client.request<{ files: string[] }>('list_files', { limit: 600 });
+      const res = await promise;
+      void this.view?.webview.postMessage({
+        type: 'filesList',
+        files: res.files ?? [],
+      });
+    } catch {
+      void this.view?.webview.postMessage({
+        type: 'filesList',
+        files: [],
+      });
+    }
   }
 
   private async pickContextFile(): Promise<void> {
@@ -159,21 +372,75 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
   private syncContextBar(): void {
     const active = vscode.window.activeTextEditor;
     const activeLabel = active ? vscode.workspace.asRelativePath(active.document.uri, false) : '';
+    const diagnostics = collectWorkspaceDiagnostics();
     void this.view?.webview.postMessage({
       type: 'contextSync',
       activeFile: activeLabel,
       attachedFiles: Array.from(this.attachedFiles),
+      diagnostics,
     });
+  }
+
+  private syncReviewBar(): void {
+    const reviewable = Array.from(this.editSnapshots.values()).filter(
+      (snap) => snap.status === 'pending' || snap.status === 'applied'
+    );
+    const fileCount = new Set(reviewable.map((snap) => snap.relPath)).size;
+    void this.view?.webview.postMessage({
+      type: 'reviewSync',
+      fileCount,
+      editCount: reviewable.length,
+    });
+  }
+
+  private async acceptAllEdits(): Promise<void> {
+    for (const snap of this.editSnapshots.values()) {
+      if (snap.status === 'applied') {
+        snap.status = 'accepted';
+      } else if (snap.status === 'pending') {
+        if (snap.resolveDecision) {
+          snap.autoAcceptOnApply = true;
+          const resolve = snap.resolveDecision;
+          snap.resolveDecision = undefined;
+          resolve(true);
+        } else {
+          snap.status = 'accepted';
+        }
+      }
+    }
+    this.syncReviewBar();
+  }
+
+  private async revertAllEdits(): Promise<void> {
+    const ordered = Array.from(this.editSnapshots.values()).reverse();
+    for (const snap of ordered) {
+      if (snap.status === 'pending') {
+        snap.status = 'rejected';
+        const resolve = snap.resolveDecision;
+        snap.resolveDecision = undefined;
+        resolve?.(false);
+      } else if (snap.status === 'applied') {
+        await this.revertAppliedEdit(snap.callId);
+      }
+    }
+    this.syncReviewBar();
   }
 
   private async handleUserPrompt(
     prompt: string,
+    images: ImageAttachment[],
     mode: 'agent' | 'ask',
     includeWorkspace: boolean,
+    includeGitDiff: boolean,
     autoApply: boolean,
     model?: string
   ): Promise<void> {
-    this.history.push({ role: 'user', content: prompt });
+    const turn: ChatTurn = {
+      role: 'user',
+      content: prompt,
+      ...(images.length > 0 ? { images } : {}),
+    };
+    this.history.push(turn);
 
     const contextFiles: Array<{ path: string; content: string }> = [];
     const seenPaths = new Set<string>();
@@ -211,10 +478,16 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
     const { id, promise } = this.client.request<{ text: string }>(
       'agent_chat',
       {
-        messages: this.history,
+        sessionId: this.currentSessionId,
+        messages: this.history.map((m) => ({
+          role: m.role,
+          content: m.content,
+          ...(m.images && m.images.length > 0 ? { images: m.images } : {}),
+        })),
         contextFiles,
         diagnostics,
         useWorkspaceSearch: includeWorkspace,
+        includeGitDiff,
         mode,
         model,
       },
@@ -236,6 +509,7 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
       const result = await promise;
       this.history.push({ role: 'assistant', content: result.text });
       void this.view?.webview.postMessage({ type: 'done' });
+      void this.refreshSessions();
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       void this.view?.webview.postMessage({ type: 'error', text: message });
@@ -349,6 +623,7 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
       afterContent,
       isNewFile,
       explanation,
+      status: autoApply ? 'applied' : 'pending',
     };
     this.editSnapshots.set(req.callId, snapshot);
 
@@ -356,6 +631,8 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
       try {
         await applyFileWrite(absPath, afterContent);
         await this.refreshSidecarFile(absPath, afterContent);
+        snapshot.status = 'applied';
+        this.syncReviewBar();
         void this.view?.webview.postMessage({
           type: 'toolCard',
           card: {
@@ -372,6 +649,8 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
           path: relPath,
         });
       } catch (err) {
+        snapshot.status = 'error';
+        this.syncReviewBar();
         await this.client.submitToolResult(req.callId, false, {
           error: err instanceof Error ? err.message : String(err),
         });
@@ -381,6 +660,7 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
 
     const approved = await new Promise<boolean>((resolve) => {
       snapshot.resolveDecision = resolve;
+      this.syncReviewBar();
       void this.view?.webview.postMessage({
         type: 'toolCard',
         card: {
@@ -397,6 +677,8 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
     snapshot.resolveDecision = undefined;
 
     if (!approved) {
+      snapshot.status = 'rejected';
+      this.syncReviewBar();
       void this.view?.webview.postMessage({
         type: 'toolCardUpdate',
         callId: req.callId,
@@ -412,6 +694,8 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
     try {
       await applyFileWrite(absPath, afterContent);
       await this.refreshSidecarFile(absPath, afterContent);
+      snapshot.status = snapshot.autoAcceptOnApply ? 'accepted' : 'applied';
+      this.syncReviewBar();
       void this.view?.webview.postMessage({
         type: 'toolCardUpdate',
         callId: req.callId,
@@ -422,6 +706,8 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
         path: relPath,
       });
     } catch (err) {
+      snapshot.status = 'error';
+      this.syncReviewBar();
       void this.view?.webview.postMessage({
         type: 'toolCardUpdate',
         callId: req.callId,
@@ -480,7 +766,13 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
       status: 'running',
     });
 
-    const result = await executeShellCommand(command, root);
+    const result = await executeShellCommand(command, root, (chunk) => {
+      void this.view?.webview.postMessage({
+        type: 'toolCardStream',
+        callId: req.callId,
+        chunk,
+      });
+    });
     void this.view?.webview.postMessage({
       type: 'toolCardUpdate',
       callId: req.callId,
@@ -524,6 +816,8 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
         await applyFileWrite(snap.absPath, snap.beforeContent);
         await this.refreshSidecarFile(snap.absPath, snap.beforeContent);
       }
+      snap.status = 'reverted';
+      this.syncReviewBar();
       void this.view?.webview.postMessage({
         type: 'toolCardUpdate',
         callId,
@@ -580,6 +874,17 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
     align-items: center;
     flex-wrap: wrap;
   }
+  .session-bar {
+    display: flex;
+    gap: 4px;
+    width: 100%;
+    align-items: center;
+  }
+  #sessionSelect {
+    flex: 1;
+    min-width: 0;
+    text-overflow: ellipsis;
+  }
   select, button {
     background: var(--vscode-button-secondaryBackground);
     color: var(--vscode-button-secondaryForeground);
@@ -590,6 +895,7 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
     font-size: 11px;
   }
   button:hover { opacity: 0.9; }
+  button:disabled { opacity: 0.5; cursor: default; }
   button.primary {
     background: var(--vscode-button-background);
     color: var(--vscode-button-foreground);
@@ -619,6 +925,19 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
     align-self: flex-end;
     max-width: 92%;
     white-space: pre-wrap;
+  }
+  .msg-images {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-bottom: 6px;
+  }
+  .msg-images img {
+    max-width: 120px;
+    max-height: 90px;
+    border-radius: 4px;
+    border: 1px solid var(--vscode-panel-border);
+    object-fit: cover;
   }
   .assistant {
     background: var(--vscode-editor-background);
@@ -699,6 +1018,19 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
     white-space: pre-wrap;
   }
   .err { color: var(--vscode-errorForeground); padding: 6px 8px; }
+  .review-bar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 8px;
+    background: var(--vscode-editor-background);
+    border-top: 1px solid var(--vscode-panel-border);
+    font-size: 11px;
+    font-weight: 600;
+  }
+  .review-bar[hidden] { display: none; }
+  .review-actions { display: flex; gap: 6px; }
   footer {
     padding: 8px;
     border-top: 1px solid var(--vscode-panel-border);
@@ -726,6 +1058,58 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
     background: transparent;
     font-size: 11px;
   }
+  .img-thumb {
+    width: 18px;
+    height: 18px;
+    border-radius: 3px;
+    object-fit: cover;
+  }
+  .composer-wrap {
+    position: relative;
+  }
+  .mention-popover {
+    position: absolute;
+    bottom: calc(100% + 4px);
+    left: 0;
+    right: 0;
+    max-height: 210px;
+    overflow-y: auto;
+    background: var(--vscode-editorWidget-background, var(--vscode-editor-background));
+    border: 1px solid var(--vscode-widget-border, var(--vscode-panel-border));
+    border-radius: var(--radius);
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+    z-index: 20;
+    padding: 4px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .mention-popover[hidden] { display: none; }
+  .mention-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 8px;
+    padding: 5px 8px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 12px;
+  }
+  .mention-item.active, .mention-item:hover {
+    background: var(--vscode-list-activeSelectionBackground, rgba(127, 127, 127, 0.25));
+    color: var(--vscode-list-activeSelectionForeground, inherit);
+  }
+  .mention-label {
+    font-weight: 600;
+    white-space: nowrap;
+  }
+  .mention-detail {
+    font-size: 11px;
+    opacity: 0.78;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
   textarea {
     width: 100%;
     min-height: 58px;
@@ -745,11 +1129,38 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
     gap: 6px;
     flex-wrap: wrap;
   }
-  .toggles { display: flex; gap: 8px; align-items: center; }
+  .toggles { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .status-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 6px;
+    font-size: 11px;
+    opacity: 0.9;
+    padding-top: 2px;
+    border-top: 1px solid var(--vscode-panel-border);
+  }
+  .status-pills {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+  .status-pill {
+    font-size: 10px;
+    padding: 2px 6px;
+    border-radius: 10px;
+    background: rgba(127, 127, 127, 0.16);
+  }
 </style>
 </head>
 <body>
   <header>
+    <div class="session-bar">
+      <select id="sessionSelect" title="Chat Sessions"></select>
+      <button id="newSessionBtn" title="Start New Session">+ New</button>
+      <button id="delSessionBtn" class="danger" title="Delete Current Session">Del</button>
+    </div>
     <select id="mode" title="Execution Mode">
       <option value="agent">Agent</option>
       <option value="ask">Ask</option>
@@ -763,20 +1174,40 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
     <button id="clearBtn">Clear</button>
   </header>
   <div id="messages"></div>
+  <div id="reviewBar" class="review-bar" hidden>
+    <span id="reviewText">0 file(s) changed</span>
+    <div class="review-actions">
+      <button id="acceptAllBtn" class="primary">Accept All</button>
+      <button id="revertAllBtn" class="danger">Revert All</button>
+    </div>
+  </div>
   <footer>
     <div class="chips" id="chips">
-      <button id="addFileBtn">+ File</button>
+      <button id="addFileBtn" type="button">+ File</button>
+      <button id="addImgBtn" type="button">+ Img</button>
+      <input type="file" id="imgFileInput" accept="image/*" multiple hidden />
     </div>
-    <textarea id="prompt" placeholder="Ask or instruct Rursor Agent (Enter to send, Shift+Enter for newline)…"></textarea>
+    <div class="composer-wrap">
+      <div id="mentionPopover" class="mention-popover" hidden></div>
+      <textarea id="prompt" placeholder="Ask or instruct Rursor Agent (type @ for context, paste images, Enter to send)…"></textarea>
+    </div>
     <div class="row">
       <div class="toggles">
         <label><input type="checkbox" id="wsCheck" checked /> @workspace</label>
+        <label title="Include git status and diff in this turn"><input type="checkbox" id="gitCheck" /> @git</label>
         <label title="Automatically apply agent file edits without prompting"><input type="checkbox" id="autoApplyCheck" /> Auto-apply</label>
       </div>
       <div>
         <button id="stopBtn">Stop</button>
         <button id="sendBtn" class="primary">Send</button>
       </div>
+    </div>
+    <div class="status-row">
+      <div class="status-pills">
+        <span id="mcpPill" class="status-pill" title="MCP Servers">MCP: 0 servers</span>
+        <span id="rulesPill" class="status-pill" hidden title="Project rules loaded">Rules: On</span>
+      </div>
+      <button id="reloadMcpBtn" type="button">Reload MCP</button>
     </div>
   </footer>
 <script>
@@ -786,13 +1217,34 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
   const modelEl = document.getElementById('model');
   const modeEl = document.getElementById('mode');
   const wsEl = document.getElementById('wsCheck');
+  const gitEl = document.getElementById('gitCheck');
   const autoApplyEl = document.getElementById('autoApplyCheck');
   const chipsEl = document.getElementById('chips');
+  const imgFileInput = document.getElementById('imgFileInput');
+  const sessionSelectEl = document.getElementById('sessionSelect');
+  const mentionPopoverEl = document.getElementById('mentionPopover');
+  const reviewBarEl = document.getElementById('reviewBar');
+  const reviewTextEl = document.getElementById('reviewText');
+  const mcpPillEl = document.getElementById('mcpPill');
+  const rulesPillEl = document.getElementById('rulesPill');
+  const reloadMcpBtn = document.getElementById('reloadMcpBtn');
 
   let activeAssistantEl = null;
   let activeAssistantRaw = '';
   const toolPills = new Map();
   const toolCards = new Map();
+
+  let lastActiveFile = '';
+  let lastAttachedFiles = [];
+  let latestDiagnostics = [];
+  let pendingImages = [];
+
+  let cachedFiles = [];
+  let filesRequested = false;
+  let mentionOpen = false;
+  let mentionStart = -1;
+  let mentionItems = [];
+  let mentionIndex = 0;
 
   function escHtml(s) {
     return String(s)
@@ -843,56 +1295,279 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
   window.copyCode = (enc) => navigator.clipboard?.writeText(decodeURIComponent(enc));
   window.insertCode = (enc) => vscode.postMessage({ type: 'insertCode', code: decodeURIComponent(enc) });
 
-  function addMessage(cls, text) {
+  function addMessage(cls, text, images) {
     const div = document.createElement('div');
     div.className = 'msg ' + cls;
     if (cls === 'assistant') {
       div.innerHTML = renderMarkdown(text);
     } else {
-      div.textContent = text;
+      if (Array.isArray(images) && images.length > 0) {
+        const imgsDiv = document.createElement('div');
+        imgsDiv.className = 'msg-images';
+        for (const img of images) {
+          const el = document.createElement('img');
+          el.src = 'data:' + img.mimeType + ';base64,' + img.data;
+          el.alt = img.name || 'image';
+          el.title = img.name || 'image';
+          imgsDiv.appendChild(el);
+        }
+        div.appendChild(imgsDiv);
+      }
+      if (text) {
+        const span = document.createElement('span');
+        span.textContent = text;
+        div.appendChild(span);
+      }
     }
     messagesEl.appendChild(div);
     messagesEl.scrollTop = messagesEl.scrollHeight;
     return div;
   }
 
-  function send() {
-    const text = promptEl.value.trim();
-    if (!text) return;
-    addMessage('user', text);
-    activeAssistantEl = addMessage('assistant', '');
-    activeAssistantRaw = '';
-    promptEl.value = '';
-    vscode.postMessage({
-      type: 'send',
-      text,
-      mode: modeEl.value,
-      model: modelEl.value,
-      includeWorkspace: wsEl.checked,
-      autoApply: autoApplyEl.checked,
-    });
+  function readImageFile(file) {
+    if (!file || !file.type || !file.type.startsWith('image/')) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = typeof reader.result === 'string' ? reader.result : '';
+      const commaIdx = result.indexOf(',');
+      if (commaIdx === -1) return;
+      const header = result.slice(0, commaIdx);
+      const data = result.slice(commaIdx + 1);
+      const match = header.match(/data:(.*?);/);
+      const mimeType = file.type || (match ? match[1] : 'image/png');
+      pendingImages.push({
+        mimeType,
+        data,
+        name: file.name || ('image-' + (pendingImages.length + 1) + '.png'),
+      });
+      renderChips(lastActiveFile, lastAttachedFiles);
+    };
+    reader.readAsDataURL(file);
   }
 
   function renderChips(activeFile, attached) {
-    const addBtn = document.getElementById('addFileBtn');
+    lastActiveFile = activeFile || '';
+    lastAttachedFiles = Array.isArray(attached) ? attached : [];
+
+    const addFileBtn = document.getElementById('addFileBtn');
+    const addImgBtn = document.getElementById('addImgBtn');
     chipsEl.innerHTML = '';
-    chipsEl.appendChild(addBtn);
-    if (activeFile) {
+    chipsEl.appendChild(addFileBtn);
+    chipsEl.appendChild(addImgBtn);
+    chipsEl.appendChild(imgFileInput);
+
+    if (lastActiveFile) {
       const span = document.createElement('span');
       span.className = 'chip';
-      span.textContent = 'Active: ' + activeFile;
+      span.textContent = 'Active: ' + lastActiveFile;
       chipsEl.appendChild(span);
     }
-    for (const f of attached || []) {
+    for (const f of lastAttachedFiles) {
       const span = document.createElement('span');
       span.className = 'chip';
       span.innerHTML = '@' + escHtml(f) + ' ';
       const rm = document.createElement('button');
+      rm.type = 'button';
       rm.textContent = '×';
       rm.onclick = () => vscode.postMessage({ type: 'removeFile', filePath: f });
       span.appendChild(rm);
       chipsEl.appendChild(span);
     }
+    pendingImages.forEach((img, idx) => {
+      const span = document.createElement('span');
+      span.className = 'chip';
+      const thumb = document.createElement('img');
+      thumb.className = 'img-thumb';
+      thumb.src = 'data:' + img.mimeType + ';base64,' + img.data;
+      thumb.alt = img.name || 'image';
+      span.appendChild(thumb);
+
+      const label = document.createElement('span');
+      label.textContent = img.name || 'image';
+      span.appendChild(label);
+
+      const rm = document.createElement('button');
+      rm.type = 'button';
+      rm.textContent = '×';
+      rm.onclick = () => {
+        pendingImages.splice(idx, 1);
+        renderChips(lastActiveFile, lastAttachedFiles);
+      };
+      span.appendChild(rm);
+      chipsEl.appendChild(span);
+    });
+  }
+
+  function fuzzyScore(query, target) {
+    if (!query) return 1;
+    const q = query.toLowerCase();
+    const t = target.toLowerCase();
+    if (t === q) return 1000;
+    if (t.startsWith(q)) return 600 - t.length;
+    const subIdx = t.indexOf(q);
+    if (subIdx !== -1) return 400 - subIdx - t.length * 0.1;
+    let qi = 0;
+    let score = 100;
+    let lastMatch = -1;
+    for (let ti = 0; ti < t.length && qi < q.length; ti++) {
+      if (t[ti] === q[qi]) {
+        if (lastMatch === ti - 1) score += 8;
+        lastMatch = ti;
+        qi++;
+      }
+    }
+    return qi === q.length ? score - t.length * 0.1 : -1;
+  }
+
+  function buildErrorsInsertText() {
+    if (!latestDiagnostics || latestDiagnostics.length === 0) {
+      return 'Check and fix any active workspace diagnostics. ';
+    }
+    const lines = latestDiagnostics.slice(0, 10).map((d) =>
+      '[' + d.severity + '] ' + d.path + ':' + d.line + ' ' + d.message
+    );
+    return 'Fix these diagnostics:\\n' + lines.join('\\n') + '\\n';
+  }
+
+  function getFilteredMentions(query) {
+    const builtins = [
+      { kind: 'workspace', label: '@workspace', detail: 'Toggle workspace search on' },
+      { kind: 'git', label: '@git', detail: 'Include git diff in this turn' },
+      { kind: 'errors', label: '@errors', detail: 'Insert active diagnostics (' + latestDiagnostics.length + ')' },
+    ];
+
+    const matchedBuiltins = builtins
+      .map((item) => ({ item, score: fuzzyScore(query, item.label.slice(1)) }))
+      .filter((x) => x.score > 0)
+      .sort((a, b) => b.score - a.score)
+      .map((x) => x.item);
+
+    const matchedFiles = cachedFiles
+      .map((filePath) => ({
+        item: { kind: 'file', label: '@' + filePath, detail: 'Attach file', path: filePath },
+        score: fuzzyScore(query, filePath),
+      }))
+      .filter((x) => x.score > 0)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 20)
+      .map((x) => x.item);
+
+    return matchedBuiltins.concat(matchedFiles);
+  }
+
+  function renderMentionPopover() {
+    if (!mentionOpen || mentionItems.length === 0) {
+      mentionPopoverEl.hidden = true;
+      mentionPopoverEl.innerHTML = '';
+      return;
+    }
+    mentionPopoverEl.hidden = false;
+    mentionPopoverEl.innerHTML = '';
+    mentionItems.forEach((item, idx) => {
+      const row = document.createElement('div');
+      row.className = 'mention-item' + (idx === mentionIndex ? ' active' : '');
+      const lbl = document.createElement('span');
+      lbl.className = 'mention-label';
+      lbl.textContent = item.label;
+      const det = document.createElement('span');
+      det.className = 'mention-detail';
+      det.textContent = item.detail;
+      row.appendChild(lbl);
+      row.appendChild(det);
+      row.onmousedown = (e) => {
+        e.preventDefault();
+        selectMention(item);
+      };
+      mentionPopoverEl.appendChild(row);
+    });
+    const activeRow = mentionPopoverEl.children[mentionIndex];
+    if (activeRow) {
+      activeRow.scrollIntoView({ block: 'nearest' });
+    }
+  }
+
+  function closeMentionPopover() {
+    mentionOpen = false;
+    mentionStart = -1;
+    mentionItems = [];
+    mentionIndex = 0;
+    mentionPopoverEl.hidden = true;
+  }
+
+  function selectMention(item) {
+    if (!item) return;
+    const cursor = promptEl.selectionStart ?? promptEl.value.length;
+    const before = promptEl.value.slice(0, mentionStart >= 0 ? mentionStart : cursor);
+    const after = promptEl.value.slice(cursor);
+    let inserted = '';
+    if (item.kind === 'workspace') {
+      wsEl.checked = true;
+      inserted = '@workspace ';
+    } else if (item.kind === 'git') {
+      gitEl.checked = true;
+      inserted = '@git ';
+    } else if (item.kind === 'errors') {
+      inserted = buildErrorsInsertText();
+    } else if (item.kind === 'file') {
+      vscode.postMessage({ type: 'attachFile', filePath: item.path });
+      inserted = '';
+    }
+    promptEl.value = before + inserted + after;
+    const nextPos = before.length + inserted.length;
+    promptEl.focus();
+    promptEl.setSelectionRange(nextPos, nextPos);
+    closeMentionPopover();
+  }
+
+  function updateMentionState() {
+    const cursor = promptEl.selectionStart ?? promptEl.value.length;
+    const beforeCursor = promptEl.value.slice(0, cursor);
+    const match = beforeCursor.match(/(?:^|\\s)@([^\\s@]*)$/);
+    if (!match) {
+      closeMentionPopover();
+      return;
+    }
+    if (!filesRequested) {
+      filesRequested = true;
+      vscode.postMessage({ type: 'listFiles' });
+    }
+    const query = match[1] || '';
+    mentionStart = beforeCursor.lastIndexOf('@');
+    mentionOpen = true;
+    mentionItems = getFilteredMentions(query);
+    if (mentionIndex >= mentionItems.length) {
+      mentionIndex = 0;
+    }
+    renderMentionPopover();
+  }
+
+  function send() {
+    const text = promptEl.value.trim();
+    const imagesToSend = pendingImages.slice();
+    if (!text && imagesToSend.length === 0) return;
+
+    const includeGitDiff = Boolean(gitEl.checked) || /(?:^|\\s)@git(?:\\s|$)/.test(text);
+    const includeWorkspace = Boolean(wsEl.checked) || /(?:^|\\s)@workspace(?:\\s|$)/.test(text);
+
+    addMessage('user', text, imagesToSend);
+    activeAssistantEl = addMessage('assistant', '');
+    activeAssistantRaw = '';
+    promptEl.value = '';
+    pendingImages = [];
+    gitEl.checked = false;
+    closeMentionPopover();
+    renderChips(lastActiveFile, lastAttachedFiles);
+
+    vscode.postMessage({
+      type: 'send',
+      text,
+      images: imagesToSend,
+      mode: modeEl.value,
+      model: modelEl.value,
+      includeWorkspace,
+      includeGitDiff,
+      autoApply: autoApplyEl.checked,
+    });
   }
 
   document.getElementById('sendBtn').onclick = send;
@@ -903,11 +1578,78 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
     toolCards.clear();
     vscode.postMessage({ type: 'clear' });
   };
+  document.getElementById('newSessionBtn').onclick = () => vscode.postMessage({ type: 'newSession' });
+  document.getElementById('delSessionBtn').onclick = () => vscode.postMessage({ type: 'deleteSession' });
+  sessionSelectEl.onchange = () => {
+    if (sessionSelectEl.value) {
+      vscode.postMessage({ type: 'switchSession', sessionId: sessionSelectEl.value });
+    }
+  };
   document.getElementById('keyBtn').onclick = () => vscode.postMessage({ type: 'setKey' });
   document.getElementById('addFileBtn').onclick = () => vscode.postMessage({ type: 'pickFile' });
+  document.getElementById('addImgBtn').onclick = () => imgFileInput.click();
+  imgFileInput.onchange = () => {
+    for (const file of imgFileInput.files || []) {
+      readImageFile(file);
+    }
+    imgFileInput.value = '';
+  };
+  document.getElementById('acceptAllBtn').onclick = () => vscode.postMessage({ type: 'acceptAllEdits' });
+  document.getElementById('revertAllBtn').onclick = () => vscode.postMessage({ type: 'revertAllEdits' });
+  reloadMcpBtn.onclick = () => {
+    reloadMcpBtn.disabled = true;
+    reloadMcpBtn.textContent = 'Reloading…';
+    vscode.postMessage({ type: 'reloadMcp' });
+  };
   modelEl.onchange = () => vscode.postMessage({ type: 'modelChanged', model: modelEl.value });
+
+  promptEl.addEventListener('input', updateMentionState);
+  promptEl.addEventListener('click', () => {
+    if (mentionOpen) updateMentionState();
+  });
+  promptEl.addEventListener('paste', (e) => {
+    const items = e.clipboardData && e.clipboardData.items ? Array.from(e.clipboardData.items) : [];
+    const imgItems = items.filter((it) => it.kind === 'file' && it.type.startsWith('image/'));
+    if (imgItems.length > 0) {
+      const hasText = Boolean(e.clipboardData.getData('text/plain'));
+      if (!hasText) {
+        e.preventDefault();
+      }
+      for (const it of imgItems) {
+        const f = it.getAsFile();
+        if (f) readImageFile(f);
+      }
+    }
+  });
   promptEl.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+    if (mentionOpen && mentionItems.length > 0) {
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        mentionIndex = (mentionIndex + 1) % mentionItems.length;
+        renderMentionPopover();
+        return;
+      }
+      if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        mentionIndex = (mentionIndex - 1 + mentionItems.length) % mentionItems.length;
+        renderMentionPopover();
+        return;
+      }
+      if ((e.key === 'Enter' && !e.shiftKey) || e.key === 'Tab') {
+        e.preventDefault();
+        selectMention(mentionItems[mentionIndex]);
+        return;
+      }
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        closeMentionPopover();
+        return;
+      }
+    }
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      send();
+    }
   });
 
   function renderToolCard(card) {
@@ -951,6 +1693,47 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
     }
   }
 
+  function renderSessions(sessions, currentId) {
+    const list = Array.isArray(sessions) ? sessions : [];
+    sessionSelectEl.innerHTML = '';
+    const hasCurrent = list.some((s) => s.sessionId === currentId);
+    if (!hasCurrent && currentId) {
+      const opt = document.createElement('option');
+      opt.value = currentId;
+      opt.textContent = 'New Session';
+      sessionSelectEl.appendChild(opt);
+    }
+    for (const s of list) {
+      const opt = document.createElement('option');
+      opt.value = s.sessionId;
+      opt.textContent = (s.title || s.sessionId) + ' (' + (s.messageCount || 0) + ')';
+      sessionSelectEl.appendChild(opt);
+    }
+    if (currentId) {
+      sessionSelectEl.value = currentId;
+    }
+  }
+
+  function renderStatus(msg) {
+    reloadMcpBtn.disabled = false;
+    reloadMcpBtn.textContent = 'Reload MCP';
+    const servers = Array.isArray(msg.mcpServers) ? msg.mcpServers : [];
+    const connected = servers.filter((s) => s.connected).length;
+    if (servers.length === 0) {
+      mcpPillEl.textContent = 'MCP: 0 servers';
+      mcpPillEl.title = 'No MCP servers configured (.rursor/mcp.json)';
+    } else if (connected === servers.length) {
+      mcpPillEl.textContent = 'MCP: ' + servers.length + ' server' + (servers.length === 1 ? '' : 's');
+      mcpPillEl.title = servers.map((s) => s.name + ': ' + s.toolCount + ' tools').join('\\n');
+    } else {
+      mcpPillEl.textContent = 'MCP: ' + connected + '/' + servers.length + ' servers';
+      mcpPillEl.title = servers
+        .map((s) => s.name + ': ' + (s.connected ? s.toolCount + ' tools' : (s.error || 'disconnected')))
+        .join('\\n');
+    }
+    rulesPillEl.hidden = !msg.hasWorkspaceRules;
+  }
+
   window.viewDiff = (callId) => vscode.postMessage({ type: 'viewDiff', callId });
   window.decideEdit = (callId, decision) => vscode.postMessage({ type: 'editDecision', callId, text: decision });
   window.revertEdit = (callId) => vscode.postMessage({ type: 'revertEdit', callId });
@@ -976,8 +1759,50 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
       addMessage('err', msg.text);
       activeAssistantEl = null;
       activeAssistantRaw = '';
+      reloadMcpBtn.disabled = false;
+      reloadMcpBtn.textContent = 'Reload MCP';
     } else if (msg.type === 'contextSync') {
+      latestDiagnostics = Array.isArray(msg.diagnostics) ? msg.diagnostics : [];
       renderChips(msg.activeFile, msg.attachedFiles);
+    } else if (msg.type === 'filesList') {
+      cachedFiles = Array.isArray(msg.files) ? msg.files : [];
+      if (mentionOpen) {
+        updateMentionState();
+      }
+    } else if (msg.type === 'sessionsSync') {
+      renderSessions(msg.sessions, msg.currentSessionId);
+    } else if (msg.type === 'sessionLoaded') {
+      messagesEl.innerHTML = '';
+      toolPills.clear();
+      toolCards.clear();
+      activeAssistantEl = null;
+      activeAssistantRaw = '';
+      for (const m of msg.messages || []) {
+        addMessage(m.role === 'assistant' ? 'assistant' : 'user', m.content || '', m.images);
+      }
+      if (msg.sessionId) {
+        let optExists = false;
+        for (const opt of sessionSelectEl.options) {
+          if (opt.value === msg.sessionId) optExists = true;
+        }
+        if (!optExists) {
+          const opt = document.createElement('option');
+          opt.value = msg.sessionId;
+          opt.textContent = 'New Session';
+          sessionSelectEl.insertBefore(opt, sessionSelectEl.firstChild);
+        }
+        sessionSelectEl.value = msg.sessionId;
+      }
+    } else if (msg.type === 'reviewSync') {
+      const count = msg.fileCount || 0;
+      if (count > 0) {
+        reviewTextEl.textContent = count + ' file(s) changed';
+        reviewBarEl.hidden = false;
+      } else {
+        reviewBarEl.hidden = true;
+      }
+    } else if (msg.type === 'statusSync') {
+      renderStatus(msg);
     } else if (msg.type === 'toolEvent') {
       const ev = msg.payload;
       if (ev.phase === 'start') {
@@ -1000,6 +1825,28 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
       activeAssistantEl = null;
       activeAssistantRaw = '';
       renderToolCard(msg.card);
+    } else if (msg.type === 'toolCardStream') {
+      const entry = toolCards.get(msg.callId);
+      if (entry) {
+        entry.card.output = (entry.card.output || '') + (msg.chunk || '');
+        if (entry.card.output.length > 16000) {
+          entry.card.output = entry.card.output.slice(-16000);
+        }
+        let outEl = entry.el.querySelector('.cmd-out');
+        if (!outEl) {
+          outEl = document.createElement('div');
+          outEl.className = 'cmd-out';
+          const actionsEl = entry.el.querySelector('.tool-card-actions');
+          if (actionsEl) {
+            entry.el.insertBefore(outEl, actionsEl);
+          } else {
+            entry.el.appendChild(outEl);
+          }
+        }
+        outEl.textContent = entry.card.output;
+        outEl.scrollTop = outEl.scrollHeight;
+        messagesEl.scrollTop = messagesEl.scrollHeight;
+      }
     } else if (msg.type === 'toolCardUpdate') {
       const entry = toolCards.get(msg.callId);
       if (entry) {
@@ -1008,6 +1855,8 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
       }
     }
   });
+
+  vscode.postMessage({ type: 'webviewReady' });
 </script>
 </body>
 </html>`;
@@ -1097,15 +1946,18 @@ function collectWorkspaceDiagnostics(): Array<{
 
 function executeShellCommand(
   command: string,
-  cwd: string
+  cwd: string,
+  onOutput?: (chunk: string) => void
 ): Promise<{ exitCode: number; combinedOutput: string }> {
   return new Promise((resolve) => {
     const child = spawn('/bin/zsh', ['-lc', command], { cwd });
     let combined = '';
     const append = (chunk: Buffer) => {
+      const text = chunk.toString('utf8');
       if (combined.length < 16_000) {
-        combined += chunk.toString('utf8');
+        combined += text;
       }
+      onOutput?.(text);
     };
     child.stdout.on('data', append);
     child.stderr.on('data', append);

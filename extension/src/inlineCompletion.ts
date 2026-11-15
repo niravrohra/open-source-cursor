@@ -3,7 +3,7 @@ import { SidecarClient } from './sidecarClient';
 
 const PREFIX_LINES = 100;
 const SUFFIX_LINES = 35;
-const DEBOUNCE_MS = 260;
+const DEBOUNCE_MS = 220;
 const MAX_CACHE_ENTRIES = 60;
 
 export class RursorInlineCompletionProvider
@@ -12,6 +12,7 @@ export class RursorInlineCompletionProvider
   private activeRequestId: number | undefined;
   private readonly cache = new Map<string, string>();
   private readonly recentSnippets = new Map<string, string>();
+  private recentEditHint = '';
   private readonly disposables: vscode.Disposable[] = [];
 
   constructor(private readonly client: SidecarClient) {
@@ -23,6 +24,11 @@ export class RursorInlineCompletionProvider
       }),
       vscode.workspace.onDidChangeTextDocument((event) => {
         this.recordDocument(event.document);
+        if (event.document.uri.scheme === 'file' && event.contentChanges.length > 0) {
+          const change = event.contentChanges[0];
+          const rel = vscode.workspace.asRelativePath(event.document.uri, false);
+          this.recentEditHint = `${rel}:${change.range.start.line + 1} -> ${change.text.slice(0, 240)}`;
+        }
       })
     );
   }
@@ -62,7 +68,6 @@ export class RursorInlineCompletionProvider
       return [];
     }
 
-    // Avoid firing when a completion widget is explicitly selected unless invoked manually.
     if (
       context.selectedCompletionInfo &&
       context.triggerKind === vscode.InlineCompletionTriggerKind.Automatic
@@ -92,7 +97,6 @@ export class RursorInlineCompletionProvider
         : [];
     }
 
-    // Debounce rapid keystrokes before calling Gemini.
     if (context.triggerKind === vscode.InlineCompletionTriggerKind.Automatic) {
       const stillValid = await new Promise<boolean>((resolve) => {
         const timer = setTimeout(() => resolve(!token.isCancellationRequested), DEBOUNCE_MS);
@@ -127,6 +131,7 @@ export class RursorInlineCompletionProvider
       prefix,
       suffix,
       recentFiles: recentFiles.slice(-2),
+      recentEditHint: this.recentEditHint || undefined,
       model,
     });
     this.activeRequestId = id;

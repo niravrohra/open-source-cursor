@@ -33,6 +33,9 @@ pub struct SetConfigParams {
     pub api_key: Option<String>,
     pub model: Option<String>,
     pub autocomplete_model: Option<String>,
+    pub autocomplete_backend: Option<String>,
+    pub local_endpoint: Option<String>,
+    pub local_model: Option<String>,
     pub workspace_root: Option<String>,
 }
 
@@ -105,14 +108,26 @@ pub struct InlineCompleteParams {
     pub suffix: String,
     #[serde(default)]
     pub recent_files: Vec<ContextSnippet>,
+    pub recent_edit_hint: Option<String>,
     pub model: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageAttachment {
+    pub mime_type: String,
+    pub data: String,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+    #[serde(default)]
+    pub images: Vec<ImageAttachment>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -125,6 +140,7 @@ pub struct ContextSnippet {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentChatParams {
+    pub session_id: Option<String>,
     pub messages: Vec<ChatMessage>,
     #[serde(default)]
     pub context_files: Vec<ContextSnippet>,
@@ -132,6 +148,8 @@ pub struct AgentChatParams {
     pub diagnostics: Vec<DiagnosticItem>,
     #[serde(default)]
     pub use_workspace_search: bool,
+    #[serde(default)]
+    pub include_git_diff: bool,
     #[serde(default = "default_mode")]
     pub mode: String,
     pub model: Option<String>,
@@ -143,6 +161,20 @@ pub struct SubmitToolResultParams {
     pub call_id: String,
     pub ok: bool,
     pub output: Value,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionIdParams {
+    pub session_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveSessionParams {
+    pub session_id: String,
+    pub title: String,
+    pub messages: Vec<ChatMessage>,
 }
 
 #[derive(Debug, Deserialize)]

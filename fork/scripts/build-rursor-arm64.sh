@@ -26,8 +26,9 @@ if [[ ! -d "${VSCODE_DIR}" ]]; then
   git clone --depth 1 --branch "${VSCODE_TAG}" https://github.com/microsoft/vscode.git "${VSCODE_DIR}"
 fi
 
-echo "=== 4. Applying Rursor product.json & bundling rursor-ai ==="
+echo "=== 4. Applying Rursor product.json, app icon & bundling rursor-ai ==="
 cp "${ROOT_DIR}/fork/product.json" "${VSCODE_DIR}/product.json"
+cp "${ROOT_DIR}/fork/resources/darwin/rursor.icns" "${VSCODE_DIR}/resources/darwin/code.icns"
 rm -rf "${VSCODE_DIR}/extensions/rursor-ai"
 mkdir -p "${VSCODE_DIR}/extensions/rursor-ai"
 cp -R \

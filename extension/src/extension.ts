@@ -30,19 +30,28 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   tabStatus.show();
   context.subscriptions.push(tabStatus);
 
+  let agentProvider: AgentPanelProvider | undefined;
+
   const syncConfig = async (modelOverride?: string): Promise<void> => {
     const cfg = vscode.workspace.getConfiguration('rursor');
     const apiKey = await context.secrets.get(SECRET_GEMINI_KEY);
     const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     const model = modelOverride ?? cfg.get<string>('defaultModel', 'gemini-2.5-flash');
     const autocompleteModel = cfg.get<string>('autocomplete.model', 'gemini-2.5-flash-lite');
+    const autocompleteBackend = cfg.get<string>('autocomplete.backend', 'gemini');
+    const localEndpoint = cfg.get<string>('autocomplete.localEndpoint', 'http://127.0.0.1:11434');
+    const localModel = cfg.get<string>('autocomplete.localModel', 'qwen2.5-coder:7b');
     const { promise } = client.request('set_config', {
       apiKey,
       model,
       autocompleteModel,
+      autocompleteBackend,
+      localEndpoint,
+      localModel,
       workspaceRoot,
     });
     await promise.catch(() => undefined);
+    await agentProvider?.refreshStatus();
   };
 
   void syncConfig();
@@ -70,7 +79,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     vscode.languages.registerInlineCompletionItemProvider({ pattern: '**' }, completionProvider)
   );
 
-  const agentProvider = new AgentPanelProvider(client, diffProvider, async (model) => {
+  agentProvider = new AgentPanelProvider(client, diffProvider, async (model) => {
     await syncConfig(model);
   });
   context.subscriptions.push(
@@ -166,6 +175,24 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }),
     vscode.commands.registerCommand('rursor.openAgent', async () => {
       await vscode.commands.executeCommand('workbench.view.extension.rursor-sidebar');
+    }),
+    vscode.commands.registerCommand('rursor.reloadMcp', async () => {
+      try {
+        const { promise } = client.request<{
+          servers: Array<{ name: string; connected: boolean; toolCount: number; error?: string }>;
+        }>('reload_mcp');
+        const res = await promise;
+        const servers = res.servers ?? [];
+        const connected = servers.filter((s) => s.connected).length;
+        await agentProvider?.refreshStatus();
+        vscode.window.showInformationMessage(
+          `Rursor MCP reloaded: ${connected}/${servers.length} servers connected.`
+        );
+      } catch (err) {
+        vscode.window.showErrorMessage(
+          `Failed to reload MCP servers: ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
     })
   );
 }

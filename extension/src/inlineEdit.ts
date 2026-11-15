@@ -2,19 +2,36 @@ import * as vscode from 'vscode';
 import { SidecarClient } from './sidecarClient';
 
 const CONTEXT_LINES_AROUND = 80;
+const MAX_PROMPT_HISTORY = 8;
 
 const addedHighlight = vscode.window.createTextEditorDecorationType({
-  backgroundColor: 'rgba(46, 160, 67, 0.20)',
+  backgroundColor: 'rgba(46, 160, 67, 0.22)',
   borderWidth: '0 0 0 3px',
   borderStyle: 'solid',
-  borderColor: 'rgba(46, 160, 67, 0.85)',
+  borderColor: 'rgba(46, 160, 67, 0.90)',
   isWholeLine: true,
 });
 
+const removedHighlight = vscode.window.createTextEditorDecorationType({
+  backgroundColor: 'rgba(248, 81, 73, 0.22)',
+  borderWidth: '0 0 0 3px',
+  borderStyle: 'solid',
+  borderColor: 'rgba(248, 81, 73, 0.90)',
+  textDecoration: 'line-through',
+  opacity: '0.82',
+  isWholeLine: true,
+});
+
+export interface DiffLineEntry {
+  kind: 'same' | 'removed' | 'added';
+  text: string;
+}
+
 interface PendingInlineEdit {
   uri: vscode.Uri;
-  range: vscode.Range;
+  diffRange: vscode.Range;
   originalText: string;
+  replacementText: string;
   lastInstruction: string;
 }
 
@@ -22,6 +39,7 @@ export class InlineEditSessionManager implements vscode.CodeLensProvider, vscode
   private readonly onDidChangeCodeLensesEmitter = new vscode.EventEmitter<void>();
   public readonly onDidChangeCodeLenses = this.onDidChangeCodeLensesEmitter.event;
   private session: PendingInlineEdit | undefined;
+  private promptHistory: string[] = [];
 
   constructor(private readonly client: SidecarClient) {}
 
@@ -29,7 +47,7 @@ export class InlineEditSessionManager implements vscode.CodeLensProvider, vscode
     if (!this.session || this.session.uri.toString() !== document.uri.toString()) {
       return [];
     }
-    const line = Math.max(0, Math.min(this.session.range.start.line, document.lineCount - 1));
+    const line = Math.max(0, Math.min(this.session.diffRange.start.line, document.lineCount - 1));
     const lensRange = new vscode.Range(line, 0, line, 0);
     return [
       new vscode.CodeLens(lensRange, {
@@ -54,7 +72,6 @@ export class InlineEditSessionManager implements vscode.CodeLensProvider, vscode
       return;
     }
 
-    // Clear any prior unaccepted session decoration before starting a new edit.
     if (this.session) {
       await this.acceptSession();
     }
@@ -70,22 +87,80 @@ export class InlineEditSessionManager implements vscode.CodeLensProvider, vscode
     const matchingDiagnostics = collectDiagnosticsNearRange(doc.uri, selection);
 
     const instruction =
-      presetInstruction ??
-      (await vscode.window.showInputBox({
-        title: 'Rursor Inline Edit (Cmd+K)',
-        prompt:
-          matchingDiagnostics.length > 0
-            ? `Describe edit (${matchingDiagnostics.length} diagnostic(s) attached automatically)`
-            : 'Describe how to edit the selected code (or generate at cursor)',
-        value: matchingDiagnostics.length > 0 ? 'Fix the diagnostics in this code' : '',
-        placeHolder: 'e.g., Add error handling and return early on invalid input',
-      }));
+      presetInstruction ?? (await this.promptInstructionWithQuickPick(matchingDiagnostics.length));
 
     if (!instruction?.trim()) {
       return;
     }
 
+    this.recordPrompt(instruction.trim());
     await this.executeEdit(editor, selection, instruction.trim(), matchingDiagnostics);
+  }
+
+  private async promptInstructionWithQuickPick(diagnosticCount: number): Promise<string | undefined> {
+    const qp = vscode.window.createQuickPick<vscode.QuickPickItem>();
+    qp.title = 'Rursor Inline Edit (Cmd+K)';
+    qp.placeholder =
+      diagnosticCount > 0
+        ? `Type an instruction or pick an action (${diagnosticCount} diagnostic(s) attached)`
+        : 'Type an instruction (or pick a preset / recent prompt)…';
+    qp.matchOnDescription = true;
+
+    const baseItems: vscode.QuickPickItem[] = [
+      ...(diagnosticCount > 0
+        ? [
+            {
+              label: '$(wrench) Fix the diagnostics in this code',
+              description: `${diagnosticCount} active diagnostic(s)`,
+            },
+          ]
+        : []),
+      { label: '$(sparkle) Refactor and improve readability', description: 'Preset' },
+      { label: '$(shield) Add robust error handling and edge-case checks', description: 'Preset' },
+      { label: '$(beaker) Write unit tests for this code', description: 'Preset' },
+      { label: '$(comment) Add concise docstrings / comments', description: 'Preset' },
+      ...this.promptHistory.map((h) => ({ label: `$(history) ${h}`, description: 'Recent' })),
+    ];
+
+    qp.items = baseItems;
+    qp.onDidChangeValue((val) => {
+      const trimmed = val.trim();
+      if (!trimmed) {
+        qp.items = baseItems;
+      } else {
+        qp.items = [
+          { label: `$(play) ${trimmed}`, description: 'Run custom instruction' },
+          ...baseItems,
+        ];
+      }
+    });
+
+    return new Promise<string | undefined>((resolve) => {
+      let resolved = false;
+      qp.onDidAccept(() => {
+        resolved = true;
+        const selected = qp.selectedItems[0];
+        const raw = selected
+          ? selected.label.replace(/^\$\([a-z-]+\)\s*/, '')
+          : qp.value.trim();
+        qp.hide();
+        resolve(raw || undefined);
+      });
+      qp.onDidHide(() => {
+        qp.dispose();
+        if (!resolved) {
+          resolve(undefined);
+        }
+      });
+      qp.show();
+    });
+  }
+
+  private recordPrompt(prompt: string): void {
+    this.promptHistory = [prompt, ...this.promptHistory.filter((p) => p !== prompt)].slice(
+      0,
+      MAX_PROMPT_HISTORY
+    );
   }
 
   async refineSession(): Promise<void> {
@@ -107,16 +182,33 @@ export class InlineEditSessionManager implements vscode.CodeLensProvider, vscode
       return;
     }
 
-    const currentRange = this.session.range;
-    const originalBeforeAll = this.session.originalText;
-    const diagnostics = collectDiagnosticsNearRange(editor.document.uri, currentRange);
+    const session = this.session;
+    // Strip temporary removed-line diff preview back to clean replacement before refining.
+    await editor.edit((builder) => {
+      builder.replace(session.diffRange, session.replacementText);
+    });
 
+    const lines = session.replacementText.split('\n');
+    const cleanEndLine = Math.min(
+      editor.document.lineCount - 1,
+      session.diffRange.start.line + lines.length - 1
+    );
+    const cleanEndChar =
+      lines.length === 1
+        ? session.diffRange.start.character + lines[0].length
+        : lines[lines.length - 1].length;
+    const cleanRange = new vscode.Range(
+      session.diffRange.start,
+      new vscode.Position(cleanEndLine, cleanEndChar)
+    );
+
+    const diagnostics = collectDiagnosticsNearRange(editor.document.uri, cleanRange);
     await this.executeEdit(
       editor,
-      currentRange,
-      `${this.session.lastInstruction}\nFollow-up refinement: ${followUp.trim()}`,
+      cleanRange,
+      `${session.lastInstruction}\nFollow-up refinement: ${followUp.trim()}`,
       diagnostics,
-      originalBeforeAll
+      session.originalText
     );
   }
 
@@ -124,12 +216,23 @@ export class InlineEditSessionManager implements vscode.CodeLensProvider, vscode
     if (!this.session) {
       return;
     }
-    const targetUri = this.session.uri.toString();
-    for (const editor of vscode.window.visibleTextEditors) {
-      if (editor.document.uri.toString() === targetUri) {
-        editor.setDecorations(addedHighlight, []);
-      }
+    const session = this.session;
+    const editor = vscode.window.visibleTextEditors.find(
+      (e) => e.document.uri.toString() === session.uri.toString()
+    );
+
+    if (editor) {
+      editor.setDecorations(addedHighlight, []);
+      editor.setDecorations(removedHighlight, []);
+      await editor.edit((builder) => {
+        builder.replace(session.diffRange, session.replacementText);
+      });
+    } else {
+      const wsEdit = new vscode.WorkspaceEdit();
+      wsEdit.replace(session.uri, session.diffRange, session.replacementText);
+      await vscode.workspace.applyEdit(wsEdit);
     }
+
     this.session = undefined;
     await vscode.commands.executeCommand('setContext', 'rursor.hasActiveInlineEdit', false);
     this.onDidChangeCodeLensesEmitter.fire();
@@ -146,12 +249,13 @@ export class InlineEditSessionManager implements vscode.CodeLensProvider, vscode
 
     if (editor) {
       editor.setDecorations(addedHighlight, []);
-      await editor.edit((editBuilder) => {
-        editBuilder.replace(session.range, session.originalText);
+      editor.setDecorations(removedHighlight, []);
+      await editor.edit((builder) => {
+        builder.replace(session.diffRange, session.originalText);
       });
     } else {
       const wsEdit = new vscode.WorkspaceEdit();
-      wsEdit.replace(session.uri, session.range, session.originalText);
+      wsEdit.replace(session.uri, session.diffRange, session.originalText);
       await vscode.workspace.applyEdit(wsEdit);
     }
 
@@ -205,9 +309,25 @@ export class InlineEditSessionManager implements vscode.CodeLensProvider, vscode
             return;
           }
 
+          const originalForDiff = preservedOriginalText ?? selectedText;
           const replacement = result.replacement;
+
+          // Build interleaved red/green diff preview when inline edit spans whole lines.
+          const isWholeLineEdit =
+            targetRange.start.character === 0 &&
+            (targetRange.end.character === doc.lineAt(targetRange.end.line).text.length ||
+              selectedText.includes('\n'));
+
+          const diffEntries = isWholeLineEdit
+            ? computeLineDiff(originalForDiff.split('\n'), replacement.split('\n'))
+            : [{ kind: 'added' as const, text: replacement }];
+
+          const previewText = isWholeLineEdit
+            ? diffEntries.map((e) => e.text).join('\n')
+            : replacement;
+
           const applied = await editor.edit((editBuilder) => {
-            editBuilder.replace(targetRange, replacement);
+            editBuilder.replace(targetRange, previewText);
           });
 
           if (!applied) {
@@ -215,23 +335,45 @@ export class InlineEditSessionManager implements vscode.CodeLensProvider, vscode
             return;
           }
 
-          const lines = replacement.split('\n');
-          const endLine = Math.min(doc.lineCount - 1, targetRange.start.line + lines.length - 1);
+          const previewLines = previewText.split('\n');
+          const endLine = Math.min(
+            doc.lineCount - 1,
+            targetRange.start.line + previewLines.length - 1
+          );
           const endChar =
-            lines.length === 1
-              ? targetRange.start.character + lines[0].length
-              : lines[lines.length - 1].length;
-          const newRange = new vscode.Range(targetRange.start, new vscode.Position(endLine, endChar));
-          const highlightRange = new vscode.Range(
-            new vscode.Position(targetRange.start.line, 0),
-            doc.lineAt(endLine).range.end
+            previewLines.length === 1
+              ? targetRange.start.character + previewLines[0].length
+              : previewLines[previewLines.length - 1].length;
+          const diffRange = new vscode.Range(
+            targetRange.start,
+            new vscode.Position(endLine, endChar)
           );
 
-          editor.setDecorations(addedHighlight, [highlightRange]);
+          const addedRanges: vscode.Range[] = [];
+          const removedRanges: vscode.Range[] = [];
+
+          if (isWholeLineEdit) {
+            diffEntries.forEach((entry, offset) => {
+              const lineIdx = Math.min(doc.lineCount - 1, targetRange.start.line + offset);
+              const lineRange = doc.lineAt(lineIdx).range;
+              if (entry.kind === 'added') {
+                addedRanges.push(lineRange);
+              } else if (entry.kind === 'removed') {
+                removedRanges.push(lineRange);
+              }
+            });
+          } else {
+            addedRanges.push(diffRange);
+          }
+
+          editor.setDecorations(addedHighlight, addedRanges);
+          editor.setDecorations(removedHighlight, removedRanges);
+
           this.session = {
             uri: doc.uri,
-            range: newRange,
-            originalText: preservedOriginalText ?? selectedText,
+            diffRange,
+            originalText: originalForDiff,
+            replacementText: replacement,
             lastInstruction: instruction,
           };
 
@@ -270,6 +412,53 @@ export class RursorCodeActionProvider implements vscode.CodeActionProvider {
     action.diagnostics = [...context.diagnostics];
     return [action];
   }
+}
+
+/** LCS line diff producing interleaved removed/added hunks for inline editor preview. */
+export function computeLineDiff(before: string[], after: string[]): DiffLineEntry[] {
+  const n = before.length;
+  const m = after.length;
+  if (n * m > 40_000) {
+    return [
+      ...before.map((text) => ({ kind: 'removed' as const, text })),
+      ...after.map((text) => ({ kind: 'added' as const, text })),
+    ];
+  }
+
+  const dp: number[][] = Array.from({ length: n + 1 }, () => Array<number>(m + 1).fill(0));
+  for (let i = n - 1; i >= 0; i--) {
+    for (let j = m - 1; j >= 0; j--) {
+      if (before[i] === after[j]) {
+        dp[i][j] = 1 + dp[i + 1][j + 1];
+      } else {
+        dp[i][j] = Math.max(dp[i + 1][j], dp[i][j + 1]);
+      }
+    }
+  }
+
+  const out: DiffLineEntry[] = [];
+  let i = 0;
+  let j = 0;
+  while (i < n && j < m) {
+    if (before[i] === after[j]) {
+      out.push({ kind: 'same', text: before[i] });
+      i++;
+      j++;
+    } else if (dp[i + 1][j] >= dp[i][j + 1]) {
+      out.push({ kind: 'removed', text: before[i] });
+      i++;
+    } else {
+      out.push({ kind: 'added', text: after[j] });
+      j++;
+    }
+  }
+  while (i < n) {
+    out.push({ kind: 'removed', text: before[i++] });
+  }
+  while (j < m) {
+    out.push({ kind: 'added', text: after[j++] });
+  }
+  return out;
 }
 
 function collectDiagnosticsNearRange(

@@ -1,14 +1,23 @@
 mod context;
 mod gemini;
+mod local_llm;
+mod mcp;
 mod protocol;
+mod rules;
+mod sessions;
 
 use crate::context::WorkspaceIndex;
-use crate::gemini::GeminiClient;
+use crate::gemini::{chat_message_to_gemini_content, GeminiClient};
+use crate::local_llm::LocalLlmClient;
+use crate::mcp::McpManager;
 use crate::protocol::{
     AgentChatParams, CancelParams, ChatMessage, GrepWorkspaceParams, IndexWorkspaceParams,
     InlineCompleteParams, InlineEditParams, RemoveFileParams, RpcEvent, RpcRequest, RpcResponse,
-    SearchContextParams, SetConfigParams, SubmitToolResultParams, UpdateFileParams,
+    SaveSessionParams, SearchContextParams, SessionIdParams, SetConfigParams,
+    SubmitToolResultParams, UpdateFileParams,
 };
+use crate::rules::load_workspace_rules;
+use crate::sessions::SessionStore;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -20,7 +29,9 @@ use tokio::task::JoinHandle;
 
 const DEFAULT_GEMINI_MODEL: &str = "gemini-2.5-flash";
 const DEFAULT_AUTOCOMPLETE_MODEL: &str = "gemini-2.5-flash-lite";
-const MAX_AGENT_STEPS: usize = 12;
+const DEFAULT_LOCAL_ENDPOINT: &str = "http://127.0.0.1:11434";
+const DEFAULT_LOCAL_MODEL: &str = "qwen2.5-coder:7b";
+const MAX_AGENT_STEPS: usize = 16;
 
 static NEXT_TOOL_CALL_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -33,8 +44,15 @@ struct AppState {
     api_key: RwLock<Option<String>>,
     model: RwLock<String>,
     autocomplete_model: RwLock<String>,
+    autocomplete_backend: RwLock<String>,
+    local_endpoint: RwLock<String>,
+    local_model: RwLock<String>,
+    workspace_rules: RwLock<Option<String>>,
     index: RwLock<WorkspaceIndex>,
     gemini: GeminiClient,
+    local_llm: LocalLlmClient,
+    mcp: RwLock<McpManager>,
+    sessions: SessionStore,
     in_flight: Mutex<HashMap<u64, JoinHandle<()>>>,
     pending_tools: Mutex<HashMap<String, oneshot::Sender<ToolResultPayload>>>,
 }
@@ -48,8 +66,15 @@ impl AppState {
             api_key: RwLock::new(env_key),
             model: RwLock::new(DEFAULT_GEMINI_MODEL.to_string()),
             autocomplete_model: RwLock::new(DEFAULT_AUTOCOMPLETE_MODEL.to_string()),
+            autocomplete_backend: RwLock::new("gemini".to_string()),
+            local_endpoint: RwLock::new(DEFAULT_LOCAL_ENDPOINT.to_string()),
+            local_model: RwLock::new(DEFAULT_LOCAL_MODEL.to_string()),
+            workspace_rules: RwLock::new(None),
             index: RwLock::new(WorkspaceIndex::default()),
             gemini: GeminiClient::new(),
+            local_llm: LocalLlmClient::new(),
+            mcp: RwLock::new(McpManager::default()),
+            sessions: SessionStore::default_store(),
             in_flight: Mutex::new(HashMap::new()),
             pending_tools: Mutex::new(HashMap::new()),
         }
@@ -181,6 +206,9 @@ async fn dispatch(
             let has_key = state.api_key.read().await.is_some();
             let model = state.model.read().await.clone();
             let autocomplete_model = state.autocomplete_model.read().await.clone();
+            let autocomplete_backend = state.autocomplete_backend.read().await.clone();
+            let has_rules = state.workspace_rules.read().await.is_some();
+            let mcp_servers = state.mcp.read().await.statuses();
             let index = state.index.read().await;
             RpcResponse::ok(
                 req.id,
@@ -189,7 +217,10 @@ async fn dispatch(
                     "hasApiKey": has_key,
                     "model": model,
                     "autocompleteModel": autocomplete_model,
+                    "autocompleteBackend": autocomplete_backend,
                     "indexedFiles": index.files.len(),
+                    "hasWorkspaceRules": has_rules,
+                    "mcpServers": mcp_servers,
                     "workspaceRoot": index.root.as_ref().map(|p| p.display().to_string()),
                 }),
             )
@@ -217,11 +248,31 @@ async fn dispatch(
                     *state.autocomplete_model.write().await = ac_model.trim().to_string();
                 }
             }
-            if let Some(root) = params.workspace_root {
-                let mut index = state.index.write().await;
-                if let Err(e) = index.index_directory(&PathBuf::from(root)) {
-                    return RpcResponse::err(req.id, e);
+            if let Some(backend) = params.autocomplete_backend {
+                if !backend.trim().is_empty() {
+                    *state.autocomplete_backend.write().await = backend.trim().to_lowercase();
                 }
+            }
+            if let Some(endpoint) = params.local_endpoint {
+                if !endpoint.trim().is_empty() {
+                    *state.local_endpoint.write().await = endpoint.trim().to_string();
+                }
+            }
+            if let Some(local_model) = params.local_model {
+                if !local_model.trim().is_empty() {
+                    *state.local_model.write().await = local_model.trim().to_string();
+                }
+            }
+            if let Some(root) = params.workspace_root {
+                let root_path = PathBuf::from(&root);
+                {
+                    let mut index = state.index.write().await;
+                    if let Err(e) = index.index_directory(&root_path) {
+                        return RpcResponse::err(req.id, e);
+                    }
+                }
+                *state.workspace_rules.write().await = load_workspace_rules(&root_path);
+                let _ = state.mcp.write().await.reload(Some(&root_path)).await;
             }
             RpcResponse::ok(req.id, json!({ "updated": true }))
         }
@@ -232,9 +283,64 @@ async fn dispatch(
                     return RpcResponse::err(req.id, format!("Invalid index_workspace params: {e}"))
                 }
             };
-            let mut index = state.index.write().await;
-            match index.index_directory(&PathBuf::from(&params.workspace_root)) {
-                Ok(count) => RpcResponse::ok(req.id, json!({ "indexedFiles": count })),
+            let root_path = PathBuf::from(&params.workspace_root);
+            let count = {
+                let mut index = state.index.write().await;
+                match index.index_directory(&root_path) {
+                    Ok(c) => c,
+                    Err(e) => return RpcResponse::err(req.id, e),
+                }
+            };
+            *state.workspace_rules.write().await = load_workspace_rules(&root_path);
+            RpcResponse::ok(req.id, json!({ "indexedFiles": count }))
+        }
+        "reload_mcp" => {
+            let root = state.index.read().await.root.clone();
+            let statuses = state.mcp.write().await.reload(root.as_deref()).await;
+            RpcResponse::ok(req.id, json!({ "servers": statuses }))
+        }
+        "mcp_status" => {
+            let statuses = state.mcp.read().await.statuses();
+            RpcResponse::ok(req.id, json!({ "servers": statuses }))
+        }
+        "list_sessions" => {
+            let root = state.index.read().await.root.clone();
+            let sessions = state.sessions.list(root.as_deref());
+            RpcResponse::ok(req.id, json!({ "sessions": sessions }))
+        }
+        "load_session" => {
+            let params: SessionIdParams = match serde_json::from_value(req.params) {
+                Ok(p) => p,
+                Err(e) => return RpcResponse::err(req.id, format!("Invalid load_session params: {e}")),
+            };
+            let root = state.index.read().await.root.clone();
+            match state.sessions.load(root.as_deref(), &params.session_id) {
+                Ok(sess) => RpcResponse::ok(req.id, json!({ "session": sess })),
+                Err(e) => RpcResponse::err(req.id, e),
+            }
+        }
+        "save_session" => {
+            let params: SaveSessionParams = match serde_json::from_value(req.params) {
+                Ok(p) => p,
+                Err(e) => return RpcResponse::err(req.id, format!("Invalid save_session params: {e}")),
+            };
+            let root = state.index.read().await.root.clone();
+            match state
+                .sessions
+                .save(root.as_deref(), &params.session_id, &params.title, params.messages)
+            {
+                Ok(summary) => RpcResponse::ok(req.id, json!({ "summary": summary })),
+                Err(e) => RpcResponse::err(req.id, e),
+            }
+        }
+        "delete_session" => {
+            let params: SessionIdParams = match serde_json::from_value(req.params) {
+                Ok(p) => p,
+                Err(e) => return RpcResponse::err(req.id, format!("Invalid delete_session params: {e}")),
+            };
+            let root = state.index.read().await.root.clone();
+            match state.sessions.delete(root.as_deref(), &params.session_id) {
+                Ok(deleted) => RpcResponse::ok(req.id, json!({ "deleted": deleted })),
                 Err(e) => RpcResponse::err(req.id, e),
             }
         }
@@ -269,6 +375,17 @@ async fn dispatch(
             let hits = index.search(&params.query, params.limit);
             RpcResponse::ok(req.id, json!({ "hits": hits }))
         }
+        "search_symbols" => {
+            let params: SearchContextParams = match serde_json::from_value(req.params) {
+                Ok(p) => p,
+                Err(e) => {
+                    return RpcResponse::err(req.id, format!("Invalid search_symbols params: {e}"))
+                }
+            };
+            let index = state.index.read().await;
+            let hits = index.search_symbols(&params.query, params.limit);
+            RpcResponse::ok(req.id, json!({ "symbols": hits }))
+        }
         "grep_workspace" => {
             let params: GrepWorkspaceParams = match serde_json::from_value(req.params) {
                 Ok(p) => p,
@@ -279,6 +396,13 @@ async fn dispatch(
             let index = state.index.read().await;
             let hits = index.grep(&params.query, params.case_sensitive, params.limit);
             RpcResponse::ok(req.id, json!({ "hits": hits }))
+        }
+        "git_context" => {
+            let index = state.index.read().await;
+            match index.git_context() {
+                Ok(ctx) => RpcResponse::ok(req.id, json!({ "context": ctx })),
+                Err(e) => RpcResponse::err(req.id, e),
+            }
         }
         "list_files" => {
             let prefix = req
@@ -329,7 +453,17 @@ async fn handle_inline_edit(
         diag_block.push_str("</diagnostics>");
     }
 
-    let system_prompt = "You are Rursor's inline code editor. Output ONLY the exact replacement code for the <selection> region—no markdown code fences, no explanations, no surrounding context, and preserve indentation.";
+    let rules_section = state
+        .workspace_rules
+        .read()
+        .await
+        .clone()
+        .map(|r| format!("\n\nWorkspace Rules:\n{r}"))
+        .unwrap_or_default();
+
+    let system_prompt = format!(
+        "You are Rursor's inline code editor. Output ONLY the exact replacement code for the <selection> region—no markdown code fences, no explanations, no surrounding context, and preserve indentation.{rules_section}"
+    );
     let user_prompt = format!(
         "File: {file} ({lang})\n\n<prefix>\n{prefix}\n</prefix>\n\n<selection>\n{selection}\n</selection>\n\n<suffix>\n{suffix}\n</suffix>{diag}\n\nInstruction: {instruction}",
         file = params.file_path,
@@ -344,12 +478,13 @@ async fn handle_inline_edit(
     let messages = vec![ChatMessage {
         role: "user".to_string(),
         content: user_prompt,
+        images: vec![],
     }];
 
     let req_id = req.id;
     let res = state
         .gemini
-        .stream_chat(&api_key, &model, Some(system_prompt), &messages, 0.2, None, |delta| {
+        .stream_chat(&api_key, &model, Some(&system_prompt), &messages, 0.2, None, |delta| {
             emit_event(out_tx, req_id, "stream_chunk", json!({ "text": delta }));
         })
         .await;
@@ -369,18 +504,14 @@ async fn handle_inline_complete(req: RpcRequest, state: Arc<AppState>) -> RpcRes
         Err(e) => return RpcResponse::err(req.id, format!("Invalid inline_complete params: {e}")),
     };
 
-    let Some(api_key) = state.api_key.read().await.clone() else {
-        return RpcResponse::ok(req.id, json!({ "completion": "" }));
-    };
-
-    let model = match params.model {
-        Some(m) if !m.trim().is_empty() => m,
-        _ => state.autocomplete_model.read().await.clone(),
-    };
-
     let mut recent_block = String::new();
     for rf in params.recent_files.iter().take(2) {
         recent_block.push_str(&format!("\n--- Related file: {} ---\n{}\n", rf.path, rf.content));
+    }
+    if let Some(hint) = &params.recent_edit_hint {
+        if !hint.trim().is_empty() {
+            recent_block.push_str(&format!("\n--- Recent edit ---\n{hint}\n"));
+        }
     }
 
     let system_prompt = "You are Rursor's low-latency Tab autocomplete engine. Complete the code exactly at <CURSOR>. Output ONLY the raw text to insert at <CURSOR>—no markdown fences, no commentary, do not repeat the prefix or suffix. Return empty output if no confident continuation is needed.";
@@ -393,9 +524,55 @@ async fn handle_inline_complete(req: RpcRequest, state: Arc<AppState>) -> RpcRes
         suffix = params.suffix
     );
 
+    let backend = state.autocomplete_backend.read().await.clone();
+    let local_endpoint = state.local_endpoint.read().await.clone();
+    let local_model = state.local_model.read().await.clone();
+
+    if backend == "ollama" || backend == "mlx" || backend == "auto" {
+        let try_backend = if backend == "auto" {
+            if local_endpoint.contains("11434") {
+                "ollama"
+            } else {
+                "mlx"
+            }
+        } else {
+            backend.as_str()
+        };
+
+        match state
+            .local_llm
+            .complete_fim(try_backend, &local_endpoint, &local_model, system_prompt, &user_prompt)
+            .await
+        {
+            Ok(raw) => {
+                let completion = clean_fim_completion(&raw, &params.prefix, &params.suffix);
+                return RpcResponse::ok(
+                    req.id,
+                    json!({ "completion": completion, "backend": try_backend }),
+                );
+            }
+            Err(err) if backend != "auto" => {
+                return RpcResponse::err(req.id, err);
+            }
+            Err(_) => {
+                // In 'auto' mode, fall back silently to Gemini Cloud API.
+            }
+        }
+    }
+
+    let Some(api_key) = state.api_key.read().await.clone() else {
+        return RpcResponse::ok(req.id, json!({ "completion": "" }));
+    };
+
+    let model = match params.model {
+        Some(m) if !m.trim().is_empty() => m,
+        _ => state.autocomplete_model.read().await.clone(),
+    };
+
     let messages = vec![ChatMessage {
         role: "user".to_string(),
         content: user_prompt,
+        images: vec![],
     }];
 
     let res = state
@@ -406,7 +583,7 @@ async fn handle_inline_complete(req: RpcRequest, state: Arc<AppState>) -> RpcRes
     match res {
         Ok(raw) => {
             let completion = clean_fim_completion(&raw, &params.prefix, &params.suffix);
-            RpcResponse::ok(req.id, json!({ "completion": completion }))
+            RpcResponse::ok(req.id, json!({ "completion": completion, "backend": "gemini" }))
         }
         Err(e) => RpcResponse::err(req.id, e),
     }
@@ -442,6 +619,12 @@ async fn handle_agent_chat(
         }
     }
 
+    if params.include_git_diff {
+        if let Ok(git_ctx) = state.index.read().await.git_context() {
+            context_blocks.push_str(&format!("\n{git_ctx}\n"));
+        }
+    }
+
     if params.use_workspace_search {
         if let Some(last_user) = params.messages.iter().rev().find(|m| m.role == "user") {
             let hits = state.index.read().await.search(&last_user.content, 5);
@@ -454,6 +637,7 @@ async fn handle_agent_chat(
         }
     }
 
+    let original_messages = params.messages.clone();
     let mut messages = params.messages;
     if !context_blocks.is_empty() {
         if let Some(last) = messages.last_mut() {
@@ -461,39 +645,39 @@ async fn handle_agent_chat(
         }
     }
 
+    let rules_block = state
+        .workspace_rules
+        .read()
+        .await
+        .clone()
+        .map(|r| format!("\n\nProject Rules (must follow):\n{r}"))
+        .unwrap_or_default();
+
     let req_id = req.id;
 
     if params.mode == "ask" {
-        let system_prompt = "You are Rursor, a concise, accurate AI coding assistant inside a macOS code editor. Reference exact file paths and symbols from context when available, and provide clean, directly applicable code blocks.";
+        let system_prompt = format!(
+            "You are Rursor, a concise, accurate AI coding assistant inside a macOS code editor. Reference exact file paths and symbols from context when available, and provide clean, directly applicable code blocks.{rules_block}"
+        );
         let res = state
             .gemini
-            .stream_chat(&api_key, &model, Some(system_prompt), &messages, 0.3, None, |delta| {
+            .stream_chat(&api_key, &model, Some(&system_prompt), &messages, 0.3, None, |delta| {
                 emit_event(out_tx, req_id, "stream_chunk", json!({ "text": delta }));
             })
             .await;
 
         return match res {
-            Ok(full) => RpcResponse::ok(req.id, json!({ "text": full })),
+            Ok(full) => {
+                persist_session_turn(&state, params.session_id.as_deref(), original_messages, &full).await;
+                RpcResponse::ok(req.id, json!({ "text": full }))
+            }
             Err(e) => RpcResponse::err(req.id, e),
         };
     }
 
-    // Agent mode: multi-step Gemini function calling loop
-    let mut contents: Vec<Value> = messages
-        .iter()
-        .map(|m| {
-            let role = match m.role.as_str() {
-                "assistant" | "model" => "model",
-                _ => "user",
-            };
-            json!({
-                "role": role,
-                "parts": [{ "text": m.content }]
-            })
-        })
-        .collect();
-
-    let tools = Some(agent_tool_declarations());
+    let mut contents: Vec<Value> = messages.iter().map(chat_message_to_gemini_content).collect();
+    let mcp_decls = state.mcp.read().await.gemini_function_declarations();
+    let tools = Some(agent_tool_declarations(&mcp_decls));
     let workspace_root_label = state
         .index
         .read()
@@ -505,11 +689,11 @@ async fn handle_agent_chat(
 
     let system_prompt = format!(
         "You are Rursor Agent, an autonomous AI software engineer inside a macOS code editor (workspace root: {workspace_root_label}).\n\
-        Use the provided tools to inspect files, search/grep the workspace, edit or create files, and run terminal commands to verify changes.\n\
+        Use the provided tools to inspect files, search/grep/symbol-search the workspace, check git diff, edit or create files, invoke MCP tools, and run terminal commands to verify changes.\n\
         Rules:\n\
         - Always read a file before editing it unless creating a brand new file.\n\
         - Prefer minimal, exact replacements in edit_file (`old_text` must uniquely match existing text in the file).\n\
-        - Summarize the exact files modified and any verification commands run."
+        - Summarize the exact files modified and any verification commands run.{rules_block}"
     );
 
     let mut combined_text = String::new();
@@ -543,6 +727,13 @@ async fn handle_agent_chat(
         combined_text.push_str(&turn.text);
 
         if turn.function_calls.is_empty() {
+            persist_session_turn(
+                &state,
+                params.session_id.as_deref(),
+                original_messages,
+                &combined_text,
+            )
+            .await;
             return RpcResponse::ok(req.id, json!({ "text": combined_text }));
         }
 
@@ -554,15 +745,8 @@ async fn handle_agent_chat(
         let mut response_parts = Vec::new();
         for fc in turn.function_calls {
             let call_id = format!("tc_{}", NEXT_TOOL_CALL_ID.fetch_add(1, Ordering::Relaxed));
-            let result_val = execute_agent_tool(
-                req_id,
-                &call_id,
-                &fc.name,
-                &fc.args,
-                &state,
-                out_tx,
-            )
-            .await;
+            let result_val =
+                execute_agent_tool(req_id, &call_id, &fc.name, &fc.args, &state, out_tx).await;
 
             response_parts.push(json!({
                 "functionResponse": {
@@ -578,10 +762,40 @@ async fn handle_agent_chat(
         }));
     }
 
-    let suffix = "\n\n[Stopped after reaching max agent steps (12).]";
+    let suffix = "\n\n[Stopped after reaching max agent steps (16).]";
     emit_event(out_tx, req_id, "stream_chunk", json!({ "text": suffix }));
     combined_text.push_str(suffix);
+    persist_session_turn(
+        &state,
+        params.session_id.as_deref(),
+        original_messages,
+        &combined_text,
+    )
+    .await;
     RpcResponse::ok(req.id, json!({ "text": combined_text }))
+}
+
+async fn persist_session_turn(
+    state: &AppState,
+    session_id: Option<&str>,
+    mut messages: Vec<ChatMessage>,
+    assistant_text: &str,
+) {
+    let Some(id) = session_id else {
+        return;
+    };
+    messages.push(ChatMessage {
+        role: "assistant".to_string(),
+        content: assistant_text.to_string(),
+        images: vec![],
+    });
+    let title = messages
+        .iter()
+        .find(|m| m.role == "user")
+        .map(|m| m.content.lines().next().unwrap_or("Session").chars().take(48).collect::<String>())
+        .unwrap_or_else(|| "Session".to_string());
+    let root = state.index.read().await.root.clone();
+    let _ = state.sessions.save(root.as_deref(), id, &title, messages);
 }
 
 async fn execute_agent_tool(
@@ -593,7 +807,7 @@ async fn execute_agent_tool(
     out_tx: &mpsc::UnboundedSender<String>,
 ) -> Value {
     match name {
-        "read_file" | "list_files" | "search_workspace" | "grep_workspace" => {
+        "read_file" | "list_files" | "search_workspace" | "search_symbols" | "grep_workspace" | "git_context" => {
             emit_event(
                 out_tx,
                 req_id,
@@ -630,6 +844,12 @@ async fn execute_agent_tool(
                         let hits = index.search(query, limit);
                         (true, json!({ "hits": hits }))
                     }
+                    "search_symbols" => {
+                        let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
+                        let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(25) as usize;
+                        let hits = index.search_symbols(query, limit);
+                        (true, json!({ "symbols": hits }))
+                    }
                     "grep_workspace" => {
                         let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
                         let case_sensitive = args
@@ -640,6 +860,10 @@ async fn execute_agent_tool(
                         let hits = index.grep(query, case_sensitive, limit);
                         (true, json!({ "hits": hits }))
                     }
+                    "git_context" => match index.git_context() {
+                        Ok(ctx) => (true, json!({ "context": ctx })),
+                        Err(e) => (false, json!({ "error": e })),
+                    },
                     _ => unreachable!(),
                 }
             };
@@ -679,106 +903,160 @@ async fn execute_agent_tool(
                 Err(_) => json!({ "ok": false, "result": { "error": "Tool execution cancelled." } }),
             }
         }
-        unknown => json!({
-            "ok": false,
-            "result": { "error": format!("Unknown tool: {unknown}") }
-        }),
+        other => {
+            if state.mcp.read().await.has_tool(other) {
+                emit_event(
+                    out_tx,
+                    req_id,
+                    "tool_event",
+                    json!({
+                        "callId": call_id,
+                        "phase": "start",
+                        "name": other,
+                        "args": args,
+                    }),
+                );
+                let (ok, output) = match state.mcp.read().await.call_tool(other, args.clone()).await {
+                    Ok(res) => (true, res),
+                    Err(e) => (false, json!({ "error": e })),
+                };
+                emit_event(
+                    out_tx,
+                    req_id,
+                    "tool_event",
+                    json!({
+                        "callId": call_id,
+                        "phase": "done",
+                        "name": other,
+                        "ok": ok,
+                        "output": output,
+                    }),
+                );
+                json!({ "ok": ok, "result": output })
+            } else {
+                json!({
+                    "ok": false,
+                    "result": { "error": format!("Unknown tool: {other}") }
+                })
+            }
+        }
     }
 }
 
-fn agent_tool_declarations() -> Vec<Value> {
-    vec![json!({
-        "functionDeclarations": [
-            {
-                "name": "read_file",
-                "description": "Read a file inside the workspace with 1-based line numbers.",
-                "parameters": {
-                    "type": "OBJECT",
-                    "properties": {
-                        "path": { "type": "STRING", "description": "Workspace-relative path to the file." },
-                        "start_line": { "type": "INTEGER", "description": "Optional 1-based starting line." },
-                        "end_line": { "type": "INTEGER", "description": "Optional 1-based inclusive ending line." }
-                    },
-                    "required": ["path"]
-                }
-            },
-            {
-                "name": "list_files",
-                "description": "List indexed files in the workspace, optionally filtered by directory prefix.",
-                "parameters": {
-                    "type": "OBJECT",
-                    "properties": {
-                        "prefix": { "type": "STRING", "description": "Optional relative directory prefix." },
-                        "limit": { "type": "INTEGER", "description": "Max files to return (default 200)." }
-                    }
-                }
-            },
-            {
-                "name": "search_workspace",
-                "description": "Rank workspace files matching keywords in path or contents.",
-                "parameters": {
-                    "type": "OBJECT",
-                    "properties": {
-                        "query": { "type": "STRING", "description": "Space-separated keywords or symbol names." },
-                        "limit": { "type": "INTEGER", "description": "Max hits to return (default 8)." }
-                    },
-                    "required": ["query"]
-                }
-            },
-            {
-                "name": "grep_workspace",
-                "description": "Find exact line matches across indexed workspace files.",
-                "parameters": {
-                    "type": "OBJECT",
-                    "properties": {
-                        "query": { "type": "STRING", "description": "Substring to search for." },
-                        "case_sensitive": { "type": "BOOLEAN", "description": "Case sensitivity (default false)." },
-                        "limit": { "type": "INTEGER", "description": "Max line matches to return (default 30)." }
-                    },
-                    "required": ["query"]
-                }
-            },
-            {
-                "name": "edit_file",
-                "description": "Propose an exact replacement in an existing workspace file. Requires old_text to match uniquely.",
-                "parameters": {
-                    "type": "OBJECT",
-                    "properties": {
-                        "path": { "type": "STRING", "description": "Workspace-relative file path." },
-                        "old_text": { "type": "STRING", "description": "Exact existing snippet to replace." },
-                        "new_text": { "type": "STRING", "description": "Replacement code." },
-                        "explanation": { "type": "STRING", "description": "Short summary of why this edit is needed." }
-                    },
-                    "required": ["path", "old_text", "new_text"]
-                }
-            },
-            {
-                "name": "write_file",
-                "description": "Create a new file or overwrite an entire file in the workspace.",
-                "parameters": {
-                    "type": "OBJECT",
-                    "properties": {
-                        "path": { "type": "STRING", "description": "Workspace-relative file path." },
-                        "content": { "type": "STRING", "description": "Complete file contents." },
-                        "explanation": { "type": "STRING", "description": "Short summary of why this file is written." }
-                    },
-                    "required": ["path", "content"]
-                }
-            },
-            {
-                "name": "run_command",
-                "description": "Ask the user to run a shell command in the workspace root (e.g., cargo test, npm run compile) and return stdout/stderr/exit code.",
-                "parameters": {
-                    "type": "OBJECT",
-                    "properties": {
-                        "command": { "type": "STRING", "description": "Shell command to execute in workspace root." },
-                        "reason": { "type": "STRING", "description": "Why this command should be run." }
-                    },
-                    "required": ["command"]
+fn agent_tool_declarations(mcp_decls: &[Value]) -> Vec<Value> {
+    let mut decls = vec![
+        json!({
+            "name": "read_file",
+            "description": "Read a file inside the workspace with 1-based line numbers.",
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {
+                    "path": { "type": "STRING", "description": "Workspace-relative path to the file." },
+                    "start_line": { "type": "INTEGER", "description": "Optional 1-based starting line." },
+                    "end_line": { "type": "INTEGER", "description": "Optional 1-based inclusive ending line." }
+                },
+                "required": ["path"]
+            }
+        }),
+        json!({
+            "name": "list_files",
+            "description": "List indexed files in the workspace, optionally filtered by directory prefix.",
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {
+                    "prefix": { "type": "STRING", "description": "Optional relative directory prefix." },
+                    "limit": { "type": "INTEGER", "description": "Max files to return (default 200)." }
                 }
             }
-        ]
-    })]
+        }),
+        json!({
+            "name": "search_workspace",
+            "description": "Rank workspace files by path, symbol definitions, and BM25 term relevance.",
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {
+                    "query": { "type": "STRING", "description": "Space-separated keywords or symbol names." },
+                    "limit": { "type": "INTEGER", "description": "Max hits to return (default 8)." }
+                },
+                "required": ["query"]
+            }
+        }),
+        json!({
+            "name": "search_symbols",
+            "description": "Search extracted functions, structs, classes, interfaces, and types across the workspace.",
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {
+                    "query": { "type": "STRING", "description": "Symbol substring to match." },
+                    "limit": { "type": "INTEGER", "description": "Max symbols to return (default 25)." }
+                },
+                "required": ["query"]
+            }
+        }),
+        json!({
+            "name": "grep_workspace",
+            "description": "Find exact line matches across indexed workspace files.",
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {
+                    "query": { "type": "STRING", "description": "Substring to search for." },
+                    "case_sensitive": { "type": "BOOLEAN", "description": "Case sensitivity (default false)." },
+                    "limit": { "type": "INTEGER", "description": "Max line matches to return (default 30)." }
+                },
+                "required": ["query"]
+            }
+        }),
+        json!({
+            "name": "git_context",
+            "description": "Inspect git status and current unstaged git diff in the workspace.",
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {}
+            }
+        }),
+        json!({
+            "name": "edit_file",
+            "description": "Propose an exact replacement in an existing workspace file. Requires old_text to match uniquely.",
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {
+                    "path": { "type": "STRING", "description": "Workspace-relative file path." },
+                    "old_text": { "type": "STRING", "description": "Exact existing snippet to replace." },
+                    "new_text": { "type": "STRING", "description": "Replacement code." },
+                    "explanation": { "type": "STRING", "description": "Short summary of why this edit is needed." }
+                },
+                "required": ["path", "old_text", "new_text"]
+            }
+        }),
+        json!({
+            "name": "write_file",
+            "description": "Create a new file or overwrite an entire file in the workspace.",
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {
+                    "path": { "type": "STRING", "description": "Workspace-relative file path." },
+                    "content": { "type": "STRING", "description": "Complete file contents." },
+                    "explanation": { "type": "STRING", "description": "Short summary of why this file is written." }
+                },
+                "required": ["path", "content"]
+            }
+        }),
+        json!({
+            "name": "run_command",
+            "description": "Ask the user to run a shell command in the workspace root (e.g., cargo test, npm run compile) and return stdout/stderr/exit code.",
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {
+                    "command": { "type": "STRING", "description": "Shell command to execute in workspace root." },
+                    "reason": { "type": "STRING", "description": "Why this command should be run." }
+                },
+                "required": ["command"]
+            }
+        }),
+    ];
+
+    decls.extend(mcp_decls.iter().cloned());
+    vec![json!({ "functionDeclarations": decls })]
 }
 
 fn coalesce_model_parts(parts: Vec<Value>) -> Vec<Value> {
@@ -835,13 +1113,11 @@ fn clean_fim_completion(raw: &str, prefix: &str, suffix: &str) -> String {
         return String::new();
     }
 
-    // Remove accidental overlap with the tail of prefix on the current line.
     let current_line_prefix = prefix.rsplit('\n').next().unwrap_or("");
     if !current_line_prefix.is_empty() && text.starts_with(current_line_prefix) {
         text = text[current_line_prefix.len()..].to_string();
     }
 
-    // Remove accidental overlap with the start of suffix.
     let first_suffix_line = suffix.split('\n').next().unwrap_or("").trim_end();
     if !first_suffix_line.is_empty() && text.ends_with(first_suffix_line) {
         let new_len = text.len() - first_suffix_line.len();

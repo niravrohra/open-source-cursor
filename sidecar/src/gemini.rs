@@ -96,16 +96,7 @@ impl GeminiClient {
     {
         let contents: Vec<Value> = messages
             .iter()
-            .map(|m| {
-                let role = match m.role.as_str() {
-                    "assistant" | "model" => "model",
-                    _ => "user",
-                };
-                json!({
-                    "role": role,
-                    "parts": [{ "text": m.content }]
-                })
-            })
+            .map(chat_message_to_gemini_content)
             .collect();
 
         let output = self
@@ -214,6 +205,29 @@ fn apply_parsed_chunk<F: FnMut(&str)>(
     }
     output.function_calls.extend(parsed.function_calls);
     output.raw_model_parts.extend(parsed.raw_parts);
+}
+
+pub fn chat_message_to_gemini_content(m: &ChatMessage) -> Value {
+    let role = match m.role.as_str() {
+        "assistant" | "model" => "model",
+        _ => "user",
+    };
+    let mut parts = Vec::new();
+    for img in &m.images {
+        parts.push(json!({
+            "inlineData": {
+                "mimeType": img.mime_type,
+                "data": img.data
+            }
+        }));
+    }
+    if !m.content.is_empty() || parts.is_empty() {
+        parts.push(json!({ "text": m.content }));
+    }
+    json!({
+        "role": role,
+        "parts": parts
+    })
 }
 
 fn parse_sse_data(raw: &str) -> Result<Option<ParsedChunk>, String> {
