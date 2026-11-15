@@ -41,7 +41,7 @@ export class InlineEditSessionManager implements vscode.CodeLensProvider, vscode
   private session: PendingInlineEdit | undefined;
   private promptHistory: string[] = [];
 
-  constructor(private readonly client: SidecarClient) {}
+  constructor(private readonly client: SidecarClient) { }
 
   provideCodeLenses(document: vscode.TextDocument): vscode.CodeLens[] {
     if (!this.session || this.session.uri.toString() !== document.uri.toString()) {
@@ -69,15 +69,15 @@ export class InlineEditSessionManager implements vscode.CodeLensProvider, vscode
     presetOrBridge?:
       | string
       | {
-          prompt?: string;
-          range?: {
-            startLineNumber: number;
-            startColumn: number;
-            endLineNumber: number;
-            endColumn: number;
-          };
-          uri?: string;
-        }
+        prompt?: string;
+        range?: {
+          startLineNumber: number;
+          startColumn: number;
+          endLineNumber: number;
+          endColumn: number;
+        };
+        uri?: string;
+      }
   ): Promise<void> {
     const editor = vscode.window.activeTextEditor;
     if (!editor) {
@@ -97,9 +97,9 @@ export class InlineEditSessionManager implements vscode.CodeLensProvider, vscode
       presetInstruction = presetOrBridge;
       selection = editor.selection.isEmpty
         ? new vscode.Selection(
-            new vscode.Position(editor.selection.active.line, 0),
-            doc.lineAt(editor.selection.active.line).range.end
-          )
+          new vscode.Position(editor.selection.active.line, 0),
+          doc.lineAt(editor.selection.active.line).range.end
+        )
         : editor.selection;
     } else if (presetOrBridge && typeof presetOrBridge === 'object') {
       presetInstruction = presetOrBridge.prompt;
@@ -112,17 +112,17 @@ export class InlineEditSessionManager implements vscode.CodeLensProvider, vscode
       } else {
         selection = editor.selection.isEmpty
           ? new vscode.Selection(
-              new vscode.Position(editor.selection.active.line, 0),
-              doc.lineAt(editor.selection.active.line).range.end
-            )
+            new vscode.Position(editor.selection.active.line, 0),
+            doc.lineAt(editor.selection.active.line).range.end
+          )
           : editor.selection;
       }
     } else {
       selection = editor.selection.isEmpty
         ? new vscode.Selection(
-            new vscode.Position(editor.selection.active.line, 0),
-            doc.lineAt(editor.selection.active.line).range.end
-          )
+          new vscode.Position(editor.selection.active.line, 0),
+          doc.lineAt(editor.selection.active.line).range.end
+        )
         : editor.selection;
     }
 
@@ -151,11 +151,11 @@ export class InlineEditSessionManager implements vscode.CodeLensProvider, vscode
     const baseItems: vscode.QuickPickItem[] = [
       ...(diagnosticCount > 0
         ? [
-            {
-              label: '$(wrench) Fix the diagnostics in this code',
-              description: `${diagnosticCount} active diagnostic(s)`,
-            },
-          ]
+          {
+            label: '$(wrench) Fix the diagnostics in this code',
+            description: `${diagnosticCount} active diagnostic(s)`,
+          },
+        ]
         : []),
       { label: '$(sparkle) Refactor and improve readability', description: 'Preset' },
       { label: '$(shield) Add robust error handling and edge-case checks', description: 'Preset' },

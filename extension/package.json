@@ -39,6 +39,14 @@
         "title": "Rursor: Set Gemini API Key"
       },
       {
+        "command": "rursor.setAnthropicApiKey",
+        "title": "Rursor: Set Anthropic API Key"
+      },
+      {
+        "command": "rursor.setOpenAiApiKey",
+        "title": "Rursor: Set OpenAI API Key"
+      },
+      {
         "command": "rursor.status",
         "title": "Rursor: Show Sidecar Status"
       },
@@ -67,6 +75,22 @@
         "title": "Rursor: Refine Inline Edit"
       },
       {
+        "command": "rursor.acceptNextEdit",
+        "title": "Rursor: Accept Next Edit"
+      },
+      {
+        "command": "rursor.dismissNextEdit",
+        "title": "Rursor: Dismiss Next Edit"
+      },
+      {
+        "command": "rursor.jumpToNextEdit",
+        "title": "Rursor: Jump to Next Edit"
+      },
+      {
+        "command": "rursor.acceptNextWord",
+        "title": "Rursor: Accept Next Word"
+      },
+      {
         "command": "rursor.toggleAutocomplete",
         "title": "Rursor: Toggle Tab Autocomplete"
       },
@@ -77,6 +101,18 @@
       {
         "command": "rursor.reloadMcp",
         "title": "Rursor: Reload MCP Servers"
+      },
+      {
+        "command": "rursor.openPreview",
+        "title": "Rursor: Open Web Preview"
+      },
+      {
+        "command": "rursor.restoreCheckpoint",
+        "title": "Rursor: Restore Agent Checkpoint"
+      },
+      {
+        "command": "rursor.manageWorktrees",
+        "title": "Rursor: Manage Git Worktree Sandboxes"
       }
     ],
     "keybindings": [
@@ -102,6 +138,30 @@
         "key": "cmd+n",
         "mac": "cmd+n",
         "when": "editorTextFocus && rursor.hasActiveInlineEdit"
+      },
+      {
+        "command": "rursor.acceptNextEdit",
+        "key": "tab",
+        "mac": "tab",
+        "when": "editorTextFocus && rursor.hasNextEdit"
+      },
+      {
+        "command": "rursor.jumpToNextEdit",
+        "key": "tab",
+        "mac": "tab",
+        "when": "editorTextFocus && rursor.hasJumpTarget && !rursor.hasNextEdit"
+      },
+      {
+        "command": "rursor.dismissNextEdit",
+        "key": "escape",
+        "mac": "escape",
+        "when": "editorTextFocus && (rursor.hasNextEdit || rursor.hasJumpTarget)"
+      },
+      {
+        "command": "rursor.acceptNextWord",
+        "key": "cmd+right",
+        "mac": "cmd+right",
+        "when": "editorTextFocus"
       }
     ],
     "configuration": {
@@ -111,11 +171,36 @@
           "type": "string",
           "default": "gemini-2.5-flash",
           "enum": [
+            "auto",
             "gemini-2.5-flash",
             "gemini-2.5-pro",
-            "gemini-2.5-flash-lite"
+            "gemini-2.5-flash-lite",
+            "claude-sonnet-4-20250514",
+            "claude-3-5-haiku-latest",
+            "gpt-4o-mini",
+            "o3-mini"
           ],
-          "description": "Default Gemini model for Rursor Agent and Inline Edit."
+          "description": "Default model or Smart Router mode for Rursor Agent and Inline Edit."
+        },
+        "rursor.agent.autoVerify": {
+          "type": "boolean",
+          "default": false,
+          "description": "Automatically run detected project test/typecheck commands after Agent edits and loop on failures."
+        },
+        "rursor.agent.thinkingBudget": {
+          "type": "number",
+          "default": 0,
+          "description": "Optional thinking token budget for Gemini 2.5 reasoning turns (0 = automatic)."
+        },
+        "rursor.agent.promptCache": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable Gemini Context Caching for large static project rules and memory prefixes."
+        },
+        "rursor.agent.usePty": {
+          "type": "boolean",
+          "default": true,
+          "description": "Run Agent shell commands inside a real PTY via portable-pty in the Rust sidecar."
         },
         "rursor.autocomplete.enabled": {
           "type": "boolean",

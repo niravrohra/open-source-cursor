@@ -1693,7 +1693,7 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
   function updateMentionState() {
     const cursor = promptEl.selectionStart ?? promptEl.value.length;
     const beforeCursor = promptEl.value.slice(0, cursor);
-    const slashMatch = beforeCursor.match(/^\/([a-zA-Z0-9_-]*)$/);
+    const slashMatch = beforeCursor.match(/^\\/([a-zA-Z0-9_-]*)$/);
     if (slashMatch) {
       const q = (slashMatch[1] || '').toLowerCase();
       mentionStart = 0;

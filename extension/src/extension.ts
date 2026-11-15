@@ -196,18 +196,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     vscode.commands.registerCommand('rursor.inlineEdit', async (arg?: unknown) => {
       await inlineEditManager.runInlineEdit(
         arg as
-          | string
-          | {
-              prompt?: string;
-              range?: {
-                startLineNumber: number;
-                startColumn: number;
-                endLineNumber: number;
-                endColumn: number;
-              };
-              uri?: string;
-            }
-          | undefined
+        | string
+        | {
+          prompt?: string;
+          range?: {
+            startLineNumber: number;
+            startColumn: number;
+            endLineNumber: number;
+            endColumn: number;
+          };
+          uri?: string;
+        }
+        | undefined
       );
     }),
     vscode.commands.registerCommand('rursor.openPreview', () => {
@@ -358,4 +358,4 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   );
 }
 
-export function deactivate(): void {}
+export function deactivate(): void { }
