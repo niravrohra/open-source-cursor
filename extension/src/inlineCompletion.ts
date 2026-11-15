@@ -692,7 +692,7 @@ export class RursorInlineCompletionProvider
     if (!config.get<boolean>('autocomplete.nesEnabled', true)) {
       return null;
     }
-    const model = config.get<string>('autocomplete.model', 'gemini-2.5-flash-lite');
+    const model = config.get<string>('autocomplete.model', 'gemini-3.5-flash-lite');
     const relPath = vscode.workspace.asRelativePath(document.uri, false);
 
     const focusStartLine = Math.max(0, position.line - NES_FOCUS_BEFORE);
@@ -786,7 +786,7 @@ export class RursorInlineCompletionProvider
     onRequestId: (id: number) => void
   ): Promise<string | undefined> {
     const config = vscode.workspace.getConfiguration('rursor');
-    const model = config.get<string>('autocomplete.model', 'gemini-2.5-flash-lite');
+    const model = config.get<string>('autocomplete.model', 'gemini-3.5-flash-lite');
     const relPath = vscode.workspace.asRelativePath(document.uri, false);
 
     const estInputTokens = Math.ceil((prefix.length + suffix.length) / 4);

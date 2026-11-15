@@ -1400,7 +1400,7 @@ export class ArtifactStudioManager implements vscode.Disposable {
       try {
         const model = vscode.workspace
           .getConfiguration('rursor')
-          .get<string>('defaultModel', 'gemini-2.5-flash');
+          .get<string>('defaultModel', 'gemini-3.8-flash');
         const schemaPrompt = [
           `Design a ${targetSlides}-slide executive & technical presentation as strict JSON only (no prose outside JSON).`,
           `Topic / Instruction: ${input.prompt.trim()}`,
@@ -1524,7 +1524,7 @@ export class ArtifactStudioManager implements vscode.Disposable {
       try {
         const model = vscode.workspace
           .getConfiguration('rursor')
-          .get<string>('defaultModel', 'gemini-2.5-flash');
+          .get<string>('defaultModel', 'gemini-3.8-flash');
         const ask = [
           `Create a 3-to-4 scene technical explainer video storyboard as strict JSON only.`,
           `Topic: ${input.prompt.trim()}`,

@@ -8,9 +8,9 @@ const ANTHROPIC_MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const OPENAI_CHAT_COMPLETIONS_URL: &str = "https://api.openai.com/v1/chat/completions";
 
-const DEFAULT_GEMINI_FAST: &str = "gemini-2.5-flash";
-const DEFAULT_GEMINI_LITE: &str = "gemini-2.5-flash-lite";
-const DEFAULT_GEMINI_PRO: &str = "gemini-2.5-pro";
+const DEFAULT_GEMINI_FAST: &str = "gemini-3.8-flash";
+const DEFAULT_GEMINI_LITE: &str = "gemini-3.5-flash-lite";
+const DEFAULT_GEMINI_PRO: &str = "gemini-3.1-pro-preview";
 const DEFAULT_ANTHROPIC_FAST: &str = "claude-3-5-haiku-latest";
 const DEFAULT_ANTHROPIC_DEEP: &str = "claude-sonnet-4-20250514";
 const DEFAULT_OPENAI_FAST: &str = "gpt-4o-mini";
@@ -809,7 +809,7 @@ mod tests {
     fn routes_by_task_kind_and_prompt_complexity() {
         let keys = all_keys();
 
-        // Complex architecture/refactor prompt -> gemini-2.5-pro with thinking budget
+        // Complex architecture/refactor prompt -> gemini-3.1-pro-preview with thinking budget
         let complex = route_task(
             TaskKind::AgentFast,
             "Refactor and architect the sidecar RPC layer for multi-provider streaming",
@@ -819,10 +819,10 @@ mod tests {
             &keys,
         );
         assert_eq!(complex.provider, ProviderKind::Gemini);
-        assert_eq!(complex.model, "gemini-2.5-pro");
+        assert_eq!(complex.model, "gemini-3.1-pro-preview");
         assert!(complex.thinking_budget.unwrap_or(0) >= 8192);
 
-        // Fast inline edit -> gemini-2.5-flash without thinking budget
+        // Fast inline edit -> gemini-3.8-flash without thinking budget
         let fast = route_task(
             TaskKind::InlineEdit,
             "Add null check",
@@ -832,7 +832,7 @@ mod tests {
             &keys,
         );
         assert_eq!(fast.provider, ProviderKind::Gemini);
-        assert_eq!(fast.model, "gemini-2.5-flash");
+        assert_eq!(fast.model, "gemini-3.8-flash");
         assert_eq!(fast.thinking_budget, None);
 
         // Tab autocomplete with local backend -> LocalLlm
@@ -847,7 +847,7 @@ mod tests {
         assert_eq!(tab_local.provider, ProviderKind::LocalLlm);
         assert_eq!(tab_local.model, "qwen2.5-coder:7b");
 
-        // Tab autocomplete without local backend -> gemini-2.5-flash-lite
+        // Tab autocomplete without local backend -> gemini-3.5-flash-lite
         let tab_cloud = route_task(
             TaskKind::TabAutocomplete,
             "",
@@ -857,12 +857,12 @@ mod tests {
             &keys,
         );
         assert_eq!(tab_cloud.provider, ProviderKind::Gemini);
-        assert_eq!(tab_cloud.model, "gemini-2.5-flash-lite");
+        assert_eq!(tab_cloud.model, "gemini-3.5-flash-lite");
 
-        // Compaction -> gemini-2.5-flash-lite
+        // Compaction -> gemini-3.5-flash-lite
         let compact = route_task(TaskKind::Compaction, "summarize", None, "gemini", "", &keys);
         assert_eq!(compact.provider, ProviderKind::Gemini);
-        assert_eq!(compact.model, "gemini-2.5-flash-lite");
+        assert_eq!(compact.model, "gemini-3.5-flash-lite");
     }
 
     #[test]
@@ -892,7 +892,7 @@ mod tests {
         let decision_oai = route_task(
             TaskKind::InlineEdit,
             "Format helper",
-            Some("gemini-2.5-flash"),
+            Some("gemini-3.8-flash"),
             "gemini",
             "",
             &openai_only,

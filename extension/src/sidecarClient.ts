@@ -27,6 +27,7 @@ export interface ToolRequestPayload {
 
 export interface StreamCallbacks {
   onStream?: (text: string) => void;
+  onThinking?: (text: string) => void;
   onToolEvent?: (payload: ToolEventPayload) => void;
   onToolRequest?: (payload: ToolRequestPayload) => void;
   onCheckpointCreated?: (checkpoint: Record<string, unknown>) => void;
@@ -143,6 +144,11 @@ export class SidecarClient implements vscode.Disposable {
         const payload = parsed.payload as { text?: string } | undefined;
         if (payload?.text) {
           call.callbacks.onStream?.(payload.text);
+        }
+      } else if (parsed.event === 'thinking_chunk') {
+        const payload = parsed.payload as { text?: string } | undefined;
+        if (payload?.text) {
+          call.callbacks.onThinking?.(payload.text);
         }
       } else if (parsed.event === 'tool_event') {
         call.callbacks.onToolEvent?.(parsed.payload as ToolEventPayload);

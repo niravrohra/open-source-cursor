@@ -183,7 +183,7 @@ export interface BrowserStudioHooks {
   onSendToAgent?: (
     prompt: string,
     images?: BrowserStudioImageAttachment[],
-    mode?: 'agent' | 'ask'
+    mode?: 'agent' | 'ask' | 'plan' | 'take-control'
   ) => Promise<void>;
   onRunInlineEdit?: (instruction?: string) => Promise<void>;
 }

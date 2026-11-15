@@ -1,53 +1,51 @@
 diff --git a/src/vs/workbench/browser/parts/titlebar/media/titlebarpart.css b/src/vs/workbench/browser/parts/titlebar/media/titlebarpart.css
-index 0264e54..ce62644 100644
+index 0264e54..375ee89 100644
 --- a/src/vs/workbench/browser/parts/titlebar/media/titlebarpart.css
 +++ b/src/vs/workbench/browser/parts/titlebar/media/titlebarpart.css
-@@ -474,3 +474,43 @@
+@@ -474,3 +474,41 @@
  	border-radius: 16px;
  	text-align: center;
  }
 +
-+/* Rursor AI Titlebar Pill */
++/* Rursor Agents Window Titlebar Pill (Cursor-style) */
 +.monaco-workbench .part.titlebar > .titlebar-container > .titlebar-right > .action-toolbar-container .monaco-action-bar .rursor-titlebar-pill {
 +	display: inline-flex;
 +	align-items: center;
-+	gap: 5px;
-+	height: 22px;
-+	padding: 0 8px;
-+	margin: auto 4px auto 0;
++	gap: 6px;
++	height: 24px;
++	padding: 0 10px 0 12px;
++	margin: auto 6px auto 2px;
 +	border-radius: 999px;
-+	border: 1px solid var(--vscode-contrastBorder, rgba(128, 128, 128, 0.35));
-+	background-color: rgba(128, 128, 128, 0.14);
-+	color: inherit;
-+	font-size: 11px;
++	border: none;
++	background-color: #c5ced8;
++	color: #1c1c1c;
++	font-size: 12px;
 +	font-weight: 500;
-+	line-height: 20px;
++	line-height: 24px;
++	letter-spacing: -0.01em;
 +	cursor: pointer;
 +	white-space: nowrap;
 +	-webkit-app-region: no-drag;
-+	transition: background-color 120ms ease, border-color 120ms ease;
++	transition: background-color 120ms ease, filter 120ms ease;
 +}
 +
 +.monaco-workbench .part.titlebar > .titlebar-container > .titlebar-right > .action-toolbar-container .monaco-action-bar .rursor-titlebar-pill:hover,
 +.monaco-workbench .part.titlebar > .titlebar-container > .titlebar-right > .action-toolbar-container .monaco-action-bar .rursor-titlebar-pill:focus-visible {
-+	background-color: rgba(128, 128, 128, 0.24);
-+	border-color: var(--vscode-focusBorder, rgba(128, 128, 128, 0.6));
++	background-color: #d5dce4;
 +	outline: none;
++	filter: brightness(1.03);
 +}
 +
 +.monaco-workbench .part.titlebar > .titlebar-container > .titlebar-right > .action-toolbar-container .monaco-action-bar .rursor-titlebar-pill .codicon {
 +	font-size: 12px;
++	color: #1c1c1c;
 +}
 +
-+.monaco-workbench .part.titlebar > .titlebar-container > .titlebar-right > .action-toolbar-container .monaco-action-bar .rursor-titlebar-pill-key {
-+	opacity: 0.72;
-+	font-size: 10px;
-+	padding: 0 4px;
-+	border-radius: 4px;
-+	background-color: rgba(128, 128, 128, 0.16);
++.monaco-workbench .part.titlebar > .titlebar-container > .titlebar-right > .action-toolbar-container .monaco-action-bar .rursor-titlebar-pill-label {
++	color: #1c1c1c;
 +}
 diff --git a/src/vs/workbench/browser/parts/titlebar/titlebarActions.ts b/src/vs/workbench/browser/parts/titlebar/titlebarActions.ts
-index 20e940c..b025f96 100644
+index 20e940c..0729cf4 100644
 --- a/src/vs/workbench/browser/parts/titlebar/titlebarActions.ts
 +++ b/src/vs/workbench/browser/parts/titlebar/titlebarActions.ts
 @@ -15,6 +15,10 @@ import { IAction } from '../../../../base/common/actions.js';
@@ -72,10 +70,10 @@ index 20e940c..b025f96 100644
 +	constructor() {
 +		super({
 +			id: RURSOR_TITLEBAR_OPEN_AGENT_ID,
-+			title: localize2('rursor.titlebar.openAgent', "Open Rursor AI Agent"),
++			title: localize2('rursor.titlebar.openAgent', "Agents Window"),
 +			category: Categories.View,
-+			icon: Codicon.sparkle,
-+			tooltip: localize('rursor.titlebar.openAgentTooltip', "Open Rursor AI Agent (Cmd+L)"),
++			icon: Codicon.linkExternal,
++			tooltip: localize('rursor.titlebar.openAgentTooltip', "Open Agents Window (Cmd+L)"),
 +			menu: [
 +				{
 +					id: MenuId.LayoutControlMenu,
@@ -100,7 +98,7 @@ index 20e940c..b025f96 100644
 +	}
 +});
 diff --git a/src/vs/workbench/browser/parts/titlebar/titlebarPart.ts b/src/vs/workbench/browser/parts/titlebar/titlebarPart.ts
-index 717c0a0..6e0ba9e 100644
+index 717c0a0..165dce6 100644
 --- a/src/vs/workbench/browser/parts/titlebar/titlebarPart.ts
 +++ b/src/vs/workbench/browser/parts/titlebar/titlebarPart.ts
 @@ -50,13 +50,16 @@ import { ResolvedKeybinding } from '../../../../base/common/keybindings.js';
@@ -152,7 +150,7 @@ index 717c0a0..6e0ba9e 100644
  				);
  			}
  
-@@ -910,3 +918,52 @@ export class AuxiliaryBrowserTitlebarPart extends BrowserTitlebarPart implements
+@@ -910,3 +918,49 @@ export class AuxiliaryBrowserTitlebarPart extends BrowserTitlebarPart implements
  		return getZoomFactor(getWindow(this.element)) < 1 || !this.mainTitlebar.hasZoomableElements;
  	}
  }
@@ -174,21 +172,18 @@ index 717c0a0..6e0ba9e 100644
 +		const pill = append(container, $('div.rursor-titlebar-pill'));
 +		pill.setAttribute('role', 'button');
 +		pill.tabIndex = 0;
-+		pill.setAttribute('aria-label', localize('rursor.titlebar.pillAria', "Open Rursor AI Agent"));
-+
-+		const icon = append(pill, $('span'));
-+		icon.classList.add(...ThemeIcon.asClassNameArray(Codicon.sparkle));
++		pill.setAttribute('aria-label', localize('rursor.titlebar.pillAria', "Agents Window"));
 +
 +		const label = append(pill, $('span.rursor-titlebar-pill-label'));
-+		label.textContent = 'Rursor AI';
++		label.textContent = 'Agents Window';
 +
-+		const keycap = append(pill, $('span.rursor-titlebar-pill-key'));
-+		keycap.textContent = isMacintosh ? '⌘L' : 'Ctrl+L';
++		const icon = append(pill, $('span'));
++		icon.classList.add(...ThemeIcon.asClassNameArray(Codicon.linkExternal));
 +
 +		this._register(this.hoverService.setupManagedHover(
 +			this.hoverDelegate,
 +			pill,
-+			localize('rursor.titlebar.pillTooltip', "Open Rursor AI Agent ({0})", isMacintosh ? 'Cmd+L' : 'Ctrl+L')
++			localize('rursor.titlebar.pillTooltip', "Open Agents Window ({0})", isMacintosh ? 'Cmd+L' : 'Ctrl+L')
 +		));
 +
 +		this._register(addDisposableListener(pill, EventType.CLICK, e => {

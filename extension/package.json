@@ -25,6 +25,8 @@
     ],
     "configurationDefaults": {
       "chat.commandCenter.enabled": false,
+      "window.commandCenter": true,
+      "workbench.layoutControl.enabled": true,
       "editor.inlineSuggest.enabled": true,
       "editor.smoothScrolling": true,
       "editor.cursorBlinking": "smooth",
@@ -35,7 +37,7 @@
         {
           "id": "rursor-sidebar",
           "title": "Rursor AI",
-          "icon": "$(sparkle)"
+          "icon": "$(comment-discussion)"
         }
       ]
     },
@@ -320,12 +322,12 @@
       "properties": {
         "rursor.defaultModel": {
           "type": "string",
-          "default": "gemini-2.5-flash",
+          "default": "gemini-3.8-flash",
           "enum": [
             "auto",
-            "gemini-2.5-flash",
-            "gemini-2.5-pro",
-            "gemini-2.5-flash-lite",
+            "gemini-3.8-flash",
+            "gemini-3.1-pro-preview",
+            "gemini-3.5-flash-lite",
             "claude-sonnet-4-20250514",
             "claude-3-5-haiku-latest",
             "gpt-4o-mini",
@@ -380,7 +382,7 @@
         },
         "rursor.autocomplete.model": {
           "type": "string",
-          "default": "gemini-2.5-flash-lite",
+          "default": "gemini-3.5-flash-lite",
           "description": "Gemini model used for Tab autocomplete and NES."
         },
         "rursor.autocomplete.backend": {
@@ -403,6 +405,49 @@
           "type": "string",
           "default": "qwen2.5-coder:7b",
           "description": "Local model identifier for Ollama or MLX Tab autocomplete."
+        },
+        "rursor.layout.windowLayout": {
+          "type": "string",
+          "default": "editor",
+          "enum": ["agent", "editor"],
+          "description": "Default window layout: Agent-first or Editor-first."
+        },
+        "rursor.layout.conversationDensity": {
+          "type": "string",
+          "default": "detailed",
+          "enum": ["compact", "detailed", "verbose"],
+          "description": "How much detail Agent tool calls show in the conversation."
+        },
+        "rursor.layout.showTitleBar": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show title bar in agent layout."
+        },
+        "rursor.layout.showStatusBar": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show status bar at the bottom of the window."
+        },
+        "rursor.layout.reviewControlLocation": {
+          "type": "string",
+          "default": "breadcrumb",
+          "enum": ["breadcrumb", "floating"],
+          "description": "Show inline diff review controls in breadcrumbs or a floating island."
+        },
+        "rursor.layout.autoHideEditorWhenEmpty": {
+          "type": "boolean",
+          "default": false,
+          "description": "When all editors are closed, hide the editor area and maximize chat."
+        },
+        "rursor.layout.openChatAsEditorTabs": {
+          "type": "boolean",
+          "default": true,
+          "description": "Open Agent chats as editor tabs instead of only the sidebar."
+        },
+        "rursor.ui.customizeBannerDismissed": {
+          "type": "boolean",
+          "default": false,
+          "description": "Whether the Customize migration banner in Settings has been dismissed."
         }
       }
     }

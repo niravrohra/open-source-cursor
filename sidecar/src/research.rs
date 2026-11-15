@@ -586,7 +586,7 @@ pub async fn web_search(
     if let Some(key) = gemini_api_key.filter(|k| !k.trim().is_empty()) {
         let model = model_override
             .filter(|m| !m.trim().is_empty() && m.starts_with("gemini"))
-            .unwrap_or("gemini-2.5-flash");
+            .unwrap_or("gemini-3.8-flash");
         let endpoint = format!(
             "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
         );

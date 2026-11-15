@@ -44,7 +44,7 @@ pub struct VerifyResult {
 }
 
 /// Executes multiple read-only/research/analysis subtasks concurrently against Gemini using
-/// `tokio::task::JoinSet`, invoking `on_progress(task_id, status)` as tasks start and finish.
+/// `tokio::task::JoinSet`, invoking `on_progress(task_id, role, status, output)` as tasks progress.
 pub async fn run_parallel_subagents<F>(
     gemini: &GeminiClient,
     api_key: &str,
@@ -54,7 +54,7 @@ pub async fn run_parallel_subagents<F>(
     mut on_progress: F,
 ) -> Vec<SubagentResult>
 where
-    F: FnMut(&str, &str),
+    F: FnMut(&str, &str, &str, Option<&str>),
 {
     if tasks.is_empty() {
         return Vec::new();
@@ -68,7 +68,7 @@ where
     let mut join_set: JoinSet<(usize, SubagentResult)> = JoinSet::new();
 
     for (idx, task) in tasks.into_iter().enumerate() {
-        on_progress(&task.id, "started");
+        on_progress(&task.id, &task.role, "started", None);
 
         let client = gemini.clone();
         let api_key_owned = api_key.to_string();
@@ -117,13 +117,13 @@ where
         match joined {
             Ok((idx, result)) => {
                 let status = if result.ok { "completed" } else { "failed" };
-                on_progress(&result.id, status);
+                on_progress(&result.id, &result.role, status, Some(&result.output));
                 if idx < ordered.len() {
                     ordered[idx] = Some(result);
                 }
             }
             Err(join_err) => {
-                on_progress("unknown", &format!("failed: {join_err}"));
+                on_progress("unknown", "worker", &format!("failed: {join_err}"), None);
             }
         }
     }

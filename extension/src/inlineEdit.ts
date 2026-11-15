@@ -383,7 +383,7 @@ export class InlineEditSessionManager implements vscode.CodeLensProvider, vscode
 
     const model = vscode.workspace
       .getConfiguration('rursor')
-      .get<string>('defaultModel', 'gemini-2.5-flash');
+      .get<string>('defaultModel', 'gemini-3.8-flash');
     const estInputTokens = Math.ceil(
       (prefix.length + selectedText.length + suffix.length + lspContext.length + instruction.length) / 4
     );

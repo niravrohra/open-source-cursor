@@ -78,9 +78,22 @@ interface SidecarStatusResult {
   workspaceRoot?: string | null;
 }
 
+interface LayoutState {
+  windowLayout: 'agent' | 'editor';
+  conversationDensity: 'compact' | 'detailed' | 'verbose';
+  showTitleBar: boolean;
+  showStatusBar: boolean;
+  reviewControlLocation: 'breadcrumb' | 'floating';
+  autoHideEditorWhenEmpty: boolean;
+  openChatAsEditorTabs: boolean;
+  customizeBannerDismissed: boolean;
+}
+
 interface DashboardStatePayload {
   workspaceRoot: string | null;
   sidecarReady: boolean;
+  accountEmail: string;
+  accountPlan: string;
   keys: Record<ProviderId, KeyStatusInfo>;
   models: {
     defaultModel: string;
@@ -89,6 +102,7 @@ interface DashboardStatePayload {
     promptCache: boolean;
     autoVerify: boolean;
   };
+  layout: LayoutState;
   tab: {
     enabled: boolean;
     nesEnabled: boolean;
@@ -145,6 +159,8 @@ interface WebviewIncomingMessage {
   memoryCategory?: string;
   memoryContent?: string;
   memoryId?: string;
+  command?: string;
+  url?: string;
 }
 
 const STARTER_RULES_TEMPLATE = `# Rursor Workspace Engineering Rules
@@ -308,7 +324,7 @@ export class RursorSettingsPanel implements vscode.Disposable {
 
     const panel = vscode.window.createWebviewPanel(
       'rursor.settings',
-      'Rursor Settings',
+      'Settings',
       vscode.ViewColumn.One,
       {
         enableScripts: true,
@@ -422,10 +438,16 @@ export class RursorSettingsPanel implements vscode.Disposable {
         }
 
         case 'toggleSetting': {
-          if (!msg.key || typeof msg.boolValue !== 'boolean') {
+          if (!msg.key) {
             return;
           }
-          await this.updateRursorSetting(msg.key, msg.boolValue);
+          if (typeof msg.boolValue === 'boolean') {
+            await this.updateRursorSetting(msg.key, msg.boolValue);
+          } else if (typeof msg.value === 'string' && msg.value.length > 0) {
+            await this.updateRursorSetting(msg.key, msg.value);
+          } else {
+            return;
+          }
           await this.onConfigUpdated();
           await this.refreshState();
           break;
@@ -615,6 +637,53 @@ Execute the /${slug} workflow carefully on the target context:
           break;
         }
 
+        case 'openVscodeSettings': {
+          await vscode.commands.executeCommand('workbench.action.openSettings');
+          break;
+        }
+
+        case 'openEditorSettings': {
+          await vscode.commands.executeCommand('workbench.action.openSettings', 'editor.');
+          break;
+        }
+
+        case 'openKeyboardShortcuts': {
+          await vscode.commands.executeCommand('workbench.action.openGlobalKeybindings');
+          break;
+        }
+
+        case 'importFromVsCode': {
+          await vscode.commands.executeCommand('workbench.action.openSettingsSync');
+          this.postToast('Open Settings Sync / profiles to import VS Code settings.', 'info');
+          break;
+        }
+
+        case 'resetDontAskAgain': {
+          await this.context.globalState.update('rursor.dismissedDialogs', []);
+          this.postToast('Hidden dialogs and tips have been restored.');
+          break;
+        }
+
+        case 'dismissCustomizeBanner': {
+          await this.updateRursorSetting('ui.customizeBannerDismissed', true);
+          await this.refreshState();
+          break;
+        }
+
+        case 'openExternal': {
+          if (msg.url) {
+            await vscode.env.openExternal(vscode.Uri.parse(msg.url));
+          }
+          break;
+        }
+
+        case 'runCommand': {
+          if (msg.command) {
+            await vscode.commands.executeCommand(msg.command);
+          }
+          break;
+        }
+
         default:
           break;
       }
@@ -798,9 +867,22 @@ Execute the /${slug} workflow carefully on the target context:
         ? rawBackend
         : 'gemini';
 
+    const rawLayout = cfg.get<string>('layout.windowLayout', 'editor');
+    const windowLayout: 'agent' | 'editor' = rawLayout === 'agent' ? 'agent' : 'editor';
+    const rawDensity = cfg.get<string>('layout.conversationDensity', 'detailed');
+    const conversationDensity: LayoutState['conversationDensity'] =
+      rawDensity === 'compact' || rawDensity === 'verbose' ? rawDensity : 'detailed';
+    const rawReviewLoc = cfg.get<string>('layout.reviewControlLocation', 'breadcrumb');
+    const reviewControlLocation: LayoutState['reviewControlLocation'] =
+      rawReviewLoc === 'floating' ? 'floating' : 'breadcrumb';
+
     const statePayload: DashboardStatePayload = {
       workspaceRoot: statusRes.workspaceRoot ?? root,
       sidecarReady: Boolean(statusRes.ready),
+      accountEmail: process.env.USER
+        ? `${process.env.USER}@local`
+        : 'rursor@local',
+      accountPlan: 'Pro+ Plan',
       keys: {
         gemini: {
           hasKeychainKey: Boolean(geminiSecret?.trim()),
@@ -819,17 +901,27 @@ Execute the /${slug} workflow carefully on the target context:
         },
       },
       models: {
-        defaultModel: cfg.get<string>('defaultModel', 'gemini-2.5-flash'),
+        defaultModel: cfg.get<string>('defaultModel', 'gemini-3.8-flash'),
         thinkingBudget: cfg.get<number>('agent.thinkingBudget', 0),
         permissionProfile,
         promptCache: cfg.get<boolean>('agent.promptCache', true),
         autoVerify: cfg.get<boolean>('agent.autoVerify', false),
       },
+      layout: {
+        windowLayout,
+        conversationDensity,
+        showTitleBar: cfg.get<boolean>('layout.showTitleBar', true),
+        showStatusBar: cfg.get<boolean>('layout.showStatusBar', true),
+        reviewControlLocation,
+        autoHideEditorWhenEmpty: cfg.get<boolean>('layout.autoHideEditorWhenEmpty', false),
+        openChatAsEditorTabs: cfg.get<boolean>('layout.openChatAsEditorTabs', true),
+        customizeBannerDismissed: cfg.get<boolean>('ui.customizeBannerDismissed', false),
+      },
       tab: {
         enabled: cfg.get<boolean>('autocomplete.enabled', true),
         nesEnabled: cfg.get<boolean>('autocomplete.nesEnabled', true),
         backend,
-        autocompleteModel: cfg.get<string>('autocomplete.model', 'gemini-2.5-flash-lite'),
+        autocompleteModel: cfg.get<string>('autocomplete.model', 'gemini-3.5-flash-lite'),
         localEndpoint: cfg.get<string>('autocomplete.localEndpoint', 'http://127.0.0.1:11434'),
         localModel: cfg.get<string>('autocomplete.localModel', 'qwen2.5-coder:7b'),
       },
@@ -879,24 +971,24 @@ Execute the /${slug} workflow carefully on the target context:
   <title>Rursor Settings</title>
   <style>
     :root {
-      --obs-bg: var(--vscode-editor-background, #0B0D12);
-      --obs-surface: var(--vscode-sideBar-background, #080A0F);
-      --obs-card: #0F131D;
-      --obs-card-hover: #131926;
-      --obs-border: var(--vscode-panel-border, #1B2334);
-      --obs-input-bg: var(--vscode-input-background, #0C1018);
-      --obs-input-border: var(--vscode-input-border, #1F293D);
-      --obs-fg: var(--vscode-editor-foreground, #E2E8F0);
-      --obs-muted: var(--vscode-descriptionForeground, #8B9BB4);
-      --obs-cyan: #38BDF8;
-      --obs-cyan-dim: rgba(56, 189, 248, 0.14);
-      --obs-violet: #A78BFA;
-      --obs-violet-dim: rgba(167, 139, 250, 0.16);
-      --obs-emerald: #34D399;
-      --obs-emerald-dim: rgba(52, 211, 153, 0.15);
-      --obs-rose: #FB7185;
-      --obs-rose-dim: rgba(251, 113, 133, 0.15);
-      --obs-amber: #FBBF24;
+      --obs-bg: #0c0c0c;
+      --obs-surface: #0c0c0c;
+      --obs-card: #141414;
+      --obs-card-hover: #1a1a1a;
+      --obs-border: #262626;
+      --obs-input-bg: #141414;
+      --obs-input-border: #333333;
+      --obs-fg: #ececec;
+      --obs-muted: #a1a1a1;
+      --obs-cyan: #d4d4d4;
+      --obs-cyan-dim: rgba(255, 255, 255, 0.08);
+      --obs-violet: #d4d4d4;
+      --obs-violet-dim: rgba(255, 255, 255, 0.08);
+      --obs-emerald: #86efac;
+      --obs-emerald-dim: rgba(134, 239, 172, 0.12);
+      --obs-rose: #fda4af;
+      --obs-rose-dim: rgba(253, 164, 175, 0.12);
+      --obs-amber: #fbbf24;
       --radius-lg: 10px;
       --radius-md: 7px;
       --radius-sm: 5px;
@@ -920,71 +1012,13 @@ Execute the /${slug} workflow carefully on the target context:
       overflow: hidden;
     }
 
-    /* Top Header Bar */
-    .topbar {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding: 14px 24px;
-      background: var(--obs-surface);
-      border-bottom: 1px solid var(--obs-border);
-      flex-shrink: 0;
-    }
-
-    .brand {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-    }
-
-    .brand-orb {
-      width: 28px;
-      height: 28px;
-      border-radius: 8px;
-      background: linear-gradient(135deg, var(--obs-cyan), var(--obs-violet));
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      color: #06080C;
-      font-weight: 800;
-      font-size: 15px;
-      box-shadow: 0 0 16px rgba(56, 189, 248, 0.28);
-    }
-
-    .brand-title {
-      font-size: 15px;
-      font-weight: 700;
-      letter-spacing: -0.01em;
-      color: #F8FAFC;
-    }
-
-    .brand-sub {
-      font-size: 11px;
-      color: var(--obs-muted);
-    }
-
-    .topbar-right {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-    }
-
-    .kbd {
-      font-family: var(--vscode-editor-font-family, monospace);
-      font-size: 11px;
-      padding: 2px 7px;
-      border-radius: 5px;
-      background: rgba(148, 163, 184, 0.12);
-      border: 1px solid var(--obs-border);
-      color: var(--obs-muted);
-    }
-
-    /* Main Split Shell */
+    /* Main Split Shell — Cursor-like Settings */
     .shell {
       display: grid;
-      grid-template-columns: 230px 1fr;
+      grid-template-columns: 240px 1fr;
       flex: 1;
       min-height: 0;
+      height: 100vh;
     }
 
     @media (max-width: 760px) {
@@ -992,41 +1026,110 @@ Execute the /${slug} workflow carefully on the target context:
         grid-template-columns: 1fr;
       }
       .nav-rail {
-        flex-direction: row;
-        overflow-x: auto;
+        max-height: 42vh;
         border-right: none;
         border-bottom: 1px solid var(--obs-border);
-        padding: 8px 12px;
       }
     }
 
     .nav-rail {
-      background: var(--obs-surface);
-      border-right: 1px solid var(--obs-border);
-      padding: 16px 12px;
+      background: #141414;
+      border-right: 1px solid #2a2a2a;
+      padding: 14px 10px 12px;
       display: flex;
       flex-direction: column;
-      gap: 4px;
+      gap: 2px;
       overflow-y: auto;
     }
 
-    .nav-section-label {
+    .profile-card-nav {
+      padding: 8px 10px 14px;
+      display: flex;
+      gap: 10px;
+      align-items: center;
+    }
+    .profile-avatar {
+      width: 32px;
+      height: 32px;
+      border-radius: 999px;
+      background: #3f3f46;
+      color: #fff;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 12px;
+      font-weight: 700;
+      flex-shrink: 0;
+    }
+    .profile-meta { min-width: 0; }
+    .profile-email {
+      font-size: 12px;
+      font-weight: 600;
+      color: #e8e8e8;
+      word-break: break-all;
+    }
+    .profile-plan {
+      margin-top: 4px;
+      display: inline-block;
       font-size: 10px;
       font-weight: 700;
-      text-transform: uppercase;
-      letter-spacing: 0.08em;
-      color: var(--obs-muted);
-      padding: 4px 10px 8px;
+      padding: 2px 7px;
+      border-radius: 999px;
+      background: rgba(255,255,255,0.08);
+      color: #d4d4d4;
+    }
+    .section-label {
+      font-size: 12px;
+      font-weight: 600;
+      color: #8a8a8a;
+      margin: 18px 2px 8px;
+    }
+    .btn-open {
+      background: #2a2a2a !important;
+      border: 1px solid #3a3a3a !important;
+      color: #eee !important;
+      border-radius: 8px !important;
+      padding: 5px 12px !important;
+      font-size: 12px !important;
+    }
+    .search-wrap {
+      padding: 0 6px 10px;
+    }
+    .search-wrap input {
+      width: 100%;
+      background: #1c1c1c;
+      border: 1px solid #333;
+      border-radius: 8px;
+      color: #ddd;
+      padding: 7px 10px;
+      font-size: 12px;
+    }
+    .nav-divider {
+      height: 1px;
+      background: #2a2a2a;
+      margin: 8px 8px;
+    }
+    .ext-ico {
+      opacity: 0.55;
+      font-size: 11px;
+    }
+    .nav-footer {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      padding: 10px 6px 4px;
+      border-top: 1px solid #2a2a2a;
+      margin-top: 8px;
     }
 
     .nav-btn {
       appearance: none;
-      border: 1px solid transparent;
+      border: none;
       background: transparent;
-      color: var(--obs-muted);
+      color: #b5b5b5;
       text-align: left;
-      padding: 9px 12px;
-      border-radius: var(--radius-md);
+      padding: 8px 10px;
+      border-radius: 8px;
       font-size: 13px;
       font-weight: 500;
       cursor: pointer;
@@ -1034,18 +1137,16 @@ Execute the /${slug} workflow carefully on the target context:
       align-items: center;
       justify-content: space-between;
       gap: 8px;
-      transition: all 0.14s ease;
     }
 
     .nav-btn:hover {
-      background: rgba(148, 163, 184, 0.08);
-      color: #F1F5F9;
+      background: rgba(255,255,255,0.05);
+      color: #f3f3f3;
     }
 
     .nav-btn.active {
-      background: var(--obs-cyan-dim);
-      border-color: rgba(56, 189, 248, 0.32);
-      color: #F8FAFC;
+      background: rgba(255,255,255,0.08);
+      color: #fff;
       font-weight: 600;
     }
 
@@ -1058,20 +1159,140 @@ Execute the /${slug} workflow carefully on the target context:
     }
 
     .nav-btn.active .nav-badge {
-      background: var(--obs-cyan);
-      color: #06080C;
+      background: rgba(255,255,255,0.18);
+      color: #fff;
       font-weight: 700;
+    }
+
+    .notice-banner {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: center;
+      padding: 12px 14px;
+      border: 1px solid #333;
+      border-radius: 10px;
+      background: #1a1a1a;
+      margin-bottom: 18px;
+    }
+    .notice-banner[hidden] { display: none; }
+    .notice-text { font-size: 12.5px; color: #cfcfcf; line-height: 1.45; }
+    .notice-actions { display: flex; gap: 8px; flex-shrink: 0; }
+
+    .settings-group {
+      border: 1px solid #2c2c2c;
+      border-radius: 12px;
+      background: #171717;
+      margin-bottom: 16px;
+      overflow: hidden;
+    }
+    .group-label {
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: #8a8a8a;
+      padding: 12px 14px 4px;
+    }
+    .settings-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 16px;
+      padding: 14px 16px;
+      border-top: 1px solid #262626;
+    }
+    .settings-group > .settings-row:first-child { border-top: none; }
+    .settings-copy { min-width: 0; }
+    .settings-title {
+      font-size: 13.5px;
+      font-weight: 600;
+      color: #f2f2f2;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .settings-sub {
+      margin-top: 3px;
+      font-size: 12px;
+      color: #8f8f8f;
+      line-height: 1.4;
+    }
+    .new-pill {
+      font-size: 9px;
+      font-weight: 800;
+      letter-spacing: 0.06em;
+      padding: 2px 6px;
+      border-radius: 999px;
+      background: rgba(52,211,153,0.18);
+      color: #6ee7b7;
+    }
+    .inline-select {
+      min-width: 140px;
+      background: #222 !important;
+      border: 1px solid #3a3a3a !important;
+      border-radius: 8px !important;
+      color: #eee !important;
+      padding: 6px 10px !important;
+    }
+    .layout-picker {
+      display: flex;
+      gap: 8px;
+    }
+    .layout-card {
+      width: 78px;
+      background: #1d1d1d;
+      border: 1px solid #333;
+      border-radius: 10px;
+      padding: 8px 6px 6px;
+      cursor: pointer;
+      color: #bbb;
+    }
+    .layout-card.selected {
+      border-color: #5b9dff;
+      box-shadow: 0 0 0 1px rgba(91,157,255,0.35);
+      color: #fff;
+    }
+    .layout-preview {
+      height: 42px;
+      border-radius: 6px;
+      background: #111;
+      border: 1px solid #2f2f2f;
+      display: grid;
+      gap: 2px;
+      padding: 4px;
+      margin-bottom: 6px;
+    }
+    .layout-preview span {
+      background: #2a2a2a;
+      border-radius: 2px;
+      display: block;
+    }
+    .layout-preview.agent {
+      grid-template-columns: 1.1fr 0.7fr;
+    }
+    .layout-preview.agent span:first-child { grid-row: 1 / 3; }
+    .layout-preview.editor {
+      grid-template-columns: 0.35fr 1fr 0.55fr;
+    }
+    .layout-preview.editor span { min-height: 100%; }
+    .layout-name { font-size: 11px; text-align: center; font-weight: 600; }
+    .workspace-hint {
+      font-size: 11px;
+      color: #777;
+      margin: 8px 2px 20px;
     }
 
     /* Content Viewport */
     .content {
       overflow-y: auto;
-      padding: 24px 32px 48px;
+      padding: 28px 36px 56px;
+      background: #181818;
     }
 
     .tab-pane {
       display: none;
-      max-width: 880px;
+      max-width: 760px;
       animation: fadeIn 0.14s ease;
     }
 
@@ -1085,15 +1306,15 @@ Execute the /${slug} workflow carefully on the target context:
     }
 
     .pane-header {
-      margin-bottom: 20px;
+      margin-bottom: 18px;
     }
 
     .pane-title {
-      font-size: 19px;
-      font-weight: 700;
-      color: #F8FAFC;
+      font-size: 22px;
+      font-weight: 650;
+      color: #f5f5f5;
       margin: 0 0 4px;
-      letter-spacing: -0.01em;
+      letter-spacing: -0.02em;
     }
 
     .pane-desc {
@@ -1392,8 +1613,8 @@ Execute the /${slug} workflow carefully on the target context:
       position: absolute;
       cursor: pointer;
       inset: 0;
-      background-color: #1E2738;
-      border: 1px solid #2E3B52;
+      background-color: #3a3a3a;
+      border: 1px solid #4a4a4a;
       transition: 0.16s;
       border-radius: 999px;
     }
@@ -1405,19 +1626,19 @@ Execute the /${slug} workflow carefully on the target context:
       width: 16px;
       left: 2px;
       bottom: 2px;
-      background-color: #94A3B8;
+      background-color: #d4d4d4;
       transition: 0.16s;
       border-radius: 50%;
     }
 
     .switch input:checked + .slider {
-      background-color: rgba(56, 189, 248, 0.25);
-      border-color: var(--obs-cyan);
+      background-color: #22c55e;
+      border-color: #16a34a;
     }
 
     .switch input:checked + .slider:before {
       transform: translateX(18px);
-      background-color: var(--obs-cyan);
+      background-color: #fff;
     }
 
     /* Permission Profile Cards */
@@ -1622,52 +1843,288 @@ Execute the /${slug} workflow carefully on the target context:
   </style>
 </head>
 <body>
-  <div class="topbar">
-    <div class="brand">
-      <div class="brand-orb">✦</div>
-      <div>
-        <div class="brand-title">Rursor Settings</div>
-        <div class="brand-sub" id="topWorkspaceLabel">Native AI IDE Control Plane</div>
-      </div>
-    </div>
-    <div class="topbar-right">
-      <span id="sidecarStatusBadge" class="badge badge-warn">Connecting...</span>
-      <span class="kbd">⌘⇧J</span>
-      <button type="button" class="btn" id="refreshAllBtn">↻ Refresh</button>
-    </div>
-  </div>
-
   <div class="shell">
     <nav class="nav-rail" id="navRail">
-      <div class="nav-section-label">Configuration</div>
-      <button type="button" class="nav-btn active" data-tab="general">
-        <span>General &amp; Models</span>
-        <span class="nav-badge" id="navKeysBadge">0/3</span>
+      <div class="profile-card-nav">
+        <div class="profile-avatar" aria-hidden="true">R</div>
+        <div class="profile-meta">
+          <div class="profile-email" id="accountEmailLabel">local</div>
+          <div class="profile-plan" id="accountPlanLabel">Pro+ Plan</div>
+        </div>
+      </div>
+      <div class="search-wrap">
+        <input type="search" id="settingsSearch" placeholder="Search settings ⌘F" />
+      </div>
+      <button type="button" class="nav-btn active" data-tab="general"><span>General</span></button>
+      <button type="button" class="nav-btn" data-action="open-vscode-settings">
+        <span>VS Code Settings</span><span class="ext-ico">↗</span>
       </button>
-      <button type="button" class="nav-btn" data-tab="tab">
-        <span>Tab &amp; NES</span>
-        <span class="nav-badge" id="navTabBadge">On</span>
+      <div class="nav-divider"></div>
+      <button type="button" class="nav-btn" data-tab="plan"><span>Plan &amp; Usage</span></button>
+      <button type="button" class="nav-btn" data-tab="agents"><span>Agents</span></button>
+      <button type="button" class="nav-btn" data-tab="cloud"><span>Cloud Agents</span></button>
+      <button type="button" class="nav-btn" data-tab="models"><span>Models</span></button>
+      <button type="button" class="nav-btn" data-tab="voice"><span>Voice</span></button>
+      <button type="button" class="nav-btn" data-tab="source"><span>Source Control</span></button>
+      <div class="nav-divider"></div>
+      <button type="button" class="nav-btn" data-tab="customize">
+        <span>Customize</span><span class="ext-ico">↗</span>
       </button>
-      <button type="button" class="nav-btn" data-tab="rules">
-        <span>Rules &amp; Memory</span>
-        <span class="nav-badge" id="navRulesBadge">0</span>
+      <button type="button" class="nav-btn" data-tab="browser"><span>Browser &amp; Network</span></button>
+      <button type="button" class="nav-btn" data-tab="codeintel"><span>Code Intelligence</span></button>
+      <button type="button" class="nav-btn" data-tab="beta"><span>Beta</span></button>
+      <button type="button" class="nav-btn" data-action="open-docs">
+        <span>Docs</span><span class="ext-ico">↗</span>
       </button>
-      <button type="button" class="nav-btn" data-tab="mcp">
-        <span>MCP Servers</span>
-        <span class="nav-badge" id="navMcpBadge">0</span>
-      </button>
-      <button type="button" class="nav-btn" data-tab="index">
-        <span>Index &amp; Sandbox</span>
-        <span class="nav-badge" id="navIndexBadge">0</span>
-      </button>
+      <span id="navKeysBadge" hidden>0/3</span>
+      <span id="navIndexBadge" hidden>0</span>
+      <span id="navRulesBadge" hidden>0</span>
+      <span id="navTabBadge" hidden>On</span>
+      <span id="navMcpBadge" hidden>0</span>
+      <div style="flex:1"></div>
+      <div class="nav-footer">
+        <span id="sidecarStatusBadge" class="badge badge-warn">Connecting...</span>
+        <button type="button" class="btn" id="refreshAllBtn" hidden>↻ Refresh</button>
+      </div>
     </nav>
 
     <main class="content">
-      <!-- TAB 1: GENERAL & MODELS -->
+      <!-- TAB: GENERAL (Cursor-like) -->
       <section class="tab-pane active" id="pane-general">
+        <div class="notice-banner" id="customizeBanner">
+          <div class="notice-text">Plugins, MCPs, Skills, and Rules have moved to Customize. We've introduced a new home for all the ways to customize Rursor.</div>
+          <div class="notice-actions">
+            <button type="button" class="btn" id="dismissBannerBtn">Dismiss</button>
+            <button type="button" class="btn btn-primary" data-goto="customize">Open Customize →</button>
+          </div>
+        </div>
+
         <div class="pane-header">
-          <h1 class="pane-title">General &amp; Models</h1>
-          <p class="pane-desc">Manage OS Keychain BYOK credentials, Smart Router defaults, reasoning token budgets, and execution permissions.</p>
+          <h1 class="pane-title">General</h1>
+        </div>
+
+        <div class="settings-group">
+          <div class="settings-row">
+            <div class="settings-copy">
+              <div class="settings-title">Rursor Account</div>
+              <div class="settings-sub">Manage your account and billing</div>
+            </div>
+            <button type="button" class="btn btn-open" id="openAccountBtn">Open ↗</button>
+          </div>
+        </div>
+
+        <div class="section-label">Preferences</div>
+        <div class="settings-group">
+          <div class="settings-row">
+            <div class="settings-copy">
+              <div class="settings-title">Editor Settings</div>
+              <div class="settings-sub">Configure font, formatting, minimap and more</div>
+            </div>
+            <button type="button" class="btn btn-open" id="openEditorSettingsBtn">Open</button>
+          </div>
+          <div class="settings-row">
+            <div class="settings-copy">
+              <div class="settings-title">Keyboard Shortcuts</div>
+              <div class="settings-sub">Configure keyboard shortcuts</div>
+            </div>
+            <button type="button" class="btn btn-open" id="openKeysBtn">Open</button>
+          </div>
+          <div class="settings-row">
+            <div class="settings-copy">
+              <div class="settings-title">Import Settings from VS Code</div>
+              <div class="settings-sub">Import settings, extensions, and keybindings from VS Code</div>
+            </div>
+            <button type="button" class="btn btn-open" id="importVsCodeBtn">Import</button>
+          </div>
+          <div class="settings-row">
+            <div class="settings-copy">
+              <div class="settings-title">Reset "Don't Ask Again" Dialogs</div>
+              <div class="settings-sub">See warnings and tips that you've hidden</div>
+            </div>
+            <button type="button" class="btn btn-open" id="resetDontAskBtn">Show</button>
+          </div>
+        </div>
+
+        <div class="section-label">Layout</div>
+        <div class="settings-group">
+          <div class="settings-row">
+            <div class="settings-copy">
+              <div class="settings-title">Window Layout</div>
+              <div class="settings-sub">Switch between Agent and Editor default layouts.</div>
+            </div>
+            <div class="layout-picker" id="windowLayoutPicker">
+              <button type="button" class="layout-card" data-layout="agent" title="Agent">
+                <div class="layout-preview agent"><span></span><span></span></div>
+                <div class="layout-name">Agent</div>
+              </button>
+              <button type="button" class="layout-card selected" data-layout="editor" title="Editor">
+                <div class="layout-preview editor"><span></span><span></span><span></span></div>
+                <div class="layout-name">Editor</div>
+              </button>
+            </div>
+          </div>
+          <div class="settings-row">
+            <div class="settings-copy">
+              <div class="settings-title">Conversation Density</div>
+              <div class="settings-sub">Choose how much detail Agent tool calls show in the conversation.</div>
+            </div>
+            <select id="conversationDensitySelect" class="inline-select">
+              <option value="compact">Compact</option>
+              <option value="detailed" selected>Detailed</option>
+              <option value="verbose">Verbose</option>
+            </select>
+          </div>
+          <div class="settings-row">
+            <div class="settings-copy">
+              <div class="settings-title">Title Bar</div>
+              <div class="settings-sub">Show title bar in agent layout.</div>
+            </div>
+            <label class="switch"><input type="checkbox" id="toggleTitleBar" checked /><span class="slider"></span></label>
+          </div>
+          <div class="settings-row">
+            <div class="settings-copy">
+              <div class="settings-title">Status Bar</div>
+              <div class="settings-sub">Show status bar at the bottom of the window.</div>
+            </div>
+            <label class="switch"><input type="checkbox" id="toggleStatusBar" checked /><span class="slider"></span></label>
+          </div>
+          <div class="settings-row">
+            <div class="settings-copy">
+              <div class="settings-title">Review Control Location</div>
+              <div class="settings-sub">Show inline diff review controls in top level breadcrumbs or floating island.</div>
+            </div>
+            <select id="reviewControlSelect" class="inline-select">
+              <option value="breadcrumb" selected>Breadcrumb</option>
+              <option value="floating">Floating Island</option>
+            </select>
+          </div>
+          <div class="settings-row">
+            <div class="settings-copy">
+              <div class="settings-title">Auto-Hide Editor When Empty</div>
+              <div class="settings-sub">When all editors are closed, hide the editor area and maximize chat.</div>
+            </div>
+            <label class="switch"><input type="checkbox" id="toggleAutoHideEditor" /><span class="slider"></span></label>
+          </div>
+          <div class="settings-row">
+            <div class="settings-copy">
+              <div class="settings-title">Open Chat as Editor Tabs <span class="new-pill">NEW</span></div>
+              <div class="settings-sub">Open Agent chats as editor tabs instead of only the sidebar panel.</div>
+            </div>
+            <label class="switch"><input type="checkbox" id="toggleChatTabs" checked /><span class="slider"></span></label>
+          </div>
+        </div>
+        <p class="workspace-hint" id="topWorkspaceLabel">No workspace folder open</p>
+      </section>
+
+      <!-- TAB: PLAN & USAGE -->
+      <section class="tab-pane" id="pane-plan">
+        <div class="pane-header">
+          <h1 class="pane-title">Plan &amp; Usage</h1>
+          <p class="pane-desc">Local BYOK usage stays on your machine. Track sidecar readiness and connected providers.</p>
+        </div>
+        <div class="settings-group">
+          <div class="settings-row">
+            <div class="settings-copy">
+              <div class="settings-title">Current Plan</div>
+              <div class="settings-sub" id="planUsageSub">Pro+ · Bring Your Own Key</div>
+            </div>
+            <span class="badge badge-ok" id="planBadge">Pro+</span>
+          </div>
+          <div class="settings-row">
+            <div class="settings-copy">
+              <div class="settings-title">Provider Keys Connected</div>
+              <div class="settings-sub">Gemini / Anthropic / OpenAI keychain status</div>
+            </div>
+            <span class="badge badge-violet" id="planKeysBadge">0/3</span>
+          </div>
+          <div class="settings-row">
+            <div class="settings-copy">
+              <div class="settings-title">Manage API Keys</div>
+              <div class="settings-sub">Jump to Models to update OS Keychain credentials</div>
+            </div>
+            <button type="button" class="btn btn-primary" data-goto="models">Open Models</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB: AGENTS -->
+      <section class="tab-pane" id="pane-agents">
+        <div class="pane-header">
+          <h1 class="pane-title">Agents</h1>
+          <p class="pane-desc">Execution permissions, verification loops, and agent runtime defaults.</p>
+        </div>
+        <div class="card">
+          <div class="field">
+            <label>
+              <span>Agent Permission Profile</span>
+              <span class="mono" style="color: var(--obs-muted);">rursor.agent.permissionProfile</span>
+            </label>
+            <div class="profile-grid" id="permissionProfileGrid">
+              <div class="profile-card selected" data-profile="safe-auto">
+                <div class="profile-name">safe-auto</div>
+                <div class="profile-desc">Auto-runs reads &amp; search; prompts before mutations or shell.</div>
+              </div>
+              <div class="profile-card" data-profile="read-only">
+                <div class="profile-name">read-only</div>
+                <div class="profile-desc">Exploration only; blocks file writes and command execution.</div>
+              </div>
+              <div class="profile-card" data-profile="full-auto">
+                <div class="profile-name">full-auto</div>
+                <div class="profile-desc">Autonomous multi-file edits and self-healing verify loops.</div>
+              </div>
+            </div>
+          </div>
+          <div class="btn-row" style="margin-top: 12px;">
+            <button type="button" class="btn btn-primary" id="saveAgentProfileBtn">Save Permission Profile</button>
+          </div>
+        </div>
+        <div class="card">
+          <div class="toggle-row">
+            <div class="toggle-info">
+              <div class="toggle-title">Prompt Context Caching</div>
+              <div class="toggle-sub">Cache static rules and memory prefixes on Gemini turns.</div>
+            </div>
+            <label class="switch"><input type="checkbox" id="togglePromptCache" checked /><span class="slider"></span></label>
+          </div>
+          <div class="toggle-row">
+            <div class="toggle-info">
+              <div class="toggle-title">Auto-Verify Agent Edits</div>
+              <div class="toggle-sub">Run detected build/test commands after edits and self-correct failures.</div>
+            </div>
+            <label class="switch"><input type="checkbox" id="toggleAutoVerify" /><span class="slider"></span></label>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB: CLOUD AGENTS -->
+      <section class="tab-pane" id="pane-cloud">
+        <div class="pane-header">
+          <h1 class="pane-title">Cloud Agents</h1>
+          <p class="pane-desc">Launch isolated cloud workers for long-running tasks (Mission Control / Swarm).</p>
+        </div>
+        <div class="settings-group">
+          <div class="settings-row">
+            <div class="settings-copy">
+              <div class="settings-title">Mission Control</div>
+              <div class="settings-sub">Open multi-agent Swarm and Model Arena</div>
+            </div>
+            <button type="button" class="btn btn-primary" data-cmd="rursor.missionControl">Open</button>
+          </div>
+          <div class="settings-row">
+            <div class="settings-copy">
+              <div class="settings-title">APFS CoW Worker Clones</div>
+              <div class="settings-sub">Instant zero-copy sandboxes for parallel cloud-style workers on macOS</div>
+            </div>
+            <button type="button" class="btn" data-cmd="rursor.manageCowClones">Manage</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB: MODELS -->
+      <section class="tab-pane" id="pane-models">
+        <div class="pane-header">
+          <h1 class="pane-title">Models</h1>
+          <p class="pane-desc">Manage OS Keychain BYOK credentials, Smart Router defaults, and reasoning budgets.</p>
         </div>
 
         <div class="card">
@@ -1743,9 +2200,9 @@ Execute the /${slug} workflow carefully on the target context:
             </label>
             <select id="defaultModelSelect">
               <option value="auto">Auto (Smart Router — Dynamic Complexity + BYOK Fallback)</option>
-              <option value="gemini-2.5-flash">gemini-2.5-flash (Fast Default)</option>
-              <option value="gemini-2.5-pro">gemini-2.5-pro (Deep Architecture &amp; Reasoning)</option>
-              <option value="gemini-2.5-flash-lite">gemini-2.5-flash-lite (Ultra Low Latency)</option>
+              <option value="gemini-3.8-flash">gemini-3.8-flash (Fast Default)</option>
+              <option value="gemini-3.1-pro-preview">gemini-3.1-pro-preview (Deep Architecture &amp; Reasoning)</option>
+              <option value="gemini-3.5-flash-lite">gemini-3.5-flash-lite (Ultra Low Latency)</option>
               <option value="claude-sonnet-4-20250514">claude-sonnet-4-20250514 (Anthropic Deep)</option>
               <option value="claude-3-5-haiku-latest">claude-3-5-haiku-latest (Anthropic Fast)</option>
               <option value="gpt-4.1">gpt-4.1 (OpenAI Flagship)</option>
@@ -1774,58 +2231,38 @@ Execute the /${slug} workflow carefully on the target context:
             </div>
           </div>
 
-          <div class="field">
-            <label>
-              <span>Agent Permission Profile</span>
-              <span class="mono" style="color: var(--obs-muted);">rursor.agent.permissionProfile</span>
-            </label>
-            <div class="profile-grid" id="permissionProfileGrid">
-              <div class="profile-card selected" data-profile="safe-auto">
-                <div class="profile-name">safe-auto</div>
-                <div class="profile-desc">Auto-runs codebase reads &amp; search; prompts before file mutations or shell commands.</div>
-              </div>
-              <div class="profile-card" data-profile="read-only">
-                <div class="profile-name">read-only</div>
-                <div class="profile-desc">Exploration &amp; architectural review mode; blocks file writes and command execution.</div>
-              </div>
-              <div class="profile-card" data-profile="full-auto">
-                <div class="profile-name">full-auto</div>
-                <div class="profile-desc">Autonomous multi-file edits, PTY test verification, and self-healing loops.</div>
-              </div>
-            </div>
-          </div>
-
           <div class="btn-row" style="margin-top: 16px;">
             <button type="button" class="btn btn-primary" id="saveModelSettingsBtn">Save Model &amp; Router Settings</button>
           </div>
         </div>
+      </section>
 
-        <div class="card">
-          <div class="toggle-row">
-            <div class="toggle-info">
-              <div class="toggle-title">Prompt Context Caching</div>
-              <div class="toggle-sub">Cache static workspace rules and persistent memory prefixes on Gemini turns (<span class="mono">rursor.agent.promptCache</span>).</div>
+      <!-- TAB: VOICE -->
+      <section class="tab-pane" id="pane-voice">
+        <div class="pane-header">
+          <h1 class="pane-title">Voice</h1>
+          <p class="pane-desc">Dictate prompts into Rursor Agent with local or cloud transcription.</p>
+        </div>
+        <div class="settings-group">
+          <div class="settings-row">
+            <div class="settings-copy">
+              <div class="settings-title">Voice Capture</div>
+              <div class="settings-sub">Start a voice prompt that fills the Agent composer</div>
             </div>
-            <label class="switch">
-              <input type="checkbox" id="togglePromptCache" checked />
-              <span class="slider"></span>
-            </label>
+            <button type="button" class="btn btn-primary" data-cmd="rursor.voicePrompt">Start</button>
           </div>
-          <div class="toggle-row">
-            <div class="toggle-info">
-              <div class="toggle-title">Auto-Verify Agent Edits</div>
-              <div class="toggle-sub">Automatically run detected build/test/typecheck suites after edits and self-correct failures (<span class="mono">rursor.agent.autoVerify</span>).</div>
+          <div class="settings-row">
+            <div class="settings-copy">
+              <div class="settings-title">Telemetry Dashboard</div>
+              <div class="settings-sub">Inspect turn latency and token estimates for Agent / Ask / Voice</div>
             </div>
-            <label class="switch">
-              <input type="checkbox" id="toggleAutoVerify" />
-              <span class="slider"></span>
-            </label>
+            <button type="button" class="btn" data-cmd="rursor.showTelemetry">Open</button>
           </div>
         </div>
       </section>
 
-      <!-- TAB 2: TAB & NES -->
-      <section class="tab-pane" id="pane-tab">
+      <!-- TAB: CODE INTEL -->
+      <section class="tab-pane" id="pane-codeintel">
         <div class="pane-header">
           <h1 class="pane-title">Tab &amp; Next-Edit Prediction (NES)</h1>
           <p class="pane-desc">Configure low-latency ghost-text completions, multi-line Next-Edit Predictions, Tab-to-Jump, and local Ollama / MLX engines.</p>
@@ -1876,7 +2313,7 @@ Execute the /${slug} workflow carefully on the target context:
 
             <div class="field">
               <label for="tabCloudModelInput">Cloud Autocomplete Model</label>
-              <input type="text" id="tabCloudModelInput" value="gemini-2.5-flash-lite" placeholder="gemini-2.5-flash-lite" />
+              <input type="text" id="tabCloudModelInput" value="gemini-3.5-flash-lite" placeholder="gemini-3.5-flash-lite" />
             </div>
 
             <div class="field">
@@ -1896,8 +2333,8 @@ Execute the /${slug} workflow carefully on the target context:
         </div>
       </section>
 
-      <!-- TAB 3: RULES & MEMORY -->
-      <section class="tab-pane" id="pane-rules">
+      <!-- TAB: CUSTOMIZE -->
+      <section class="tab-pane" id="pane-customize">
         <div class="pane-header">
           <h1 class="pane-title">Workspace Rules &amp; Memory</h1>
           <p class="pane-desc">Edit <span class="mono">.rursorrules</span> live on disk, manage reusable <span class="mono">/skill</span> workflows, and inspect persistent agent memory.</p>
@@ -1991,8 +2428,8 @@ Execute the /${slug} workflow carefully on the target context:
         </div>
       </section>
 
-      <!-- TAB 5: INDEX & SANDBOX -->
-      <section class="tab-pane" id="pane-index">
+      <!-- TAB: SOURCE CONTROL -->
+      <section class="tab-pane" id="pane-source">
         <div class="pane-header">
           <h1 class="pane-title">Codebase Index &amp; Sandbox</h1>
           <p class="pane-desc">Monitor Rust sidecar BM25 + AST symbol indexing, PTY execution, checkpoints, and isolated Git worktrees.</p>
@@ -2063,6 +2500,68 @@ Execute the /${slug} workflow carefully on the target context:
           </div>
         </div>
       </section>
+
+      <!-- TAB: BROWSER & NETWORK -->
+      <section class="tab-pane" id="pane-browser">
+        <div class="pane-header">
+          <h1 class="pane-title">Browser &amp; Network</h1>
+          <p class="pane-desc">Chromium CDP computer-use studio and sandbox network policy.</p>
+        </div>
+        <div class="settings-group">
+          <div class="settings-row">
+            <div class="settings-copy">
+              <div class="settings-title">Browser Studio</div>
+              <div class="settings-sub">Native Chromium CDP with Set-of-Mark actions and walkthrough video proof</div>
+            </div>
+            <button type="button" class="btn btn-primary" data-cmd="rursor.openBrowserStudio">Open</button>
+          </div>
+          <div class="settings-row">
+            <div class="settings-copy">
+              <div class="settings-title">Sandbox Network Access</div>
+              <div class="settings-sub">Allow outbound network inside macOS Seatbelt sandboxed Agent commands</div>
+            </div>
+            <label class="switch"><input type="checkbox" id="toggleSandboxNetwork" /><span class="slider"></span></label>
+          </div>
+          <div class="settings-row">
+            <div class="settings-copy">
+              <div class="settings-title">Web Preview</div>
+              <div class="settings-sub">Inspect localhost pages from Agent tool calls</div>
+            </div>
+            <button type="button" class="btn" data-cmd="rursor.openPreview">Open</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB: BETA -->
+      <section class="tab-pane" id="pane-beta">
+        <div class="pane-header">
+          <h1 class="pane-title">Beta</h1>
+          <p class="pane-desc">Experimental Rursor surfaces that ship ahead of stable defaults.</p>
+        </div>
+        <div class="settings-group">
+          <div class="settings-row">
+            <div class="settings-copy">
+              <div class="settings-title">Infinite Design Canvas</div>
+              <div class="settings-sub">Design-to-code canvas for interactive UI exploration</div>
+            </div>
+            <button type="button" class="btn" data-cmd="rursor.openCanvas">Open</button>
+          </div>
+          <div class="settings-row">
+            <div class="settings-copy">
+              <div class="settings-title">Artifact Studio</div>
+              <div class="settings-sub">Decks, explainer video, Office docs, and GenUI widgets</div>
+            </div>
+            <button type="button" class="btn" data-cmd="rursor.openArtifactStudio">Open</button>
+          </div>
+          <div class="settings-row">
+            <div class="settings-copy">
+              <div class="settings-title">Open Chat as Editor Tabs</div>
+              <div class="settings-sub">Same as General → Layout (beta default on)</div>
+            </div>
+            <label class="switch"><input type="checkbox" id="toggleChatTabsBeta" checked /><span class="slider"></span></label>
+          </div>
+        </div>
+      </section>
     </main>
   </div>
 
@@ -2100,16 +2599,19 @@ Execute the /${slug} workflow carefully on the target context:
         }, 3200);
       }
 
-      // Tab Switching
-      document.querySelectorAll('.nav-btn').forEach(function (btn) {
+      function activateTab(target) {
+        if (!target) return;
+        document.querySelectorAll('.nav-btn[data-tab]').forEach(function (b) {
+          b.classList.toggle('active', b.getAttribute('data-tab') === target);
+        });
+        document.querySelectorAll('.tab-pane').forEach(function (pane) {
+          pane.classList.toggle('active', pane.id === 'pane-' + target);
+        });
+      }
+
+      document.querySelectorAll('.nav-btn[data-tab]').forEach(function (btn) {
         btn.addEventListener('click', function () {
-          const target = btn.getAttribute('data-tab');
-          document.querySelectorAll('.nav-btn').forEach(function (b) {
-            b.classList.toggle('active', b === btn);
-          });
-          document.querySelectorAll('.tab-pane').forEach(function (pane) {
-            pane.classList.toggle('active', pane.id === 'pane-' + target);
-          });
+          activateTab(btn.getAttribute('data-tab'));
         });
       });
 
@@ -2118,8 +2620,36 @@ Execute the /${slug} workflow carefully on the target context:
         vscode.postMessage({ type: 'refresh' });
       });
 
-      // Delegated Clicks (API Keys, Skill Open, Memory Delete, Budget Presets)
+      const searchEl = el('settingsSearch');
+      if (searchEl) {
+        searchEl.addEventListener('input', function (e) {
+          const q = String(e.target.value || '').trim().toLowerCase();
+          document.querySelectorAll('.nav-btn[data-tab]').forEach(function (btn) {
+            const label = (btn.textContent || '').toLowerCase();
+            btn.style.display = !q || label.indexOf(q) >= 0 ? '' : 'none';
+          });
+        });
+        window.addEventListener('keydown', function (e) {
+          if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'f') {
+            e.preventDefault();
+            searchEl.focus();
+          }
+        });
+      }
+
+      // Delegated Clicks (API Keys, Skill Open, Memory Delete, Budget Presets, nav actions)
       document.addEventListener('click', function (ev) {
+        const gotoBtn = ev.target.closest('[data-goto]');
+        if (gotoBtn) {
+          activateTab(gotoBtn.getAttribute('data-goto'));
+          return;
+        }
+        const cmdBtn = ev.target.closest('[data-cmd]');
+        if (cmdBtn) {
+          vscode.postMessage({ type: 'runCommand', command: cmdBtn.getAttribute('data-cmd') });
+          return;
+        }
+
         const target = ev.target.closest('[data-action], [data-budget], [data-profile]');
         if (!target) return;
 
@@ -2135,7 +2665,12 @@ Execute the /${slug} workflow carefully on the target context:
         }
 
         const action = target.getAttribute('data-action');
-        if (action === 'save-key') {
+        if (action === 'open-vscode-settings') {
+          vscode.postMessage({ type: 'openVscodeSettings' });
+        } else if (action === 'open-docs') {
+          vscode.postMessage({ type: 'runCommand', command: 'rursor.openSettings' });
+          showToast('See README.md in the Rursor repo for full docs.', 'info');
+        } else if (action === 'save-key') {
           const provider = target.getAttribute('data-provider');
           const input = el('input-' + provider);
           vscode.postMessage({
@@ -2196,29 +2731,83 @@ Execute the /${slug} workflow carefully on the target context:
         });
       });
 
-      // Instant Switches
-      el('togglePromptCache').addEventListener('change', function (e) {
+      el('saveAgentProfileBtn').addEventListener('click', function () {
         vscode.postMessage({
-          type: 'toggleSetting',
-          key: 'agent.promptCache',
-          boolValue: Boolean(e.target.checked),
+          type: 'saveModelSettings',
+          defaultModel: el('defaultModelSelect').value,
+          thinkingBudget: Number(el('thinkingBudgetNumber').value || '0'),
+          permissionProfile: currentPermissionProfile,
         });
       });
 
-      el('toggleAutoVerify').addEventListener('change', function (e) {
+      function bindToggle(id, key) {
+        const node = el(id);
+        if (!node) return;
+        node.addEventListener('change', function (e) {
+          vscode.postMessage({
+            type: 'toggleSetting',
+            key: key,
+            boolValue: Boolean(e.target.checked),
+          });
+        });
+      }
+
+      bindToggle('togglePromptCache', 'agent.promptCache');
+      bindToggle('toggleAutoVerify', 'agent.autoVerify');
+      bindToggle('toggleUsePty', 'agent.usePty');
+      bindToggle('toggleTitleBar', 'layout.showTitleBar');
+      bindToggle('toggleStatusBar', 'layout.showStatusBar');
+      bindToggle('toggleAutoHideEditor', 'layout.autoHideEditorWhenEmpty');
+      bindToggle('toggleChatTabs', 'layout.openChatAsEditorTabs');
+      bindToggle('toggleChatTabsBeta', 'layout.openChatAsEditorTabs');
+      bindToggle('toggleSandboxNetwork', 'agent.sandboxAllowNetwork');
+
+      el('conversationDensitySelect').addEventListener('change', function (e) {
         vscode.postMessage({
           type: 'toggleSetting',
-          key: 'agent.autoVerify',
-          boolValue: Boolean(e.target.checked),
+          key: 'layout.conversationDensity',
+          value: e.target.value,
+        });
+      });
+      el('reviewControlSelect').addEventListener('change', function (e) {
+        vscode.postMessage({
+          type: 'toggleSetting',
+          key: 'layout.reviewControlLocation',
+          value: e.target.value,
         });
       });
 
-      el('toggleUsePty').addEventListener('change', function (e) {
-        vscode.postMessage({
-          type: 'toggleSetting',
-          key: 'agent.usePty',
-          boolValue: Boolean(e.target.checked),
+      document.querySelectorAll('#windowLayoutPicker .layout-card').forEach(function (card) {
+        card.addEventListener('click', function () {
+          const layout = card.getAttribute('data-layout') || 'editor';
+          document.querySelectorAll('#windowLayoutPicker .layout-card').forEach(function (c) {
+            c.classList.toggle('selected', c === card);
+          });
+          vscode.postMessage({
+            type: 'toggleSetting',
+            key: 'layout.windowLayout',
+            value: layout,
+          });
         });
+      });
+
+      el('dismissBannerBtn').addEventListener('click', function () {
+        vscode.postMessage({ type: 'dismissCustomizeBanner' });
+      });
+      el('openAccountBtn').addEventListener('click', function () {
+        activateTab('plan');
+      });
+      el('openEditorSettingsBtn').addEventListener('click', function () {
+        vscode.postMessage({ type: 'openEditorSettings' });
+      });
+      el('openKeysBtn').addEventListener('click', function () {
+        vscode.postMessage({ type: 'openKeyboardShortcuts' });
+      });
+      el('importVsCodeBtn').addEventListener('click', function () {
+        vscode.postMessage({ type: 'importFromVsCode' });
+      });
+      el('resetDontAskBtn').addEventListener('click', function () {
+        vscode.postMessage({ type: 'resetDontAskAgain' });
       });
 
       el('tabEnabledToggle').addEventListener('change', function (e) {
@@ -2355,11 +2944,15 @@ Execute the /${slug} workflow carefully on the target context:
         el('topWorkspaceLabel').textContent = state.workspaceRoot
           ? state.workspaceRoot
           : 'No workspace folder open';
+        if (el('accountEmailLabel')) el('accountEmailLabel').textContent = state.accountEmail || 'local';
+        if (el('accountPlanLabel')) el('accountPlanLabel').textContent = state.accountPlan || 'Pro+';
+        if (el('planBadge')) el('planBadge').textContent = state.accountPlan || 'Pro+';
 
         const connectedKeysCount = ['gemini', 'anthropic', 'openai'].filter(function (p) {
           return state.keys[p].hasKeychainKey || state.keys[p].hasSidecarKey;
         }).length;
         el('navKeysBadge').textContent = connectedKeysCount + '/3';
+        if (el('planKeysBadge')) el('planKeysBadge').textContent = connectedKeysCount + '/3';
         el('navTabBadge').textContent = state.tab.enabled ? 'On' : 'Off';
         el('navRulesBadge').textContent = String(
           (state.rulesAndMemory.hasWorkspaceRules ? 1 : 0) +
@@ -2367,6 +2960,22 @@ Execute the /${slug} workflow carefully on the target context:
         );
         el('navMcpBadge').textContent = String(state.mcp.servers.length);
         el('navIndexBadge').textContent = String(state.indexAndSandbox.indexedFiles);
+
+        // Layout (General)
+        if (state.layout) {
+          const banner = el('customizeBanner');
+          if (banner) banner.hidden = Boolean(state.layout.customizeBannerDismissed);
+          document.querySelectorAll('#windowLayoutPicker .layout-card').forEach(function (card) {
+            card.classList.toggle('selected', card.getAttribute('data-layout') === state.layout.windowLayout);
+          });
+          if (el('conversationDensitySelect')) el('conversationDensitySelect').value = state.layout.conversationDensity;
+          if (el('reviewControlSelect')) el('reviewControlSelect').value = state.layout.reviewControlLocation;
+          if (el('toggleTitleBar')) el('toggleTitleBar').checked = Boolean(state.layout.showTitleBar);
+          if (el('toggleStatusBar')) el('toggleStatusBar').checked = Boolean(state.layout.showStatusBar);
+          if (el('toggleAutoHideEditor')) el('toggleAutoHideEditor').checked = Boolean(state.layout.autoHideEditorWhenEmpty);
+          if (el('toggleChatTabs')) el('toggleChatTabs').checked = Boolean(state.layout.openChatAsEditorTabs);
+          if (el('toggleChatTabsBeta')) el('toggleChatTabsBeta').checked = Boolean(state.layout.openChatAsEditorTabs);
+        }
 
         // Keys
         renderKeyStatus('gemini', state.keys.gemini);

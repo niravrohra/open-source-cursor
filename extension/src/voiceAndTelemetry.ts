@@ -288,7 +288,7 @@ export class TelemetryTracker implements vscode.Disposable {
     const cachedTokens = Math.max(0, Math.round(input.cachedTokens ?? 0));
     const ttftMs = Math.max(0, Math.round(input.ttftMs));
     const totalMs = Math.max(ttftMs, Math.round(input.totalMs));
-    const model = input.model.trim() || 'gemini-2.5-flash';
+    const model = input.model.trim() || 'gemini-3.8-flash';
     const estCostUsd =
       input.estCostUsd !== undefined
         ? Math.max(0, input.estCostUsd)
@@ -1405,7 +1405,7 @@ export class VoicePromptController implements vscode.Disposable {
   public async transcribeViaSidecar(base64Wav: string): Promise<string> {
     const model = vscode.workspace
       .getConfiguration('rursor')
-      .get<string>('defaultModel', 'gemini-2.5-flash');
+      .get<string>('defaultModel', 'gemini-3.8-flash');
     const timer = this.telemetry?.startTurn('voice', model, 320, 0);
     const { promise } = this.client.request<{ text: string }>(
       'agent_chat',
@@ -1448,7 +1448,7 @@ export class VoicePromptController implements vscode.Disposable {
     );
 
     const cfg = vscode.workspace.getConfiguration('rursor');
-    const model = cfg.get<string>('defaultModel', 'gemini-2.5-flash');
+    const model = cfg.get<string>('defaultModel', 'gemini-3.8-flash');
     const contextFiles: Array<{ path: string; content: string }> = [];
     if (payload.spatialContext.filePath && payload.spatialContext.selectedCode) {
       contextFiles.push({

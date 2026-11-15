@@ -703,7 +703,7 @@ impl SmartRouter {
                             thinking_budget: decision.thinking_budget,
                             cached_content: None,
                         },
-                        |_| {},
+                        |_, _| {},
                     )
                     .await?;
                 out.text
@@ -3053,7 +3053,7 @@ mod tests {
             },
             ArenaCandidateResult {
                 candidate_id: "c_ok_but_verify_fail".to_string(),
-                model: "gemini-2.5-flash".to_string(),
+                model: "gemini-3.8-flash".to_string(),
                 provider: "gemini".to_string(),
                 clone_id: "cow_3".to_string(),
                 clone_path: "/tmp/cow_3".to_string(),
@@ -3067,7 +3067,7 @@ mod tests {
             },
             ArenaCandidateResult {
                 candidate_id: "c_fast_pass".to_string(),
-                model: "gemini-2.5-pro".to_string(),
+                model: "gemini-3.1-pro-preview".to_string(),
                 provider: "gemini".to_string(),
                 clone_id: "cow_4".to_string(),
                 clone_path: "/tmp/cow_4".to_string(),

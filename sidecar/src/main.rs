@@ -86,8 +86,8 @@ use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 use tokio::task::JoinHandle;
 
-const DEFAULT_GEMINI_MODEL: &str = "gemini-2.5-flash";
-const DEFAULT_AUTOCOMPLETE_MODEL: &str = "gemini-2.5-flash-lite";
+const DEFAULT_GEMINI_MODEL: &str = "gemini-3.8-flash";
+const DEFAULT_AUTOCOMPLETE_MODEL: &str = "gemini-3.5-flash-lite";
 const DEFAULT_LOCAL_ENDPOINT: &str = "http://127.0.0.1:11434";
 const DEFAULT_LOCAL_MODEL: &str = "qwen2.5-coder:7b";
 const MAX_AGENT_STEPS: usize = 16;
@@ -1377,12 +1377,17 @@ async fn dispatch(
                 &model,
                 rules.as_deref(),
                 tasks,
-                |task_id, status| {
+                |task_id, role, status, output| {
                     emit_event(
                         out_tx,
                         req_id,
                         "subagent_event",
-                        json!({ "taskId": task_id, "status": status }),
+                        json!({
+                            "taskId": task_id,
+                            "role": role,
+                            "status": status,
+                            "output": output,
+                        }),
                     );
                 },
             )
@@ -1845,10 +1850,18 @@ async fn handle_agent_chat(
         &local_model,
         &keys,
     );
-    let configured_thinking = params
+    let mut configured_thinking = params
         .thinking_budget
         .or(*state.thinking_budget.read().await)
         .or(route.thinking_budget);
+    // Default a modest Gemini thinking budget so the agent UI can animate Thought tokens
+    // (unless Ask mode, or the user/router already chose a budget).
+    if configured_thinking.is_none()
+        && route.provider == ProviderKind::Gemini
+        && !params.mode.eq_ignore_ascii_case("ask")
+    {
+        configured_thinking = Some(2048);
+    }
 
     let mut context_blocks = String::new();
     for snippet in &params.context_files {
@@ -1940,7 +1953,7 @@ async fn handle_agent_chat(
         if let Some(api_key) = keys.gemini.as_deref() {
             if let Ok(compacted) = state
                 .gemini
-                .compact_messages(api_key, "gemini-2.5-flash-lite", &messages, 6)
+                .compact_messages(api_key, "gemini-3.5-flash-lite", &messages, 6)
                 .await
             {
                 emit_event(
@@ -2091,20 +2104,49 @@ async fn handle_agent_chat(
 
     let mut contents: Vec<Value> = messages.iter().map(chat_message_to_gemini_content).collect();
     let mcp_decls = state.mcp.read().await.gemini_function_declarations();
-    let tools = Some(agent_tool_declarations(&mcp_decls));
+    let mode = normalize_agent_mode(&params.mode);
+    let all_tools = agent_tool_declarations(&mcp_decls);
+    let tools = Some(filter_tools_for_mode(mode, all_tools));
     let workspace_root_label = workspace_root
         .as_ref()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "none".to_string());
 
-    let system_prompt = format!(
-        "You are Rursor Agent, an autonomous AI software engineer inside a macOS code editor (workspace root: {workspace_root_label}).\n\
-        Use the provided tools to inspect files, search/grep/symbol-search/AST-call-graph the workspace, check git diff, edit or create files, run parallel research subagents, manage background PTY processes, use git worktree sandboxes, inspect localhost web previews, persist learned project memories, invoke MCP tools, and run terminal commands.\n\
-        Rules:\n\
-        - Always read a file before editing it unless creating a brand new file.\n\
-        - Prefer minimal, exact replacements in edit_file (`old_text` must uniquely match existing text in the file).\n\
-        - Summarize the exact files modified and any verification commands run.{rules_block}{memory_block}"
-    );
+    let system_prompt = match mode {
+        "plan" => format!(
+            "You are Rursor Plan mode inside a macOS code editor (workspace root: {workspace_root_label}).\n\
+            Explore the codebase with read-only tools and produce a concrete implementation plan.\n\
+            Rules:\n\
+            - Do NOT edit files, write files, or run mutating commands.\n\
+            - Use search/read/grep/outline/git tools and spawn_subagents for parallel research when helpful.\n\
+            - Output a structured plan with: Goal, Assumptions, Steps (numbered), Files to touch, Risks, and a short Verification checklist.\n\
+            - Prefer actionable steps a coding agent can execute later.{rules_block}{memory_block}"
+        ),
+        "take-control" => format!(
+            "You are Rursor Computer-Use mode inside a macOS code editor (workspace root: {workspace_root_label}).\n\
+            You can operate the user's computer through the workspace terminal and Rursor's real Chromium CDP browser tools.\n\
+            Prefer this loop: browser_navigate → browser_snapshot → browser_act (and browser_record_walkthrough for proof), plus run_command for local automation.\n\
+            Rules:\n\
+            - Be explicit about each action you take and why.\n\
+            - Prefer browser tools for UI/web tasks; use run_command for shell/system tasks in the workspace.\n\
+            - Always read a file before editing it unless creating a brand new file.\n\
+            - Prefer minimal, exact replacements in edit_file.\n\
+            - Do not run full builds/tests unless needed for the computer-use task.\n\
+            - Summarize actions taken and files changed.{rules_block}{memory_block}"
+        ),
+        _ => format!(
+            "You are Rursor Agent, an autonomous AI software engineer inside a macOS code editor (workspace root: {workspace_root_label}).\n\
+            Use the provided tools to inspect files, search/grep/symbol-search/AST-call-graph the workspace, check git diff, edit or create files, run parallel research subagents, manage background PTY processes, use git worktree sandboxes, inspect localhost web previews, persist learned project memories, invoke MCP tools, and run terminal commands.\n\
+            Rules:\n\
+            - Always read a file before editing it unless creating a brand new file.\n\
+            - Prefer minimal, exact replacements in edit_file (`old_text` must uniquely match existing text in the file).\n\
+            - Match effort to the request: for simple/local edits, change the files and stop. Do NOT run build, test, typecheck, lint, or install commands unless the user asked, the change is high-risk (shared APIs, build config, deps), or you hit a concrete compile/runtime error that needs diagnosis.\n\
+            - Never run `npm run build`, `cargo build --release`, full test suites, or package installs as a default after-edit ritual.\n\
+            - When verification is actually needed, prefer the lightest check (`tsc --noEmit`, `npm run compile`, targeted test) over a full production build.\n\
+            - Summarize the exact files modified; only mention commands you actually ran.\n\
+            - Spawn parallel subagents with spawn_subagents when research can be fan-out across roles.{rules_block}{memory_block}"
+        ),
+    };
 
     let enable_cache = *state.enable_prompt_cache.read().await;
     let static_prefix = format!("{rules_block}{memory_block}");
@@ -2151,8 +2193,20 @@ async fn handle_agent_chat(
                 0.2,
                 None,
                 turn_options,
-                |delta| {
-                    emit_event(out_tx, req_id, "stream_chunk", json!({ "text": delta }));
+                |delta, kind| {
+                    match kind {
+                        gemini::GeminiStreamKind::Thought => {
+                            emit_event(
+                                out_tx,
+                                req_id,
+                                "thinking_chunk",
+                                json!({ "text": delta }),
+                            );
+                        }
+                        gemini::GeminiStreamKind::Text => {
+                            emit_event(out_tx, req_id, "stream_chunk", json!({ "text": delta }));
+                        }
+                    }
                 },
             )
             .await
@@ -2458,12 +2512,17 @@ async fn execute_agent_tool(
                 model,
                 rules.as_deref(),
                 tasks,
-                |task_id, status| {
+                |task_id, role, status, output| {
                     emit_event(
                         out_tx,
                         req_id,
                         "subagent_event",
-                        json!({ "taskId": task_id, "status": status }),
+                        json!({
+                            "taskId": task_id,
+                            "role": role,
+                            "status": status,
+                            "output": output,
+                        }),
                     );
                 },
             )
@@ -3003,6 +3062,46 @@ async fn execute_agent_tool(
     }
 }
 
+fn normalize_agent_mode(mode: &str) -> &'static str {
+    match mode.trim().to_ascii_lowercase().as_str() {
+        "ask" => "ask",
+        "plan" => "plan",
+        "take-control" | "take_control" | "computer" | "computer-use" | "pc" => "take-control",
+        _ => "agent",
+    }
+}
+
+fn filter_tools_for_mode(mode: &str, mut tools: Vec<Value>) -> Vec<Value> {
+    const PLAN_ALLOW: &[&str] = &[
+        "read_file",
+        "list_files",
+        "search_workspace",
+        "search_symbols",
+        "find_callers",
+        "file_outline",
+        "grep_workspace",
+        "git_context",
+        "repo_map",
+        "web_search",
+        "spawn_subagents",
+        "inspect_web_page",
+        "browser_snapshot",
+        "search_docs",
+    ];
+    match mode {
+        "plan" => {
+            tools.retain(|t| {
+                t.get("name")
+                    .and_then(|n| n.as_str())
+                    .map(|name| PLAN_ALLOW.contains(&name) || name.starts_with("mcp_"))
+                    .unwrap_or(false)
+            });
+            tools
+        }
+        _ => tools,
+    }
+}
+
 fn agent_tool_declarations(mcp_decls: &[Value]) -> Vec<Value> {
     let mut decls = vec![
         json!({
@@ -3126,12 +3225,12 @@ fn agent_tool_declarations(mcp_decls: &[Value]) -> Vec<Value> {
         }),
         json!({
             "name": "run_command",
-            "description": "Ask the user to run a shell command in the workspace root (e.g., cargo test, npm run compile) and return stdout/stderr/exit code.",
+            "description": "Run a shell command in the workspace root only when needed (debug a failure, user asked, or high-risk change). Do not use for routine after-edit builds like `npm run build`. Prefer light checks such as `npm run compile` or `npx tsc --noEmit` when verification is required. Returns stdout/stderr/exit code.",
             "parameters": {
                 "type": "OBJECT",
                 "properties": {
                     "command": { "type": "STRING", "description": "Shell command to execute in workspace root." },
-                    "reason": { "type": "STRING", "description": "Why this command should be run." }
+                    "reason": { "type": "STRING", "description": "Why this command is necessary right now (not habit)." }
                 },
                 "required": ["command"]
             }
@@ -3157,7 +3256,15 @@ fn agent_tool_declarations(mcp_decls: &[Value]) -> Vec<Value> {
                 "properties": {
                     "tasks": {
                         "type": "ARRAY",
-                        "description": "List of { id, role, prompt } subtask objects."
+                        "description": "List of { id, role, prompt } subtask objects.",
+                        "items": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "id": { "type": "STRING" },
+                                "role": { "type": "STRING" },
+                                "prompt": { "type": "STRING" }
+                            }
+                        }
                     }
                 },
                 "required": ["tasks"]
@@ -3342,7 +3449,21 @@ fn agent_tool_declarations(mcp_decls: &[Value]) -> Vec<Value> {
                 "type": "OBJECT",
                 "properties": {
                     "outputMp4Path": { "type": "STRING", "description": "Output .mp4 path (e.g. .rursor/artifacts/demo.mp4)." },
-                    "steps": { "type": "ARRAY", "description": "Array of walkthrough step objects (navigate, click, type, scroll, wait_ms)." }
+                    "steps": {
+                        "type": "ARRAY",
+                        "description": "Array of walkthrough step objects (navigate, click, type, scroll, wait_ms).",
+                        "items": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "kind": { "type": "STRING" },
+                                "url": { "type": "STRING" },
+                                "somId": { "type": "INTEGER" },
+                                "selector": { "type": "STRING" },
+                                "text": { "type": "STRING" },
+                                "waitMs": { "type": "INTEGER" }
+                            }
+                        }
+                    }
                 },
                 "required": ["steps"]
             }
@@ -3358,7 +3479,22 @@ fn agent_tool_declarations(mcp_decls: &[Value]) -> Vec<Value> {
                     "author": { "type": "STRING", "description": "Author or team name." },
                     "theme": { "type": "STRING", "description": "'obsidian', 'executive', or 'minimal'." },
                     "outputPath": { "type": "STRING", "description": "Workspace-relative .pptx path (e.g. decks/roadmap.pptx)." },
-                    "slides": { "type": "ARRAY", "description": "Array of slide objects ({ layout, title, subtitle, bullets, rightBullets, metrics, code, speakerNotes })." }
+                    "slides": {
+                        "type": "ARRAY",
+                        "description": "Array of slide objects ({ layout, title, subtitle, bullets, rightBullets, metrics, code, speakerNotes }).",
+                        "items": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "layout": { "type": "STRING" },
+                                "title": { "type": "STRING" },
+                                "subtitle": { "type": "STRING" },
+                                "bullets": { "type": "ARRAY", "items": { "type": "STRING" } },
+                                "rightBullets": { "type": "ARRAY", "items": { "type": "STRING" } },
+                                "code": { "type": "STRING" },
+                                "speakerNotes": { "type": "STRING" }
+                            }
+                        }
+                    }
                 },
                 "required": ["title", "outputPath", "slides"]
             }
@@ -3371,7 +3507,22 @@ fn agent_tool_declarations(mcp_decls: &[Value]) -> Vec<Value> {
                 "properties": {
                     "title": { "type": "STRING", "description": "Video title." },
                     "outputPath": { "type": "STRING", "description": "Workspace-relative .mp4 path (e.g. videos/overview.mp4)." },
-                    "scenes": { "type": "ARRAY", "description": "Array of scenes ({ heading, subheading, bullets, codeSnippet, narration, durationSecs, accentHex })." }
+                    "scenes": {
+                        "type": "ARRAY",
+                        "description": "Array of scenes ({ heading, subheading, bullets, codeSnippet, narration, durationSecs, accentHex }).",
+                        "items": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "heading": { "type": "STRING" },
+                                "subheading": { "type": "STRING" },
+                                "bullets": { "type": "ARRAY", "items": { "type": "STRING" } },
+                                "codeSnippet": { "type": "STRING" },
+                                "narration": { "type": "STRING" },
+                                "durationSecs": { "type": "NUMBER" },
+                                "accentHex": { "type": "STRING" }
+                            }
+                        }
+                    }
                 },
                 "required": ["title", "outputPath", "scenes"]
             }
@@ -3385,7 +3536,11 @@ fn agent_tool_declarations(mcp_decls: &[Value]) -> Vec<Value> {
                     "prompt": { "type": "STRING", "description": "Visual prompt or diagram heading." },
                     "outputPath": { "type": "STRING", "description": "Workspace-relative .png path (e.g. assets/hero.png)." },
                     "subtitle": { "type": "STRING", "description": "Optional subtitle for local card fallback." },
-                    "bullets": { "type": "ARRAY", "description": "Optional key points for architecture/card rendering." }
+                    "bullets": {
+                        "type": "ARRAY",
+                        "description": "Optional key points for architecture/card rendering.",
+                        "items": { "type": "STRING" }
+                    }
                 },
                 "required": ["prompt", "outputPath"]
             }
@@ -3397,7 +3552,21 @@ fn agent_tool_declarations(mcp_decls: &[Value]) -> Vec<Value> {
                 "type": "OBJECT",
                 "properties": {
                     "outputPath": { "type": "STRING", "description": "Workspace-relative .xlsx path (e.g. reports/metrics.xlsx)." },
-                    "sheets": { "type": "ARRAY", "description": "Array of { name, headers, rows } sheet objects." }
+                    "sheets": {
+                        "type": "ARRAY",
+                        "description": "Array of { name, headers, rows } sheet objects.",
+                        "items": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "name": { "type": "STRING" },
+                                "headers": { "type": "ARRAY", "items": { "type": "STRING" } },
+                                "rows": {
+                                    "type": "ARRAY",
+                                    "items": { "type": "ARRAY", "items": { "type": "STRING" } }
+                                }
+                            }
+                        }
+                    }
                 },
                 "required": ["outputPath", "sheets"]
             }
@@ -3411,7 +3580,19 @@ fn agent_tool_declarations(mcp_decls: &[Value]) -> Vec<Value> {
                     "title": { "type": "STRING", "description": "Document title." },
                     "subtitle": { "type": "STRING", "description": "Document subtitle." },
                     "outputPath": { "type": "STRING", "description": "Workspace-relative .docx path (e.g. docs/rfc.docx)." },
-                    "sections": { "type": "ARRAY", "description": "Array of { heading, paragraphs, bullets, codeBlock, table } sections." }
+                    "sections": {
+                        "type": "ARRAY",
+                        "description": "Array of { heading, paragraphs, bullets, codeBlock, table } sections.",
+                        "items": {
+                            "type": "OBJECT",
+                            "properties": {
+                                "heading": { "type": "STRING" },
+                                "paragraphs": { "type": "ARRAY", "items": { "type": "STRING" } },
+                                "bullets": { "type": "ARRAY", "items": { "type": "STRING" } },
+                                "codeBlock": { "type": "STRING" }
+                            }
+                        }
+                    }
                 },
                 "required": ["title", "outputPath", "sections"]
             }

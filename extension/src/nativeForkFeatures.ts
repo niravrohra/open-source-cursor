@@ -1193,7 +1193,7 @@ export function registerNativeForkFeatures(
             const relPath = vscode.workspace.asRelativePath(document.uri, false);
             const fastModel = vscode.workspace
               .getConfiguration('rursor')
-              .get<string>('autocomplete.model', 'gemini-2.5-flash-lite');
+              .get<string>('autocomplete.model', 'gemini-3.5-flash-lite');
 
             const renamePrompt = [
               `Suggest exactly 4 idiomatic, descriptive replacement identifier names for the symbol \`${currentName}\` at line ${

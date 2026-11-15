@@ -169,8 +169,8 @@ type SwarmAwareStreamCallbacks = StreamCallbacks & {
 };
 
 const ARENA_DEFAULT_MODELS: readonly string[] = [
-  'gemini-2.5-pro',
-  'gemini-2.5-flash',
+  'gemini-3.1-pro-preview',
+  'gemini-3.8-flash',
   'claude-sonnet-4-20250514',
   'gpt-4.1',
 ];
@@ -513,7 +513,7 @@ export class MissionControlPanel implements vscode.Disposable {
     arenaRunning: false,
     arenaError: null,
     arenaPrompt: '',
-    arenaSelectedModels: ['gemini-2.5-pro', 'gemini-2.5-flash'],
+    arenaSelectedModels: ['gemini-3.1-pro-preview', 'gemini-3.8-flash'],
     arenaCandidates: [],
     arenaStatuses: {},
     arenaDurationMs: 0,
@@ -2069,12 +2069,12 @@ export class MissionControlPanel implements vscode.Disposable {
         ></textarea>
         <div class="model-checks" id="arenaModelChecks">
           <label class="model-check">
-            <input type="checkbox" value="gemini-2.5-pro" checked />
-            <span>gemini-2.5-pro</span>
+            <input type="checkbox" value="gemini-3.1-pro-preview" checked />
+            <span>gemini-3.1-pro-preview</span>
           </label>
           <label class="model-check">
-            <input type="checkbox" value="gemini-2.5-flash" checked />
-            <span>gemini-2.5-flash</span>
+            <input type="checkbox" value="gemini-3.8-flash" checked />
+            <span>gemini-3.8-flash</span>
           </label>
           <label class="model-check">
             <input type="checkbox" value="claude-sonnet-4-20250514" />

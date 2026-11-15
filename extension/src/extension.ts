@@ -26,7 +26,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   context.subscriptions.push(intentLedger);
 
   const mainStatus = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
-  mainStatus.text = '$(sparkle) Rursor';
+  mainStatus.text = '$(comment-discussion) Rursor';
   mainStatus.tooltip = 'Open Rursor Settings (Cmd+Shift+J)';
   mainStatus.command = 'rursor.openSettings';
   mainStatus.show();
@@ -72,8 +72,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       context.secrets.get(SECRET_OPENAI_KEY),
     ]);
     const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-    const model = modelOverride ?? cfg.get<string>('defaultModel', 'gemini-2.5-flash');
-    const autocompleteModel = cfg.get<string>('autocomplete.model', 'gemini-2.5-flash-lite');
+    const model = modelOverride ?? cfg.get<string>('defaultModel', 'gemini-3.8-flash');
+    const autocompleteModel = cfg.get<string>('autocomplete.model', 'gemini-3.5-flash-lite');
     const autocompleteBackend = cfg.get<string>('autocomplete.backend', 'gemini');
     const localEndpoint = cfg.get<string>('autocomplete.localEndpoint', 'http://127.0.0.1:11434');
     const localModel = cfg.get<string>('autocomplete.localModel', 'qwen2.5-coder:7b');

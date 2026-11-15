@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 const GEMINI_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta/models";
 const GEMINI_V1BETA_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
 const DEFAULT_EMBEDDING_MODEL: &str = "text-embedding-004";
-const DEFAULT_COMPACTION_MODEL: &str = "gemini-2.5-flash";
+const DEFAULT_COMPACTION_MODEL: &str = "gemini-3.8-flash";
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -27,6 +27,8 @@ struct GeminiRequest {
 #[serde(rename_all = "camelCase")]
 struct ThinkingConfig {
     thinking_budget: u32,
+    /// When true, Gemini streams `thought` parts that the agent UI can animate.
+    include_thoughts: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -77,13 +79,22 @@ pub struct GeminiFunctionCall {
 #[derive(Debug, Default)]
 pub struct GeminiTurnOutput {
     pub text: String,
+    pub thought: String,
     pub function_calls: Vec<GeminiFunctionCall>,
     pub raw_model_parts: Vec<Value>,
+}
+
+/// A streamed Gemini piece — visible answer text or internal thinking/reasoning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GeminiStreamKind {
+    Text,
+    Thought,
 }
 
 #[derive(Debug, Default, PartialEq)]
 struct ParsedChunk {
     text: String,
+    thought: String,
     function_calls: Vec<GeminiFunctionCall>,
     raw_parts: Vec<Value>,
 }
@@ -134,7 +145,11 @@ impl GeminiClient {
                 None,
                 temperature,
                 max_output_tokens,
-                &mut on_chunk,
+                |delta, kind| {
+                    if kind == GeminiStreamKind::Text {
+                        on_chunk(delta);
+                    }
+                },
             )
             .await?;
 
@@ -155,7 +170,7 @@ impl GeminiClient {
         on_chunk: F,
     ) -> Result<GeminiTurnOutput, String>
     where
-        F: FnMut(&str),
+        F: FnMut(&str, GeminiStreamKind),
     {
         self.stream_turn_with_options(
             api_key,
@@ -186,7 +201,7 @@ impl GeminiClient {
         mut on_chunk: F,
     ) -> Result<GeminiTurnOutput, String>
     where
-        F: FnMut(&str),
+        F: FnMut(&str, GeminiStreamKind),
     {
         let url = format!("{GEMINI_BASE_URL}/{model}:streamGenerateContent?alt=sse");
         let body = build_gemini_request(
@@ -430,7 +445,10 @@ fn build_gemini_request(
 
     let thinking_config = options
         .thinking_budget
-        .map(|thinking_budget| ThinkingConfig { thinking_budget });
+        .map(|thinking_budget| ThinkingConfig {
+            thinking_budget,
+            include_thoughts: true,
+        });
 
     GeminiRequest {
         system_instruction,
@@ -458,14 +476,18 @@ pub fn estimate_messages_tokens(messages: &[ChatMessage]) -> usize {
         .sum()
 }
 
-fn apply_parsed_chunk<F: FnMut(&str)>(
+fn apply_parsed_chunk<F: FnMut(&str, GeminiStreamKind)>(
     parsed: ParsedChunk,
     output: &mut GeminiTurnOutput,
     on_chunk: &mut F,
 ) {
+    if !parsed.thought.is_empty() {
+        output.thought.push_str(&parsed.thought);
+        on_chunk(&parsed.thought, GeminiStreamKind::Thought);
+    }
     if !parsed.text.is_empty() {
         output.text.push_str(&parsed.text);
-        on_chunk(&parsed.text);
+        on_chunk(&parsed.text, GeminiStreamKind::Text);
     }
     output.function_calls.extend(parsed.function_calls);
     output.raw_model_parts.extend(parsed.raw_parts);
@@ -516,8 +538,10 @@ fn parse_sse_data(raw: &str) -> Result<Option<ParsedChunk>, String> {
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
 
-                if !is_thought {
-                    if let Some(t) = part.get("text").and_then(|v| v.as_str()) {
+                if let Some(t) = part.get("text").and_then(|v| v.as_str()) {
+                    if is_thought {
+                        out.thought.push_str(t);
+                    } else {
                         out.text.push_str(t);
                     }
                 }
@@ -537,7 +561,11 @@ fn parse_sse_data(raw: &str) -> Result<Option<ParsedChunk>, String> {
         }
     }
 
-    if out.text.is_empty() && out.function_calls.is_empty() && out.raw_parts.is_empty() {
+    if out.text.is_empty()
+        && out.thought.is_empty()
+        && out.function_calls.is_empty()
+        && out.raw_parts.is_empty()
+    {
         Ok(None)
     } else {
         Ok(Some(out))
@@ -561,6 +589,7 @@ mod tests {
         let raw = r#"{"candidates":[{"content":{"role":"model","parts":[{"text":"thinking...","thought":true},{"functionCall":{"name":"read_file","args":{"path":"src/main.rs"}},"thoughtSignature":"sig123"}]}}]}"#;
         let parsed = parse_sse_data(raw).unwrap().unwrap();
         assert_eq!(parsed.text, "");
+        assert_eq!(parsed.thought, "thinking...");
         assert_eq!(parsed.function_calls.len(), 1);
         assert_eq!(parsed.function_calls[0].name, "read_file");
         assert_eq!(parsed.function_calls[0].args["path"], "src/main.rs");
@@ -619,6 +648,10 @@ mod tests {
         assert_eq!(
             v["generationConfig"]["thinkingConfig"]["thinkingBudget"],
             2048
+        );
+        assert_eq!(
+            v["generationConfig"]["thinkingConfig"]["includeThoughts"],
+            true
         );
         assert_eq!(v["generationConfig"]["maxOutputTokens"], 4096);
         assert!(v.get("systemInstruction").is_none());
