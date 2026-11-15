@@ -394,23 +394,26 @@ def evaluate_task(
                 "validate_syntax",
                 {
                     "path": "src/lib.rs",
-                    "languageId": "rust",
-                    "content": "pub fn clamp(x: f64) -> f64 { x.clamp(0.0, 1.0) }\n",
+                    "before": "",
+                    "after": "pub fn clamp(x: f64) -> f64 { x.clamp(0.0, 1.0) }\n",
                 },
             )
             bad_res, bad_ms = harness.request(
                 "validate_syntax",
                 {
                     "path": "src/lib.rs",
-                    "languageId": "rust",
-                    "content": "pub fn broken(x: i32 -> {\n    let y = ;\n",
+                    "before": "pub fn clamp(x: f64) -> f64 { x }\n",
+                    "after": "pub fn broken(x: i32 -> {\n    let y = ;\n",
                 },
             )
             total_ms = (time.perf_counter() - t0) * 1000.0
+            ok_val = ok_res.get("validation") or {}
+            bad_val = bad_res.get("validation") or {}
+            err_cnt = int(bad_val.get("afterErrors", 0))
             passed = (
-                ok_res.get("valid") is True
-                and bad_res.get("valid") is False
-                and int(bad_res.get("errorCount", 0)) >= 1
+                ok_val.get("valid") is True
+                and bad_val.get("valid") is False
+                and err_cnt >= 1
             )
             return {
                 "id": task_id,
@@ -419,17 +422,17 @@ def evaluate_task(
                 "status": "PASS" if passed else "FAIL",
                 "passed": passed,
                 "latencyMs": round(total_ms, 2),
-                "metricLabel": f"valid={ok_ms:.2f}ms, broken={bad_ms:.2f}ms ({bad_res.get('errorCount', 0)} AST err)",
-                "details": {"okMs": round(ok_ms, 2), "badMs": round(bad_ms, 2)},
+                "metricLabel": f"valid={ok_ms:.2f}ms, broken={bad_ms:.2f}ms ({err_cnt} AST err)",
+                "details": {"okMs": round(ok_ms, 2), "badMs": round(bad_ms, 2), "afterErrors": err_cnt},
             }
 
         if kind == "repo_map_check":
             focus_files = task.get("focusFiles", ["extension/src/extension.ts"])
-            budget = int(task.get("tokenBudget", 1200))
+            budget_chars = int(task.get("tokenBudget", 1200)) * 4
             expected_sub = str(task.get("expectedSubstring", "SidecarClient"))
             res, ms = harness.request(
                 "repo_map",
-                {"focusFiles": focus_files, "tokenBudget": budget},
+                {"activeFiles": focus_files, "tokenBudgetChars": budget_chars},
             )
             repo_map_text = str(res.get("repoMap", ""))
             passed = len(repo_map_text) > 80 and expected_sub in repo_map_text
@@ -440,19 +443,20 @@ def evaluate_task(
                 "status": "PASS" if passed else "FAIL",
                 "passed": passed,
                 "latencyMs": round(ms, 2),
-                "metricLabel": f"{len(repo_map_text)} chars in {ms:.2f}ms (budget={budget} tok)",
+                "metricLabel": f"{len(repo_map_text)} chars in {ms:.2f}ms",
                 "details": {"chars": len(repo_map_text), "elapsedMs": round(ms, 2)},
             }
 
         if kind == "seatbelt_classify_check":
             t0 = time.perf_counter()
-            safe_res, _ = harness.request("classify_command", {"command": "cargo test --quiet"})
+            read_res, _ = harness.request("classify_command", {"command": "git status --short"})
+            build_res, _ = harness.request("classify_command", {"command": "cargo test --quiet"})
             dest_res, _ = harness.request("classify_command", {"command": "rm -rf /"})
             total_ms = (time.perf_counter() - t0) * 1000.0
             passed = (
-                safe_res.get("risk") == "safe"
-                and dest_res.get("risk") == "destructive"
-                and dest_res.get("allowed") is False
+                read_res.get("risk") == "safeRead"
+                and build_res.get("risk") == "safeBuildOrTest"
+                and dest_res.get("risk") == "destructiveOrExternal"
             )
             return {
                 "id": task_id,
@@ -461,8 +465,8 @@ def evaluate_task(
                 "status": "PASS" if passed else "FAIL",
                 "passed": passed,
                 "latencyMs": round(total_ms, 2),
-                "metricLabel": f"safe->allowed, rm -rf->blocked ({total_ms:.2f}ms)",
-                "details": {"safe": safe_res, "destructive": dest_res},
+                "metricLabel": f"safeRead / safeBuildOrTest / destructiveOrExternal ({total_ms:.2f}ms)",
+                "details": {"read": read_res, "build": build_res, "destructive": dest_res},
             }
 
         if kind == "cow_clone_roundtrip":
@@ -471,13 +475,15 @@ def evaluate_task(
             (fixture_ws / "src" / "main.rs").write_text("fn main() { println!(\"v1\"); }\n", encoding="utf-8")
             (fixture_ws / "Cargo.toml").write_text("[package]\nname = \"demo\"\nversion = \"0.1.0\"\n", encoding="utf-8")
 
+            harness.request("index_workspace", {"workspaceRoot": str(fixture_ws)})
             t0 = time.perf_counter()
             create_res, create_ms = harness.request(
                 "create_cow_clone",
-                {"workspaceRoot": str(fixture_ws), "taskLabel": "eval-cow"},
+                {"taskLabel": "eval-cow"},
             )
-            clone_id = str(create_res.get("cloneId", ""))
-            clone_path = Path(str(create_res.get("clonePath", "")))
+            clone_meta = create_res.get("clone") or {}
+            clone_id = str(clone_meta.get("cloneId", ""))
+            clone_path = Path(str(clone_meta.get("cloneRoot", "")))
             (clone_path / "src" / "main.rs").write_text(
                 "fn main() { println!(\"v2-mutated-in-apfs-cow\"); }\n",
                 encoding="utf-8",
@@ -485,13 +491,15 @@ def evaluate_task(
             diff_res, diff_ms = harness.request("diff_cow_clone", {"cloneId": clone_id})
             destroy_res, destroy_ms = harness.request("destroy_cow_clone", {"cloneId": clone_id})
             total_ms = (time.perf_counter() - t0) * 1000.0
+            harness.request("index_workspace", {"workspaceRoot": str(workspace_root)})
 
+            diffs = diff_res.get("diffs") or []
             orig_intact = "v1" in (fixture_ws / "src" / "main.rs").read_text(encoding="utf-8")
             passed = (
                 bool(clone_id)
-                and int(diff_res.get("changedFiles", 0)) == 1
+                and len(diffs) == 1
                 and orig_intact
-                and destroy_res.get("removed") is True
+                and destroy_res.get("destroyed") is True
             )
             return {
                 "id": task_id,
