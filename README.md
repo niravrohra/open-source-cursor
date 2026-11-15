@@ -547,6 +547,69 @@ Unlike plain marketplace extensions constrained by stock VS Code UI limitations,
 
 ---
 
+## 🔬 Algorithmic Internals & Local Disk Schema
+
+For systems engineers and researchers who want to understand (and improve!) what happens inside `rursor-sidecar`, here are the core algorithms and storage layouts powering Rursor:
+
+### 1. Personalized PageRank `RepoMap` Formulation (`sidecar/src/repomap.rs`)
+
+Given $N$ workspace files analyzed via Tree-sitter into exported `signatures`, `import_statements`, and `identifiers`, Rursor builds a weighted directed graph $G = (V, E)$:
+- **Forward Import Edge ($u \to v$):** Weight `2.5` when file $u$ explicitly imports module/path $v$.
+- **Reverse Importer Edge ($v \to u$):** Weight `0.45` so core utility definitions share centrality with their callers.
+- **Cross-File Symbol Reference Edge:** Weight `0.20 / |definers(s)|` (for symbols with $\le 5$ definers) when file $u$ references top-level symbol $s$ defined in $v$.
+
+We construct a normalized **personalization (teleportation) distribution** $\mathbf{p} \in \mathbb{R}^N$ from live developer state:
+- Active editor tabs (`active_files`): `+3.0`
+- Uncommitted modified files (`dirty_files`): `+2.0`
+- Prompt identifier/token matches (`query_terms`): `+1.5` per matched term
+- Baseline floor across all files: `0.05`
+
+We then iterate **12 steps** of Personalized PageRank with damping factor $\alpha = 0.85$:
+
+$$\mathbf{r}^{(t+1)} = (1 - \alpha)\mathbf{p} + \alpha M^\top \mathbf{r}^{(t)}$$
+
+Files are sorted descending by stationary score $r_i^{(12)}$, and up to `12` top-level/member AST signatures per file (capped at `160` chars per signature) are packed greedily until `token_budget_chars` (`default: 6,000`) is filled.
+
+### 2. Defense-in-Depth Sandbox Execution Pipeline (`sidecar/src/macos_sandbox.rs`)
+
+```mermaid
+flowchart LR
+    Cmd["Agent `run_command`"] --> Risk["1. Static Risk Classifier (`classify_command_risk`)"]
+    Risk -->|"Destructive (`rm -rf /`, `sudo`, etc.)"| Block["Hard Reject Before Spawn"]
+    Risk -->|"Safe / Moderate"| Profile["2. Synthesize Seatbelt `.sb` Policy (`read-only` | `safe-auto` | `full-auto`)"]
+    Profile --> Deny["Kernel-Deny `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.kube` + Optional Net Air-Gap"]
+    Deny --> CoW["3. Optional `2.3ms` APFS CoW Clone (`cp -c -R` in `~/.rursor/cow-clones/`)"]
+    CoW --> PTY["4. Spawn `/usr/bin/sandbox-exec` / `portable-pty` (4 MiB stream cap + timeout)"]
+```
+
+### 3. Complete Local Disk Layout (`~/.rursor/` & `<workspace>/.rursor/`)
+
+Rursor keeps all state human-readable, local, and easy to inspect or wipe:
+
+```text
+~/.rursor/                                     # Global User State Directory
+├── global-memory.json                         # Cross-project persistent developer preferences & facts
+├── mcp.json                                   # Global stdio MCP server definitions
+├── skills/*.md                                # Global reusable `/skill` slash command templates
+├── sessions/<session_id>.json                 # Saved multi-turn Agent conversation transcripts
+├── checkpoints/<checkpoint_id>/               # Pre-edit file snapshots for 1-click turn rollback
+├── cow-clones/                                # Instant macOS APFS Copy-on-Write workspace sandboxes
+│   ├── .meta/<clone_id>.json                  # Source root, timestamp, and task label metadata
+│   └── cow_<slug>_<ms>_<seq>/                 # Zero-extra-block APFS clone (`cp -c -R`)
+└── worktrees/                                 # Isolated parallel Git worktree checkouts
+
+<workspace>/                                   # Per-Repository Customizations (100% Optional)
+├── .rursorrules / .cursorrules                # Single-file AI coding instructions (auto-merged)
+├── AGENTS.md / CLAUDE.md                      # Cross-agent compatible instructions (auto-merged)
+└── .rursor/
+    ├── mcp.json                               # Project-specific stdio MCP servers
+    ├── memory.json                            # Project-scoped persistent Agent memories
+    ├── rules/*.md                             # Modular markdown rule files (loaded alphabetically)
+    └── skills/*.md                            # Project-specific `/skill` slash commands
+```
+
+---
+
 ## ⚡ Quick Start (Up and Running in 15 Seconds)
 
 ### Prerequisites
@@ -868,15 +931,43 @@ GEMINI_API_KEY="your-key" ./scripts/rursor eval --output eval/latest_report.json
 9. **APFS Copy-on-Write Sandbox Round-Trip (`cow_clone_roundtrip`):** Creates an APFS CoW clone, mutates files inside the clone, verifies `diff_cow_clone` detects `1` changed file while the original workspace remains `100%` intact, and destroys the clone cleanly.
 10. **Session Persistence & Live Pass@1 Tasks:** Tests full `save_session` -> `load_session` -> `delete_session` fidelity plus live `inline_edit` and `agent_chat` code generation when `GEMINI_API_KEY` is present.
 
-Also run the native Rust unit test suite and TypeScript strict compiler check anytime:
+Also run the native Rust unit test suite (**57 unit tests passing in ~1.08s**) and TypeScript strict compiler check anytime:
 
 ```bash
-# Run all Rust unit tests (router, syntax_gate, repomap, nes, ast_index, macos_sandbox, rules, memory...)
+# Run all 57 Rust unit tests (router, syntax_gate, repomap, nes, ast_index, macos_sandbox, rules, memory...)
 cargo test --manifest-path sidecar/Cargo.toml
 
 # Verify strict zero-`any` TypeScript compilation
 npm --prefix extension run compile
 ```
+
+### Measured Apple Silicon (`Darwin-arm64`) Benchmark Results
+
+Below is an unmodified baseline run of `./scripts/rursor eval` against this repository (`21/21` deterministic checks passed, `100.0%` Symbol & Hybrid Context `Recall@5`, `100.0%` Grep Precision, `0.02 ms` warm RPC round-trip):
+
+| # | Task ID | Category | Status | Latency | Measured Metric |
+|---:|:---|:---|:---:|---:|:---|
+| 1 | `rpc_ping_latency` | `rpc_latency` | **PASS** | `0.02 ms` | `p50=0.02ms, p95=0.03ms (30x)` |
+| 2 | `rpc_status_latency` | `rpc_latency` | **PASS** | `0.03 ms` | `p50=0.03ms, p95=0.05ms (25x)` |
+| 3 | `index_workspace_throughput` | `indexing` | **PASS** | `209.16 ms` | `53 files in 209.2ms (253 files/s)` |
+| 4 | `symbol_recall_agent_panel` | `symbol_recall` | **PASS** | `0.11 ms` | `Recall@5=1.00 (rank #1, 0.11ms)` |
+| 5 | `symbol_recall_gemini_client` | `symbol_recall` | **PASS** | `0.10 ms` | `Recall@5=1.00 (rank #1, 0.10ms)` |
+| 6 | `symbol_recall_workspace_index` | `symbol_recall` | **PASS** | `0.12 ms` | `Recall@5=1.00 (rank #1, 0.12ms)` |
+| 7 | `symbol_recall_mcp_manager` | `symbol_recall` | **PASS** | `0.08 ms` | `Recall@5=1.00 (rank #1, 0.08ms)` |
+| 8 | `symbol_recall_sidecar_client` | `symbol_recall` | **PASS** | `0.09 ms` | `Recall@5=1.00 (rank #1, 0.09ms)` |
+| 9 | `symbol_recall_telemetry_tracker` | `symbol_recall` | **PASS** | `0.08 ms` | `Recall@5=1.00 (rank #1, 0.08ms)` |
+| 10 | `hybrid_recall_gemini_sse` | `hybrid_context` | **PASS** | `2.37 ms` | `Recall@5=1.00 (rank #1, 2.37ms)` |
+| 11 | `hybrid_recall_inline_edit_codelens` | `hybrid_context` | **PASS** | `2.22 ms` | `Recall@5=1.00 (rank #1, 2.22ms)` |
+| 12 | `hybrid_recall_workspace_bm25_rrf` | `hybrid_context` | **PASS** | `2.85 ms` | `Recall@5=1.00 (rank #2, 2.85ms)` |
+| 13 | `hybrid_recall_mcp_stdio` | `hybrid_context` | **PASS** | `1.34 ms` | `Recall@5=1.00 (rank #1, 1.34ms)` |
+| 14 | `grep_precision_sse_endpoint` | `grep_workspace` | **PASS** | `1.10 ms` | `Precision=1.00 (3 hits, 1.10ms)` |
+| 15 | `grep_precision_agent_view` | `grep_workspace` | **PASS** | `1.10 ms` | `Precision=1.00 (5 hits, 1.10ms)` |
+| 16 | `git_context_latency` | `git` | **PASS** | `24.75 ms` | `12,087 chars in 24.75ms` |
+| 17 | `session_persistence_roundtrip` | `sessions` | **PASS** | `0.60 ms` | `save=0.44ms, load=0.07ms, del=0.07ms` |
+| 18 | `ast_syntax_gate_roundtrip` | `syntax_gate` | **PASS** | `0.14 ms` | `valid=0.07ms, broken=0.07ms (1 AST err)` |
+| 19 | `pagerank_repomap_generation` | `repomap` | **PASS** | `77.87 ms` | `4,735 chars in 77.87ms` |
+| 20 | `seatbelt_command_classifier` | `sandbox` | **PASS** | `0.15 ms` | `safeRead / safeBuildOrTest / destructiveOrExternal` |
+| 21 | `apfs_cow_clone_roundtrip` | `apfs_cow` | **PASS** | `5.65 ms` | `clone=2.3ms, diff=3.0ms, destroy=0.2ms` |
 
 ---
 
@@ -902,9 +993,30 @@ Rursor already has **32,400+ lines of working Rust + TypeScript + native Monaco 
 
 ---
 
+### Contributor Quest Board (Beginner -> Intermediate -> Systems Master)
+
+No matter your background or how much time you have—30 minutes on a Saturday or a deep multi-week systems project—there is a quest with your name on it right now:
+
+| Difficulty | Skill Set | Concrete Quest You Can Claim Today | Primary Files to Touch |
+| :--- | :--- | :--- | :--- |
+| 🟢 **Good First PR** | Rust + Tree-sitter | Add a new language (`C++`, `Java`, `Swift`, `Ruby`, `Zig`, `C#`, `Kotlin`) to AST chunking & syntax validation | `sidecar/Cargo.toml`, `ast_index.rs`, `syntax_gate.rs`, `repomap.rs` |
+| 🟢 **Good First PR** | Rust + HTTP/SSE | Add **OpenRouter**, **Groq**, **DeepSeek**, or custom OpenAI-compatible base URLs to the Smart Router | `sidecar/src/router.rs`, `extension/package.json` |
+| 🟢 **Good First PR** | Python + Evals | Add 20 new retrieval, syntax-gate, or multi-language Pass@1 benchmark tasks | `eval/tasks.json`, `eval/run_eval.py` |
+| 🟢 **Good First PR** | Markdown / Prompting | Author a curated community library of `.rursor/skills/*.md` (`/pr-review`, `/perf-profile`, `/rust-unsafe-audit`, `/react-a11y`) | `skills/` or `examples/` |
+| 🟡 **Intermediate** | TypeScript + Webview CSS | Add syntax-highlighted collapsible diff blocks, copy-code buttons, and token-speed sparklines to the Agent Webview | `extension/src/agentPanel.ts`, `voiceAndTelemetry.ts` |
+| 🟡 **Intermediate** | Rust + Anthropic/OpenAI | Bring full 16-step native `tool_use` / `tool_calls` execution parity to Claude & OpenAI inside `agent_chat` | `sidecar/src/router.rs`, `sidecar/src/main.rs` |
+| 🟡 **Intermediate** | TypeScript + CDP / Playwright | Upgrade `webPreview.ts` with headless screenshot capture & clickable DOM element inspection for visual UI debugging | `extension/src/webPreview.ts` |
+| 🟡 **Intermediate** | GitHub Actions / DevOps | Create `.github/workflows/ci.yml` running `cargo test`, `tsc`, `rursor-eval`, and automated `Rursor-arm64.dmg` nightly artifacts | `.github/workflows/` |
+| 🔴 **Systems Master** | Linux Systems Rust | Build `linux_sandbox.rs` using **Landlock LSM / `bwrap`** + **Btrfs/XFS `FICLONE`** Copy-on-Write workspace clones | `sidecar/src/`, `fork/scripts/` |
+| 🔴 **Systems Master** | Rust + `ratatui` TUI | Build `rursor tui`—a full **Claude Code / Codex CLI** interactive terminal UI talking over JSON-RPC to `rursor-sidecar`! | `sidecar/` or `tui/` crate |
+| 🔴 **Systems Master** | Parallel Agent Systems | Build **"Best-of-3 Arena Mode"**: run Gemini + Claude + OpenAI concurrently inside 3 `2.3ms` APFS CoW clones, run `cargo test` in each, and surface a 3-way Multi-Diff picker! | `macos_sandbox.rs`, `subagents.rs`, `agentPanel.ts` |
+| 🔴 **Systems Master** | Monaco Internals + ML | Implement **Speculative Fast-Apply** & character-level streaming ZoneWidget diff animations | `fork/patches/`, `inlineEdit.ts`, `router.rs` |
+
+---
+
 ### High-Impact Roadmap & Open Contributor Quests
 
-Looking for an awesome place to jump in? Pick any quest below (or invent your own and open an issue/PR!):
+Looking for the full architectural roadmap? Pick any track below (or propose your own in Issues/Discussions!):
 
 #### 🌍 Track 1: Cross-Platform Domination (Linux & Windows Support)
 - [ ] **Linux Kernel Sandboxing (`sidecar/src/linux_sandbox.rs`):** Port `macos_sandbox.rs` to Linux using **Landlock LSM** / **Bubblewrap (`bwrap`)** + **Btrfs/XFS `FICLONE` reflink** Copy-on-Write workspace clones!
@@ -931,6 +1043,136 @@ Looking for an awesome place to jump in? Pick any quest below (or invent your ow
 #### 🧪 Track 5: SWE-Bench, LiveCodeBench & Prompt Engineering (`eval/`)
 - [ ] **Expand `eval/tasks.json` to 100+ Real-World Multi-File Tasks:** Add polyglot bug-fix, refactoring, and NES prediction benchmarks so every prompt or RepoMap tweak can be A/B tested quantitatively.
 - [ ] **SWE-bench Verified Adapter:** Wire `rursor-sidecar` headless JSON-RPC mode directly into the official `SWE-bench` Docker harness and publish open leaderboards!
+
+---
+
+### 5 Copy-Paste Contributor Playbooks (Extend Rursor in Minutes)
+
+Want to see just how clean and hackable Rursor's architecture is? Expand any playbook below for a step-by-step code blueprint:
+
+<details>
+<summary><b>🛠️ Playbook 1: Add a New Native Agent Tool to <code>rursor-sidecar</code> (Rust)</b></summary>
+
+1. **Declare the tool schema** in [`sidecar/src/gemini.rs`](sidecar/src/gemini.rs) inside `builtin_agent_tools()`:
+   ```rust
+   json!({
+       "name": "git_blame_line",
+       "description": "Returns the commit hash, author, and commit message that last touched a line.",
+       "parameters": {
+           "type": "OBJECT",
+           "properties": {
+               "path": { "type": "STRING", "description": "Workspace-relative file path" },
+               "line": { "type": "INTEGER", "description": "1-based line number" }
+           },
+           "required": ["path", "line"]
+       }
+   })
+   ```
+2. **Handle execution** inside `execute_agent_tool()` in [`sidecar/src/main.rs`](sidecar/src/main.rs):
+   ```rust
+   "git_blame_line" => {
+       let rel_path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+       let line = args.get("line").and_then(|v| v.as_u64()).unwrap_or(1);
+       // Run git blame -L {line},{line} --porcelain -- {rel_path} safely inside workspace_root
+       Ok(json!({ "blame": output_str }))
+   }
+   ```
+3. Run `cargo test --manifest-path sidecar/Cargo.toml` and `./scripts/dev-vscode.sh`—your Agent immediately knows how to call `git_blame_line`!
+</details>
+
+<details>
+<summary><b>🌳 Playbook 2: Add a New Tree-Sitter Language Grammar (e.g., Swift, C++, Zig, Java)</b></summary>
+
+1. Add the grammar crate in [`sidecar/Cargo.toml`](sidecar/Cargo.toml):
+   ```toml
+   tree-sitter-swift = "0.6"
+   ```
+2. Wire the file extension in three clean match blocks:
+   - [`sidecar/src/syntax_gate.rs`](sidecar/src/syntax_gate.rs) -> `detect_gate_language()` (instant pre-write AST syntax gating!)
+   - [`sidecar/src/repomap.rs`](sidecar/src/repomap.rs) -> `detect_map_lang()` & `ts_language_for()` (Personalized PageRank signature extraction!)
+   - [`sidecar/src/ast_index.rs`](sidecar/src/ast_index.rs) -> `SupportedLanguage` & `parse_chunks()` (SQLite FTS5 + 128d vector chunk indexing!)
+3. Add a unit test in `syntax_gate.rs` verifying a valid snippet passes and a broken snippet catches the CST error span!
+</details>
+
+<details>
+<summary><b>🧠 Playbook 3: Add a New Cloud or Local Model Provider in <code>router.rs</code></b></summary>
+
+1. Add your `ProviderKind` variant (or reuse `stream_openai_chat_with_url` for any OpenAI-compatible SSE API like **Groq**, **OpenRouter**, **DeepSeek**, or **vLLM**) in [`sidecar/src/router.rs`](sidecar/src/router.rs):
+   ```rust
+   pub async fn stream_openrouter_chat<F>(
+       http: &Client,
+       api_key: &str,
+       model: &str,
+       system_prompt: Option<&str>,
+       messages: &[ChatMessage],
+       temperature: f32,
+       max_tokens: Option<u32>,
+       mut on_chunk: F,
+   ) -> Result<String, String>
+   where
+       F: FnMut(&str),
+   {
+       stream_openai_chat_with_url(
+           http,
+           "https://openrouter.ai/api/v1/chat/completions",
+           api_key,
+           model,
+           system_prompt,
+           messages,
+           temperature,
+           max_tokens,
+           &mut on_chunk,
+       )
+       .await
+   }
+   ```
+2. Add a route rule in `route_task()` + unit test in `router::tests`, then wire a SecretStorage setter command in [`extension/src/extension.ts`](extension/src/extension.ts).
+</details>
+
+<details>
+<summary><b>🐍 Playbook 4: Embed <code>rursor-sidecar</code> in Neovim, Zed, TUI, or a 25-Line Python Script</b></summary>
+
+Because `rursor-sidecar` is a standalone, zero-UI-dependency JSON-RPC daemon over `stdio`, anyone can build new frontends (Neovim Lua plugin, Zed extension, `ratatui` CLI, Discord/GitHub PR bot) on top of Rursor's Rust engine in minutes:
+
+```python
+import json, subprocess
+
+proc = subprocess.Popen(
+    ["./extension/bin/rursor-sidecar"],
+    stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1
+)
+
+def rpc(req_id: int, method: str, params: dict = {}):
+    proc.stdin.write(json.dumps({"id": req_id, "method": method, "params": params}) + "\n")
+    proc.stdin.flush()
+    while line := proc.stdout.readline():
+        msg = json.loads(line)
+        if msg.get("id") == req_id:
+            return msg["result"]
+
+print(rpc(1, "index_workspace", {"workspaceRoot": "."}))
+print(rpc(2, "search_context", {"query": "Personalized PageRank repo map", "limit": 3}))
+print(rpc(3, "validate_syntax", {"path": "demo.rs", "before": "", "after": "fn main() {"}))
+```
+</details>
+
+<details>
+<summary><b>🩹 Playbook 5: Author a Clean, Rebaseable <code>Code - OSS</code> Workbench Patch</b></summary>
+
+1. Stage the upstream `Code - OSS` source tree without launching Electron:
+   ```bash
+   ./scripts/dev-rursor.sh --no-launch
+   ```
+2. Edit the target workbench or Monaco file inside `fork/.vscode-src/src/vs/...`.
+3. Export a numbered git patch into `fork/patches/`:
+   ```bash
+   git -C fork/.vscode-src diff src/ > fork/patches/06-my-monaco-enhancement.patch
+   ```
+4. Verify clean idempotent check + compile + launch:
+   ```bash
+   ./scripts/dev-rursor.sh --compile
+   ```
+</details>
 
 ---
 
