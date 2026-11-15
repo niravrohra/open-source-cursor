@@ -1,0 +1,414 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Resolve symlinks so /usr/local/bin/rursor finds the repository root accurately.
+resolve_script_path() {
+  local source="${BASH_SOURCE[0]}"
+  while [[ -L "${source}" ]]; do
+    local dir
+    dir="$(cd -P "$(dirname "${source}")" && pwd)"
+    source="$(readlink "${source}")"
+    if [[ "${source}" != /* ]]; then
+      source="${dir}/${source}"
+    fi
+  done
+  local final_dir
+  final_dir="$(cd -P "$(dirname "${source}")" && pwd)"
+  printf '%s/%s\n' "${final_dir}" "$(basename "${source}")"
+}
+
+SCRIPT_PATH="$(resolve_script_path)"
+SCRIPTS_DIR="$(dirname "${SCRIPT_PATH}")"
+ROOT_DIR="$(cd "${SCRIPTS_DIR}/.." && pwd)"
+CALLER_PWD="$(pwd)"
+
+find_python3() {
+  if command -v python3 >/dev/null 2>&1; then
+    command -v python3
+  elif [[ -x "/usr/bin/python3" ]]; then
+    printf '%s\n' "/usr/bin/python3"
+  else
+    echo "Error: python3 not found." >&2
+    exit 1
+  fi
+}
+
+find_sidecar_bin() {
+  local candidates=(
+    "${ROOT_DIR}/extension/bin/rursor-sidecar"
+    "${ROOT_DIR}/sidecar/target/release/rursor-sidecar"
+    "${ROOT_DIR}/sidecar/target/debug/rursor-sidecar"
+  )
+  local cand
+  for cand in "${candidates[@]}"; do
+    if [[ -x "${cand}" ]]; then
+      printf '%s\n' "${cand}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+find_rursor_app() {
+  if [[ -d "${ROOT_DIR}/fork/VSCode-darwin-arm64/Rursor.app" ]]; then
+    printf '%s\n' "${ROOT_DIR}/fork/VSCode-darwin-arm64/Rursor.app"
+    return 0
+  elif [[ -d "/Applications/Rursor.app" ]]; then
+    printf '%s\n' "/Applications/Rursor.app"
+    return 0
+  fi
+  return 1
+}
+
+print_help() {
+  cat <<EOF
+rursor — macOS CLI for the Rursor AI-Native Code Editor
+
+Usage:
+  rursor                        Open Rursor.app (or launch Dev Host via scripts/dev-vscode.sh)
+  rursor <path>                 Open folder or file in Rursor
+  rursor <file>:<line>[:<col>]  Open file at exact line/column in Rursor
+  rursor status [--json]        Query rursor-sidecar ping + status JSON-RPC health
+  rursor eval [args...]         Run the rursor-eval benchmark harness (eval/run_eval.py)
+  rursor install-cli [--apply]  Print or create /usr/local/bin/rursor symlink
+  rursor --help | -h            Show this help message
+EOF
+}
+
+cmd_status() {
+  local json_only="false"
+  local target_ws="${CALLER_PWD}"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --json)
+        json_only="true"
+        shift
+        ;;
+      *)
+        target_ws="$1"
+        shift
+        ;;
+    esac
+  done
+
+  local sidecar_bin=""
+  if ! sidecar_bin="$(find_sidecar_bin)"; then
+    echo "rursor-sidecar binary not built yet; building debug sidecar..." >&2
+    cargo build --manifest-path "${ROOT_DIR}/sidecar/Cargo.toml" >&2
+    sidecar_bin="$(find_sidecar_bin)"
+  fi
+
+  local app_bundle="none (dev-host fallback: scripts/dev-vscode.sh)"
+  if resolved_app="$(find_rursor_app)"; then
+    app_bundle="${resolved_app}"
+  fi
+
+  local py
+  py="$(find_python3)"
+
+  "${py}" - "${sidecar_bin}" "${target_ws}" "${app_bundle}" "${json_only}" <<'PY'
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+
+sidecar_bin, target_ws, app_bundle, json_only_raw = sys.argv[1:5]
+json_only = json_only_raw.lower() == "true"
+
+env = os.environ.copy()
+home_rursor = os.path.join(env.get("HOME", "/tmp"), ".rursor")
+try:
+    os.makedirs(home_rursor, exist_ok=True)
+    probe = os.path.join(home_rursor, ".write_probe")
+    with open(probe, "w", encoding="utf-8") as fh:
+        fh.write("ok")
+    os.unlink(probe)
+except OSError:
+    env["HOME"] = os.path.join(tempfile.gettempdir(), "rursor_cli_home")
+    os.makedirs(env["HOME"], exist_ok=True)
+
+proc = subprocess.Popen(
+    [sidecar_bin],
+    stdin=subprocess.PIPE,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    text=True,
+    bufsize=1,
+    env=env,
+)
+
+def rpc(req_id, method, params=None):
+    payload = {"id": req_id, "method": method, "params": params or {}}
+    t0 = time.perf_counter()
+    assert proc.stdin is not None and proc.stdout is not None
+    proc.stdin.write(json.dumps(payload) + "\n")
+    proc.stdin.flush()
+    while True:
+        line = proc.stdout.readline()
+        if not line:
+            err = proc.stderr.read() if proc.stderr else ""
+            raise RuntimeError(f"rursor-sidecar EOF while awaiting {method}: {err.strip()}")
+        msg = json.loads(line)
+        if msg.get("id") == req_id:
+            elapsed_ms = (time.perf_counter() - t0) * 1000.0
+            if not msg.get("ok"):
+                raise RuntimeError(msg.get("error", f"{method} failed"))
+            return msg.get("result", {}), elapsed_ms
+
+try:
+    _, cold_boot_ms = rpc(1, "ping")
+    ping_res, ping_ms = rpc(2, "ping")
+    index_ms = None
+    if os.path.isdir(target_ws):
+        try:
+            _, index_ms = rpc(3, "index_workspace", {"workspaceRoot": os.path.abspath(target_ws)})
+        except Exception:
+            index_ms = None
+    status_res, status_ms = rpc(4, "status")
+finally:
+    try:
+        if proc.stdin:
+            proc.stdin.close()
+        proc.terminate()
+        proc.wait(timeout=2)
+    except Exception:
+        proc.kill()
+
+report = {
+    "ping": ping_res,
+    "coldBootMs": round(cold_boot_ms, 2),
+    "pingLatencyMs": round(ping_ms, 2),
+    "statusLatencyMs": round(status_ms, 2),
+    "indexLatencyMs": round(index_ms, 2) if index_ms is not None else None,
+    "sidecarBinary": sidecar_bin,
+    "appBundle": app_bundle,
+    "status": status_res,
+}
+
+if json_only:
+    print(json.dumps(report, indent=2))
+    sys.exit(0)
+
+svc = ping_res.get("service", "rursor-sidecar")
+ver = ping_res.get("version", "unknown")
+ready = status_res.get("ready", False)
+health_badge = "HEALTHY" if ready else "DEGRADED"
+
+print("==============================================================")
+print(f"  Rursor Health & Sidecar Status  [{health_badge}]")
+print("==============================================================")
+print(f"  Service          : {svc} v{ver}")
+print(f"  Sidecar Binary   : {sidecar_bin}")
+print(f"  App Bundle       : {app_bundle}")
+print(
+    f"  RPC Latency      : ping {ping_ms:.2f} ms | status {status_ms:.2f} ms "
+    f"(cold boot {cold_boot_ms:.1f} ms)"
+)
+print("--------------------------------------------------------------")
+print(f"  Default Model    : {status_res.get('model', 'n/a')}")
+print(
+    f"  Tab Autocomplete : {status_res.get('autocompleteModel', 'n/a')} "
+    f"(backend: {status_res.get('autocompleteBackend', 'n/a')})"
+)
+keys = []
+keys.append("Gemini=" + ("set" if status_res.get("hasApiKey") else "unset"))
+keys.append("Anthropic=" + ("set" if status_res.get("hasAnthropicKey") else "unset"))
+keys.append("OpenAI=" + ("set" if status_res.get("hasOpenAiKey") else "unset"))
+print(f"  Provider Keys    : {', '.join(keys)}")
+print("--------------------------------------------------------------")
+print(f"  Workspace Root   : {status_res.get('workspaceRoot') or '(none)'}")
+idx_suffix = f" ({index_ms:.1f} ms)" if index_ms is not None else ""
+print(f"  Indexed Files    : {status_res.get('indexedFiles', 0)}{idx_suffix}")
+print(f"  Workspace Rules  : {'loaded' if status_res.get('hasWorkspaceRules') else 'none'}")
+print(
+    f"  Skills / Memory  : {status_res.get('skillsCount', 0)} skills | "
+    f"{status_res.get('memoriesCount', 0)} memories"
+)
+mcp_servers = status_res.get("mcpServers") or []
+print(f"  MCP Servers      : {len(mcp_servers)} configured")
+print(f"  BG Processes     : {status_res.get('backgroundProcesses', 0)} active")
+print("==============================================================")
+PY
+}
+
+cmd_eval() {
+  local py
+  py="$(find_python3)"
+  exec "${py}" "${ROOT_DIR}/eval/run_eval.py" "$@"
+}
+
+cmd_install_cli() {
+  local target_link="/usr/local/bin/rursor"
+  local apply_mode="false"
+  if [[ "${1:-}" == "--apply" ]]; then
+    apply_mode="true"
+  fi
+
+  if [[ -L "${target_link}" ]] && [[ "$(readlink "${target_link}")" == "${SCRIPT_PATH}" ]]; then
+    echo "rursor CLI is already installed at ${target_link} -> ${SCRIPT_PATH}"
+    return 0
+  fi
+
+  if [[ "${apply_mode}" == "true" ]] || [[ -w "/usr/local/bin" ]]; then
+    if [[ -d "/usr/local/bin" && -w "/usr/local/bin" ]]; then
+      ln -sf "${SCRIPT_PATH}" "${target_link}"
+      echo "Installed symlink: ${target_link} -> ${SCRIPT_PATH}"
+      echo "Verify with: rursor status"
+      return 0
+    elif [[ "${apply_mode}" == "true" ]]; then
+      echo "Creating ${target_link} requires administrator privileges:"
+      sudo ln -sf "${SCRIPT_PATH}" "${target_link}"
+      echo "Installed symlink: ${target_link} -> ${SCRIPT_PATH}"
+      return 0
+    fi
+  fi
+
+  cat <<EOF
+To install 'rursor' globally on macOS (/usr/local/bin/rursor):
+
+  sudo ln -sf "${SCRIPT_PATH}" /usr/local/bin/rursor
+
+Or run:
+  ${SCRIPT_PATH} install-cli --apply
+
+Non-root alternative (~/.local/bin):
+  mkdir -p "\$HOME/.local/bin" && ln -sf "${SCRIPT_PATH}" "\$HOME/.local/bin/rursor"
+EOF
+}
+
+resolve_abs_path() {
+  local raw="$1"
+  if [[ "${raw}" == /* ]]; then
+    printf '%s\n' "${raw}"
+  else
+    printf '%s/%s\n' "${CALLER_PWD}" "${raw}"
+  fi
+}
+
+launch_editor() {
+  local raw_arg="${1:-}"
+  local goto_mode="false"
+  local target_path=""
+  local goto_spec=""
+
+  if [[ -n "${raw_arg}" ]]; then
+    if [[ "${raw_arg}" =~ ^(.+):([0-9]+)(:([0-9]+))?$ ]]; then
+      local file_part="${BASH_REMATCH[1]}"
+      local line_part="${BASH_REMATCH[2]}"
+      local col_suffix="${BASH_REMATCH[3]:-}"
+      local abs_file
+      abs_file="$(resolve_abs_path "${file_part}")"
+      goto_mode="true"
+      target_path="${abs_file}"
+      goto_spec="${abs_file}:${line_part}${col_suffix}"
+    else
+      target_path="$(resolve_abs_path "${raw_arg}")"
+    fi
+  fi
+
+  local app_path=""
+  if app_path="$(find_rursor_app)"; then
+    local app_cli=""
+    local bin_cand
+    for bin_cand in \
+      "${app_path}/Contents/Resources/app/bin/rursor" \
+      "${app_path}/Contents/Resources/app/bin/code" \
+      "${app_path}/Contents/Resources/app/bin/code-oss"; do
+      if [[ -x "${bin_cand}" ]]; then
+        app_cli="${bin_cand}"
+        break
+      fi
+    done
+
+    if [[ -n "${app_cli}" ]]; then
+      if [[ "${goto_mode}" == "true" ]]; then
+        exec "${app_cli}" --goto "${goto_spec}"
+      elif [[ -n "${target_path}" ]]; then
+        exec "${app_cli}" "${target_path}"
+      else
+        exec "${app_cli}" "${CALLER_PWD}"
+      fi
+    else
+      if [[ "${goto_mode}" == "true" ]]; then
+        exec open -a "${app_path}" --args --goto "${goto_spec}"
+      elif [[ -n "${target_path}" ]]; then
+        exec open -a "${app_path}" "${target_path}"
+      else
+        exec open -a "${app_path}"
+      fi
+    fi
+  fi
+
+  # Fallback when Rursor.app is not yet built: use scripts/dev-vscode.sh or dev host with target
+  if [[ -z "${raw_arg}" ]]; then
+    exec "${ROOT_DIR}/scripts/dev-vscode.sh"
+  fi
+
+  # Ensure sidecar + extension are compiled before opening a custom target in dev host
+  if [[ ! -x "${ROOT_DIR}/extension/bin/rursor-sidecar" ]] || [[ ! -d "${ROOT_DIR}/extension/out" ]]; then
+    echo "Preparing Rursor sidecar & extension before launching dev host..."
+    cargo build --manifest-path "${ROOT_DIR}/sidecar/Cargo.toml"
+    pushd "${ROOT_DIR}/extension" >/dev/null
+    if [[ ! -d node_modules ]]; then
+      npm install
+    fi
+    npm run compile
+    mkdir -p bin
+    cp "${ROOT_DIR}/sidecar/target/debug/rursor-sidecar" bin/rursor-sidecar
+    chmod +x bin/rursor-sidecar
+    popd >/dev/null
+  fi
+
+  local host_cmd=""
+  if command -v code >/dev/null 2>&1; then
+    host_cmd="code"
+  elif [[ -x "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code" ]]; then
+    host_cmd="/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code"
+  elif [[ -x "/Applications/Antigravity IDE.app/Contents/Resources/app/bin/antigravity" ]]; then
+    host_cmd="/Applications/Antigravity IDE.app/Contents/Resources/app/bin/antigravity"
+  else
+    exec "${ROOT_DIR}/scripts/dev-vscode.sh"
+  fi
+
+  if [[ "${goto_mode}" == "true" ]]; then
+    local ws_dir
+    ws_dir="$(dirname "${target_path}")"
+    exec "${host_cmd}" --extensionDevelopmentPath="${ROOT_DIR}/extension" "${ws_dir}" --goto "${goto_spec}"
+  else
+    exec "${host_cmd}" --extensionDevelopmentPath="${ROOT_DIR}/extension" "${target_path}"
+  fi
+}
+
+main() {
+  local subcmd="${1:-}"
+  case "${subcmd}" in
+    status)
+      shift
+      cmd_status "$@"
+      ;;
+    eval)
+      shift
+      cmd_eval "$@"
+      ;;
+    install-cli)
+      shift
+      cmd_install_cli "$@"
+      ;;
+    help|--help|-h)
+      print_help
+      ;;
+    --version|-v)
+      echo "rursor CLI 0.2.0 (${ROOT_DIR})"
+      ;;
+    "")
+      launch_editor ""
+      ;;
+    *)
+      launch_editor "$1"
+      ;;
+  esac
+}
+
+main "$@"

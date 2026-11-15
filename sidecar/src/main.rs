@@ -1,15 +1,18 @@
 mod context;
 mod gemini;
 mod local_llm;
+mod macos_sandbox;
 mod mcp;
 mod memory;
 mod nes;
 mod protocol;
 mod pty_runner;
+mod repomap;
 mod router;
 mod rules;
 mod sessions;
 mod subagents;
+mod syntax_gate;
 mod worktree;
 
 use crate::context::WorkspaceIndex;
@@ -17,6 +20,9 @@ use crate::gemini::{
     chat_message_to_gemini_content, estimate_messages_tokens, GeminiClient, GeminiTurnOptions,
 };
 use crate::local_llm::LocalLlmClient;
+use crate::macos_sandbox::{
+    classify_command_risk, run_sandboxed_command_async, ApfsCloneManager, PermissionProfile,
+};
 use crate::mcp::McpManager;
 use crate::memory::{
     delete_memory, format_memory_prompt, list_skills, load_memories, resolve_slash_command,
@@ -24,16 +30,18 @@ use crate::memory::{
 };
 use crate::nes::{build_nes_prompt, find_related_edit_sites, parse_nes_response};
 use crate::protocol::{
-    AgentChatParams, BgProcessIdParams, CancelParams, ChatMessage, CreateCheckpointParams,
-    CreateWorktreeParams, DeleteMemoryParams, FileOutlineParams, FindCallersParams,
-    GrepWorkspaceParams, IndexWorkspaceParams, InlineCompleteParams, InlineEditParams,
-    MergeWorktreeParams, NextEditPredictParams, RemoveFileParams, RestoreCheckpointParams,
-    RpcEvent, RpcRequest, RpcResponse, RunParallelSubagentsParams, RunPtyCommandParams,
-    SaveMemoryParams, SaveSessionParams, SearchContextParams, SessionIdParams, SetConfigParams,
-    StartBgProcessParams, SubmitToolResultParams, UpdateFileParams, WorktreePathParams,
+    AgentChatParams, BgProcessIdParams, CancelParams, ChatMessage, CowCloneIdParams,
+    CreateCheckpointParams, CreateCowCloneParams, CreateWorktreeParams, DeleteMemoryParams,
+    FileOutlineParams, FindCallersParams, GrepWorkspaceParams, IndexWorkspaceParams,
+    InlineCompleteParams, InlineEditParams, MergeWorktreeParams, NextEditPredictParams,
+    RemoveFileParams, RepoMapParams, RestoreCheckpointParams, RpcEvent, RpcRequest, RpcResponse,
+    RunParallelSubagentsParams, RunPtyCommandParams, RunSandboxedCommandParams, SaveMemoryParams,
+    SaveSessionParams, SearchContextParams, SessionIdParams, SetConfigParams, StartBgProcessParams,
+    SubmitToolResultParams, UpdateFileParams, ValidateSyntaxParams, WorktreePathParams,
     WriteBgProcessParams,
 };
 use crate::pty_runner::{run_pty_command, PtyManager};
+use crate::repomap::{build_pagerank_repo_map, RepoFileInput, RepoMapSeed};
 use crate::router::{
     route_task, stream_anthropic_chat, stream_openai_chat, ProviderKeys, ProviderKind, TaskKind,
 };
@@ -43,6 +51,7 @@ use crate::subagents::{
     all_verify_passed, detect_verify_commands, format_verify_feedback, run_parallel_subagents,
     SubagentTask, VerifyResult,
 };
+use crate::syntax_gate::{is_syntax_gate_supported, validate_edit_syntax};
 use crate::worktree::{
     create_worktree, diff_worktree, list_worktrees, merge_worktree, remove_worktree,
     CheckpointStore,
@@ -84,6 +93,8 @@ struct AppState {
     thinking_budget: RwLock<Option<u32>>,
     enable_prompt_cache: RwLock<bool>,
     auto_verify: RwLock<bool>,
+    permission_profile: RwLock<PermissionProfile>,
+    sandbox_allow_network: RwLock<bool>,
     workspace_rules: RwLock<Option<String>>,
     index: RwLock<WorkspaceIndex>,
     http: Client,
@@ -92,6 +103,7 @@ struct AppState {
     mcp: RwLock<McpManager>,
     sessions: SessionStore,
     checkpoints: CheckpointStore,
+    cow_clones: ApfsCloneManager,
     pty_manager: PtyManager,
     in_flight: Mutex<HashMap<u64, JoinHandle<()>>>,
     pending_tools: Mutex<HashMap<String, oneshot::Sender<ToolResultPayload>>>,
@@ -120,6 +132,8 @@ impl AppState {
             thinking_budget: RwLock::new(None),
             enable_prompt_cache: RwLock::new(true),
             auto_verify: RwLock::new(false),
+            permission_profile: RwLock::new(PermissionProfile::SafeAuto),
+            sandbox_allow_network: RwLock::new(false),
             workspace_rules: RwLock::new(None),
             index: RwLock::new(WorkspaceIndex::default()),
             http: Client::new(),
@@ -128,6 +142,7 @@ impl AppState {
             mcp: RwLock::new(McpManager::default()),
             sessions: SessionStore::default_store(),
             checkpoints: CheckpointStore::default_store(),
+            cow_clones: ApfsCloneManager::default_store(),
             pty_manager: PtyManager::new(),
             in_flight: Mutex::new(HashMap::new()),
             pending_tools: Mutex::new(HashMap::new()),
@@ -273,6 +288,9 @@ async fn dispatch(
             let autocomplete_backend = state.autocomplete_backend.read().await.clone();
             let thinking_budget = *state.thinking_budget.read().await;
             let auto_verify = *state.auto_verify.read().await;
+            let permission_profile = *state.permission_profile.read().await;
+            let sandbox_allow_network = *state.sandbox_allow_network.read().await;
+            let cow_clones_count = state.cow_clones.list_clones().len();
             let has_rules = state.workspace_rules.read().await.is_some();
             let mcp_servers = state.mcp.read().await.statuses();
             let bg_processes = state.pty_manager.list_processes();
@@ -291,6 +309,9 @@ async fn dispatch(
                     "autocompleteBackend": autocomplete_backend,
                     "thinkingBudget": thinking_budget,
                     "autoVerify": auto_verify,
+                    "permissionProfile": permission_profile,
+                    "sandboxAllowNetwork": sandbox_allow_network,
+                    "cowClonesCount": cow_clones_count,
                     "indexedFiles": index.files.len(),
                     "hasWorkspaceRules": has_rules,
                     "mcpServers": mcp_servers,
@@ -363,6 +384,14 @@ async fn dispatch(
             }
             if let Some(auto_verify) = params.auto_verify {
                 *state.auto_verify.write().await = auto_verify;
+            }
+            if let Some(profile_str) = params.permission_profile {
+                if let Some(parsed) = PermissionProfile::from_str_name(&profile_str) {
+                    *state.permission_profile.write().await = parsed;
+                }
+            }
+            if let Some(allow_net) = params.sandbox_allow_network {
+                *state.sandbox_allow_network.write().await = allow_net;
             }
             if let Some(root) = params.workspace_root {
                 let root_path = PathBuf::from(&root);
@@ -749,6 +778,128 @@ async fn dispatch(
             let commands = detect_verify_commands(&root);
             RpcResponse::ok(req.id, json!({ "commands": commands }))
         }
+        "validate_syntax" => {
+            let params: ValidateSyntaxParams = match serde_json::from_value(req.params) {
+                Ok(p) => p,
+                Err(e) => return RpcResponse::err(req.id, format!("Invalid validate_syntax params: {e}")),
+            };
+            let validation = validate_edit_syntax(&params.path, &params.before, &params.after);
+            RpcResponse::ok(req.id, json!({ "validation": validation }))
+        }
+        "repo_map" => {
+            let params: RepoMapParams = match serde_json::from_value(req.params) {
+                Ok(p) => p,
+                Err(e) => return RpcResponse::err(req.id, format!("Invalid repo_map params: {e}")),
+            };
+            let files: Vec<RepoFileInput> = {
+                let index = state.index.read().await;
+                index
+                    .files
+                    .iter()
+                    .take(800)
+                    .map(|f| RepoFileInput {
+                        path: f.rel_path.clone(),
+                        content: f.content.clone(),
+                    })
+                    .collect()
+            };
+            let seed = RepoMapSeed {
+                active_files: params.active_files,
+                dirty_files: params.dirty_files,
+                query_terms: params.query_terms,
+            };
+            let map = build_pagerank_repo_map(&files, &seed, params.token_budget_chars);
+            RpcResponse::ok(req.id, json!({ "repoMap": map }))
+        }
+        "create_cow_clone" => {
+            let params: CreateCowCloneParams = match serde_json::from_value(req.params) {
+                Ok(p) => p,
+                Err(e) => return RpcResponse::err(req.id, format!("Invalid create_cow_clone params: {e}")),
+            };
+            let Some(root) = state.index.read().await.root.clone() else {
+                return RpcResponse::err(req.id, "No workspace root is open.");
+            };
+            match state.cow_clones.create_clone(&root, &params.task_label) {
+                Ok(meta) => RpcResponse::ok(req.id, json!({ "clone": meta })),
+                Err(e) => RpcResponse::err(req.id, e),
+            }
+        }
+        "list_cow_clones" => {
+            let clones = state.cow_clones.list_clones();
+            RpcResponse::ok(req.id, json!({ "clones": clones }))
+        }
+        "diff_cow_clone" => {
+            let params: CowCloneIdParams = match serde_json::from_value(req.params) {
+                Ok(p) => p,
+                Err(e) => return RpcResponse::err(req.id, format!("Invalid diff_cow_clone params: {e}")),
+            };
+            match state.cow_clones.diff_clone(&params.clone_id) {
+                Ok(diffs) => RpcResponse::ok(req.id, json!({ "diffs": diffs })),
+                Err(e) => RpcResponse::err(req.id, e),
+            }
+        }
+        "apply_cow_clone" => {
+            let params: CowCloneIdParams = match serde_json::from_value(req.params) {
+                Ok(p) => p,
+                Err(e) => return RpcResponse::err(req.id, format!("Invalid apply_cow_clone params: {e}")),
+            };
+            match state.cow_clones.apply_clone_back(&params.clone_id, None) {
+                Ok(applied) => {
+                    if let Some(root) = state.index.read().await.root.clone() {
+                        let mut index = state.index.write().await;
+                        let _ = index.index_directory(&root);
+                    }
+                    RpcResponse::ok(req.id, json!({ "appliedFiles": applied }))
+                }
+                Err(e) => RpcResponse::err(req.id, e),
+            }
+        }
+        "destroy_cow_clone" => {
+            let params: CowCloneIdParams = match serde_json::from_value(req.params) {
+                Ok(p) => p,
+                Err(e) => return RpcResponse::err(req.id, format!("Invalid destroy_cow_clone params: {e}")),
+            };
+            match state.cow_clones.destroy_clone(&params.clone_id) {
+                Ok(destroyed) => RpcResponse::ok(req.id, json!({ "destroyed": destroyed })),
+                Err(e) => RpcResponse::err(req.id, e),
+            }
+        }
+        "classify_command" => {
+            let cmd = req
+                .params
+                .get("command")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let risk = classify_command_risk(cmd);
+            let profile = *state.permission_profile.read().await;
+            RpcResponse::ok(req.id, json!({ "risk": risk, "profile": profile }))
+        }
+        "run_sandboxed_command" => {
+            let params: RunSandboxedCommandParams = match serde_json::from_value(req.params) {
+                Ok(p) => p,
+                Err(e) => return RpcResponse::err(req.id, format!("Invalid run_sandboxed_command params: {e}")),
+            };
+            let cwd = match params.cwd {
+                Some(c) if !c.trim().is_empty() => PathBuf::from(c),
+                _ => match state.index.read().await.root.clone() {
+                    Some(r) => r,
+                    None => return RpcResponse::err(req.id, "No workspace root is open."),
+                },
+            };
+            let profile = match params.profile.as_deref().and_then(PermissionProfile::from_str_name) {
+                Some(p) => p,
+                None => *state.permission_profile.read().await,
+            };
+            let allow_network = match params.allow_network {
+                Some(b) => b,
+                None => *state.sandbox_allow_network.read().await,
+            };
+            let timeout = params.timeout_secs.unwrap_or(60);
+            match run_sandboxed_command_async(&params.command, &cwd, profile, allow_network, timeout).await {
+                Ok(out) => RpcResponse::ok(req.id, json!({ "result": out })),
+                Err(e) => RpcResponse::err(req.id, e),
+            }
+        }
         "run_parallel_subagents" => {
             let params: RunParallelSubagentsParams = match serde_json::from_value(req.params) {
                 Ok(p) => p,
@@ -812,7 +963,7 @@ async fn handle_next_edit_predict(req: RpcRequest, state: Arc<AppState>) -> RpcR
         find_related_edit_sites(hint, &params.file_path, &files, 6)
     };
 
-    let (system_prompt, user_prompt) = build_nes_prompt(
+    let (system_prompt, mut user_prompt) = build_nes_prompt(
         &params.file_path,
         &params.language_id,
         &params.window_before,
@@ -822,6 +973,9 @@ async fn handle_next_edit_predict(req: RpcRequest, state: Arc<AppState>) -> RpcR
         &params.recent_edits,
         &related_sites,
     );
+    if let Some(intent) = params.developer_intent.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        user_prompt.push_str(&format!("\n\n{intent}"));
+    }
 
     let focus_lines = params.focus_block.lines().count().max(1);
     let default_start = params.focus_start_line.max(1);
@@ -918,6 +1072,12 @@ async fn handle_inline_edit(
         }
         diag_block.push_str("</diagnostics>");
     }
+    if let Some(lsp_ctx) = params.lsp_context.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        diag_block.push_str(&format!("\n\n{lsp_ctx}"));
+    }
+    if let Some(intent) = params.developer_intent.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        diag_block.push_str(&format!("\n\n{intent}"));
+    }
 
     let rules_section = state
         .workspace_rules
@@ -987,7 +1147,7 @@ async fn handle_inline_edit(
             .await
         }
         ProviderKind::Gemini | ProviderKind::LocalLlm => {
-            let Some(api_key) = keys.gemini else {
+            let Some(api_key) = keys.gemini.as_deref() else {
                 return RpcResponse::err(
                     req.id,
                     "Gemini API key is not configured. Run 'Rursor: Set Gemini API Key'.",
@@ -995,7 +1155,7 @@ async fn handle_inline_edit(
             };
             state
                 .gemini
-                .stream_chat(&api_key, &route.model, Some(&system_prompt), &messages, 0.2, None, |delta| {
+                .stream_chat(api_key, &route.model, Some(&system_prompt), &messages, 0.2, None, |delta| {
                     emit_event(out_tx, req_id, "stream_chunk", json!({ "text": delta }));
                 })
                 .await
@@ -1004,8 +1164,74 @@ async fn handle_inline_edit(
 
     match res {
         Ok(full) => {
-            let cleaned = strip_code_fences(&full);
-            RpcResponse::ok(req.id, json!({ "replacement": cleaned }))
+            let mut cleaned = strip_code_fences(&full);
+            let mut syntax_repaired = false;
+
+            if let (Some(before_full), Some(start_off), Some(end_off)) = (
+                params.before_file_content.as_deref(),
+                params.selection_start_offset,
+                params.selection_end_offset,
+            ) {
+                if start_off <= end_off
+                    && end_off <= before_full.len()
+                    && before_full.is_char_boundary(start_off)
+                    && before_full.is_char_boundary(end_off)
+                    && is_syntax_gate_supported(&params.file_path)
+                {
+                    let candidate_full = format!(
+                        "{}{}{}",
+                        &before_full[..start_off],
+                        cleaned,
+                        &before_full[end_off..]
+                    );
+                    let gate = validate_edit_syntax(&params.file_path, before_full, &candidate_full);
+                    if !gate.valid {
+                        if let Some(api_key) = keys.gemini.as_deref() {
+                            let repair_msgs = vec![ChatMessage {
+                                role: "user".to_string(),
+                                content: format!(
+                                    "{}\n\nYour previous replacement introduced syntax errors:\n{}\n\nPrevious replacement:\n{}\n\nOutput ONLY the fixed replacement for <selection> with valid syntax and zero markdown fences.",
+                                    messages[0].content, gate.message, cleaned
+                                ),
+                                images: vec![],
+                            }];
+                            if let Ok(repaired_raw) = state
+                                .gemini
+                                .stream_chat(
+                                    api_key,
+                                    &route.model,
+                                    Some(&system_prompt),
+                                    &repair_msgs,
+                                    0.1,
+                                    None,
+                                    |_| {},
+                                )
+                                .await
+                            {
+                                let repaired_clean = strip_code_fences(&repaired_raw);
+                                let repaired_full = format!(
+                                    "{}{}{}",
+                                    &before_full[..start_off],
+                                    repaired_clean,
+                                    &before_full[end_off..]
+                                );
+                                if validate_edit_syntax(&params.file_path, before_full, &repaired_full).valid {
+                                    cleaned = repaired_clean;
+                                    syntax_repaired = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            RpcResponse::ok(
+                req.id,
+                json!({
+                    "replacement": cleaned,
+                    "syntaxRepaired": syntax_repaired,
+                }),
+            )
         }
         Err(e) => RpcResponse::err(req.id, e),
     }
@@ -1195,7 +1421,44 @@ async fn handle_agent_chat(
                     hit.path, hit.score, hit.preview
                 ));
             }
+
+            let repo_files: Vec<RepoFileInput> = {
+                let index = state.index.read().await;
+                index
+                    .files
+                    .iter()
+                    .take(500)
+                    .map(|f| RepoFileInput {
+                        path: f.rel_path.clone(),
+                        content: f.content.clone(),
+                    })
+                    .collect()
+            };
+            if !repo_files.is_empty() {
+                let active_files: Vec<String> =
+                    params.context_files.iter().map(|c| c.path.clone()).collect();
+                let query_terms: Vec<String> = last_user
+                    .content
+                    .split(|c: char| !c.is_alphanumeric() && c != '_')
+                    .filter(|w| w.len() >= 3)
+                    .take(16)
+                    .map(str::to_string)
+                    .collect();
+                let seed = RepoMapSeed {
+                    active_files,
+                    dirty_files: Vec::new(),
+                    query_terms,
+                };
+                let repo_map = build_pagerank_repo_map(&repo_files, &seed, 5_000);
+                if !repo_map.is_empty() {
+                    context_blocks.push_str(&format!("\n<repo_map>\n{repo_map}\n</repo_map>\n"));
+                }
+            }
         }
+    }
+
+    if let Some(intent) = params.developer_intent.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        context_blocks.push_str(&format!("\n{intent}\n"));
     }
 
     if !context_blocks.is_empty() {
@@ -1798,6 +2061,68 @@ async fn execute_agent_tool(
                 Err(e) => json!({ "ok": false, "result": { "error": e } }),
             }
         }
+        "repo_map" => {
+            let budget = args
+                .get("token_budget_chars")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(6_000) as usize;
+            let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
+            let files: Vec<RepoFileInput> = {
+                let index = state.index.read().await;
+                index
+                    .files
+                    .iter()
+                    .take(600)
+                    .map(|f| RepoFileInput {
+                        path: f.rel_path.clone(),
+                        content: f.content.clone(),
+                    })
+                    .collect()
+            };
+            let query_terms: Vec<String> = query
+                .split(|c: char| !c.is_alphanumeric() && c != '_')
+                .filter(|w| w.len() >= 3)
+                .map(str::to_string)
+                .collect();
+            let seed = RepoMapSeed {
+                active_files: Vec::new(),
+                dirty_files: Vec::new(),
+                query_terms,
+            };
+            let map = build_pagerank_repo_map(&files, &seed, budget);
+            json!({ "ok": true, "result": { "repoMap": map } })
+        }
+        "create_cow_clone" => {
+            let label = args.get("task_label").and_then(|v| v.as_str()).unwrap_or("agent-sandbox");
+            let Some(root) = state.index.read().await.root.clone() else {
+                return json!({ "ok": false, "result": { "error": "No workspace root open." } });
+            };
+            match state.cow_clones.create_clone(&root, label) {
+                Ok(meta) => json!({ "ok": true, "result": { "clone": meta } }),
+                Err(e) => json!({ "ok": false, "result": { "error": e } }),
+            }
+        }
+        "diff_cow_clone" => {
+            let clone_id = args.get("clone_id").and_then(|v| v.as_str()).unwrap_or("");
+            match state.cow_clones.diff_clone(clone_id) {
+                Ok(diffs) => json!({ "ok": true, "result": { "diffs": diffs } }),
+                Err(e) => json!({ "ok": false, "result": { "error": e } }),
+            }
+        }
+        "apply_cow_clone" => {
+            let clone_id = args.get("clone_id").and_then(|v| v.as_str()).unwrap_or("");
+            match state.cow_clones.apply_clone_back(clone_id, None) {
+                Ok(applied) => json!({ "ok": true, "result": { "appliedFiles": applied } }),
+                Err(e) => json!({ "ok": false, "result": { "error": e } }),
+            }
+        }
+        "destroy_cow_clone" => {
+            let clone_id = args.get("clone_id").and_then(|v| v.as_str()).unwrap_or("");
+            match state.cow_clones.destroy_clone(clone_id) {
+                Ok(destroyed) => json!({ "ok": true, "result": { "destroyed": destroyed } }),
+                Err(e) => json!({ "ok": false, "result": { "error": e } }),
+            }
+        }
         "edit_file" | "write_file" | "run_command" | "inspect_web_page" => {
             let (tx, rx) = oneshot::channel::<ToolResultPayload>();
             state.pending_tools.lock().await.insert(call_id.to_string(), tx);
@@ -2083,6 +2408,61 @@ fn agent_tool_declarations(mcp_decls: &[Value]) -> Vec<Value> {
                     "open_preview": { "type": "BOOLEAN", "description": "Whether to open/focus the Web Preview panel." }
                 },
                 "required": ["url"]
+            }
+        }),
+        json!({
+            "name": "repo_map",
+            "description": "Generate a Personalized PageRank structural repository map of top-ranked files and signatures.",
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {
+                    "query": { "type": "STRING", "description": "Optional query keywords to seed Personalized PageRank." },
+                    "token_budget_chars": { "type": "INTEGER", "description": "Character budget for the returned map (default 6000)." }
+                }
+            }
+        }),
+        json!({
+            "name": "create_cow_clone",
+            "description": "Create an instant zero-overhead macOS APFS Copy-on-Write workspace sandbox clone.",
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {
+                    "task_label": { "type": "STRING", "description": "Short task slug for the CoW clone." }
+                },
+                "required": ["task_label"]
+            }
+        }),
+        json!({
+            "name": "diff_cow_clone",
+            "description": "Inspect file-level diffs inside an APFS Copy-on-Write workspace clone.",
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {
+                    "clone_id": { "type": "STRING", "description": "Clone ID returned by create_cow_clone." }
+                },
+                "required": ["clone_id"]
+            }
+        }),
+        json!({
+            "name": "apply_cow_clone",
+            "description": "Apply changes from an APFS Copy-on-Write clone back to the main workspace.",
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {
+                    "clone_id": { "type": "STRING", "description": "Clone ID returned by create_cow_clone." }
+                },
+                "required": ["clone_id"]
+            }
+        }),
+        json!({
+            "name": "destroy_cow_clone",
+            "description": "Delete an APFS Copy-on-Write workspace clone.",
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {
+                    "clone_id": { "type": "STRING", "description": "Clone ID returned by create_cow_clone." }
+                },
+                "required": ["clone_id"]
             }
         }),
     ];

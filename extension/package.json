@@ -1,9 +1,9 @@
 {
   "name": "rursor-ai",
   "displayName": "Rursor AI",
-  "description": "Built-in AI editing, Tab autocomplete, codebase context, and Gemini-powered agent runtime for Rursor.",
+  "description": "Built-in AI editing, Tab/NES prediction, LSP+AST codebase intelligence, APFS/Seatbelt sandboxes, and Gemini-powered agent runtime for Rursor IDE.",
   "publisher": "rursor",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "engines": {
     "vscode": "^1.95.0"
   },
@@ -15,8 +15,23 @@
   ],
   "main": "./out/extension.js",
   "contributes": {
+    "themes": [
+      {
+        "id": "Rursor Obsidian",
+        "label": "Rursor Obsidian",
+        "uiTheme": "vs-dark",
+        "path": "./themes/rursor-obsidian-dark.json"
+      }
+    ],
+    "configurationDefaults": {
+      "chat.commandCenter.enabled": false,
+      "editor.inlineSuggest.enabled": true,
+      "editor.smoothScrolling": true,
+      "editor.cursorBlinking": "smooth",
+      "editor.cursorSmoothCaretAnimation": "on"
+    },
     "viewsContainers": {
-      "activitybar": [
+      "auxiliarybar": [
         {
           "id": "rursor-sidebar",
           "title": "Rursor AI",
@@ -34,6 +49,10 @@
       ]
     },
     "commands": [
+      {
+        "command": "rursor.openSettings",
+        "title": "Rursor: Open Rursor Settings"
+      },
       {
         "command": "rursor.setApiKey",
         "title": "Rursor: Set Gemini API Key"
@@ -57,6 +76,10 @@
       {
         "command": "rursor.inlineEdit",
         "title": "Rursor: Inline Edit"
+      },
+      {
+        "command": "rursor.inlineEditInset",
+        "title": "Rursor: Floating Inline Edit Composer"
       },
       {
         "command": "rursor.fixDiagnostics",
@@ -99,6 +122,34 @@
         "title": "Rursor: Open Agent Panel"
       },
       {
+        "command": "rursor.voicePrompt",
+        "title": "Rursor: Voice Prompt (Hold / Toggle)"
+      },
+      {
+        "command": "rursor.showTelemetry",
+        "title": "Rursor: Show Latency, Cache & Cost Telemetry"
+      },
+      {
+        "command": "rursor.openMultiDiff",
+        "title": "Rursor: Review All AI File Changes (Multi-Diff)"
+      },
+      {
+        "command": "rursor.fixLastTerminalFailure",
+        "title": "Rursor: Fix Last Terminal Failure with AI"
+      },
+      {
+        "command": "rursor.debugExplainStop",
+        "title": "Rursor: Explain Active Debugger Stop / Exception"
+      },
+      {
+        "command": "rursor.reviewGitDiff",
+        "title": "Rursor: AI Code Review on Git Diff"
+      },
+      {
+        "command": "rursor.clearReviewComments",
+        "title": "Rursor: Clear AI Code Review Comments"
+      },
+      {
         "command": "rursor.reloadMcp",
         "title": "Rursor: Reload MCP Servers"
       },
@@ -113,6 +164,10 @@
       {
         "command": "rursor.manageWorktrees",
         "title": "Rursor: Manage Git Worktree Sandboxes"
+      },
+      {
+        "command": "rursor.manageCowClones",
+        "title": "Rursor: Manage macOS APFS Copy-on-Write Sandboxes"
       }
     ],
     "keybindings": [
@@ -126,6 +181,22 @@
         "command": "rursor.openAgent",
         "key": "cmd+l",
         "mac": "cmd+l"
+      },
+      {
+        "command": "rursor.openSettings",
+        "key": "cmd+shift+j",
+        "mac": "cmd+shift+j"
+      },
+      {
+        "command": "rursor.voicePrompt",
+        "key": "cmd+shift+v",
+        "mac": "cmd+shift+v",
+        "when": "editorTextFocus"
+      },
+      {
+        "command": "rursor.openMultiDiff",
+        "key": "alt+cmd+d",
+        "mac": "alt+cmd+d"
       },
       {
         "command": "rursor.acceptInlineEdit",
@@ -182,6 +253,21 @@
           ],
           "description": "Default model or Smart Router mode for Rursor Agent and Inline Edit."
         },
+        "rursor.agent.permissionProfile": {
+          "type": "string",
+          "default": "safe-auto",
+          "enum": [
+            "read-only",
+            "safe-auto",
+            "full-auto"
+          ],
+          "description": "macOS Seatbelt sandbox and command execution permission profile for Rursor Agent."
+        },
+        "rursor.agent.sandboxAllowNetwork": {
+          "type": "boolean",
+          "default": false,
+          "description": "Allow outbound network access inside macOS Seatbelt sandboxed Agent commands."
+        },
         "rursor.agent.autoVerify": {
           "type": "boolean",
           "default": false,
@@ -205,12 +291,17 @@
         "rursor.autocomplete.enabled": {
           "type": "boolean",
           "default": true,
-          "description": "Enable low-latency Tab ghost-text autocomplete via Gemini."
+          "description": "Enable low-latency Tab ghost-text autocomplete via Gemini or local Apple Silicon models."
+        },
+        "rursor.autocomplete.nesEnabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable multi-line Next-Edit Suggestion (NES) and Tab-to-Jump predictions."
         },
         "rursor.autocomplete.model": {
           "type": "string",
           "default": "gemini-2.5-flash-lite",
-          "description": "Gemini model used for Tab autocomplete."
+          "description": "Gemini model used for Tab autocomplete and NES."
         },
         "rursor.autocomplete.backend": {
           "type": "string",

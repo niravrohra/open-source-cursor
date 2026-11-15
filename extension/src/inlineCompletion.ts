@@ -1,6 +1,13 @@
 import * as path from 'node:path';
 import * as vscode from 'vscode';
+import { TemporalIntentLedger } from './lspContext';
 import { SidecarClient } from './sidecarClient';
+import { TelemetryTracker } from './voiceAndTelemetry';
+
+export interface InlineCompletionDeps {
+  intentLedger?: TemporalIntentLedger;
+  telemetry?: TelemetryTracker;
+}
 
 const PREFIX_LINES = 100;
 const SUFFIX_LINES = 35;
@@ -118,7 +125,10 @@ export class RursorInlineCompletionProvider
   private readonly statusBarItem: vscode.StatusBarItem;
   private readonly disposables: vscode.Disposable[] = [];
 
-  constructor(private readonly client: SidecarClient) {
+  constructor(
+    private readonly client: SidecarClient,
+    private readonly deps?: InlineCompletionDeps
+  ) {
     this.nesRemovedDecoration = vscode.window.createTextEditorDecorationType({
       backgroundColor: 'rgba(248, 81, 73, 0.22)',
       borderWidth: '0 0 0 3px',
@@ -679,6 +689,9 @@ export class RursorInlineCompletionProvider
     }
 
     const config = vscode.workspace.getConfiguration('rursor');
+    if (!config.get<boolean>('autocomplete.nesEnabled', true)) {
+      return null;
+    }
     const model = config.get<string>('autocomplete.model', 'gemini-2.5-flash-lite');
     const relPath = vscode.workspace.asRelativePath(document.uri, false);
 
@@ -714,6 +727,10 @@ export class RursorInlineCompletionProvider
           )
         : '';
 
+    const developerIntent = this.deps?.intentLedger?.formatRecentIntent() || undefined;
+    const estInputTokens = Math.ceil((windowBefore.length + focusBlock.length + windowAfter.length) / 4);
+    const timer = this.deps?.telemetry?.startTurn('nes', model, estInputTokens, 0);
+
     const { id, promise } = this.client.request<NextEditPredictResponse | NesPrediction>(
       'next_edit_predict',
       {
@@ -728,6 +745,7 @@ export class RursorInlineCompletionProvider
         recentFiles: this.collectRecentFiles(relPath),
         recentEdits: [...this.recentEdits],
         recentEditHint: this.recentEditHint || undefined,
+        developerIntent,
         model,
       }
     );
@@ -739,6 +757,7 @@ export class RursorInlineCompletionProvider
         res && typeof res === 'object' && 'prediction' in res
           ? (res as NextEditPredictResponse).prediction
           : (res as NesPrediction);
+      timer?.finish((raw?.replacement ?? '').length);
       if (!raw || !raw.kind || raw.kind === 'none') {
         return null;
       }
@@ -770,6 +789,9 @@ export class RursorInlineCompletionProvider
     const model = config.get<string>('autocomplete.model', 'gemini-2.5-flash-lite');
     const relPath = vscode.workspace.asRelativePath(document.uri, false);
 
+    const estInputTokens = Math.ceil((prefix.length + suffix.length) / 4);
+    const timer = this.deps?.telemetry?.startTurn('autocomplete', model, estInputTokens, 0);
+
     const { id, promise } = this.client.request<{ completion: string }>('inline_complete', {
       filePath: relPath,
       languageId: document.languageId,
@@ -782,7 +804,9 @@ export class RursorInlineCompletionProvider
     onRequestId(id);
 
     const res = await promise;
-    return (res.completion ?? '').replace(/\r\n/g, '\n');
+    const cleaned = (res.completion ?? '').replace(/\r\n/g, '\n');
+    timer?.finish(cleaned.length);
+    return cleaned;
   }
 
   private async handleNesPrediction(

@@ -24,7 +24,15 @@
   "builtInExtensions": [],
   "extensionEnabledApiProposals": {
     "rursor.rursor-ai": [
-      "inlineCompletionsAdditions"
+      "inlineCompletionsAdditions",
+      "inlineEdit",
+      "editorInsets",
+      "quickDiffProvider",
+      "terminalQuickFixProvider",
+      "newSymbolNamesProvider",
+      "tabInputMultiDiff",
+      "contribMultiDiffEditorMenus",
+      "diffCommand"
     ]
   }
 }

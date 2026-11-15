@@ -1,0 +1,190 @@
+{
+  "suite": "rursor-eval",
+  "version": "1.0.0",
+  "description": "Deterministic offline sidecar & retrieval benchmark suite plus optional live Gemini Pass@1 tasks for Rursor.",
+  "tasks": [
+    {
+      "id": "rpc_ping_latency",
+      "category": "rpc_latency",
+      "kind": "rpc_benchmark",
+      "method": "ping",
+      "iterations": 30,
+      "maxP95Ms": 50.0,
+      "expectedField": "service",
+      "expectedValue": "rursor-sidecar",
+      "description": "Measure warm stdio JSON-RPC round-trip p50/p95 latency on `ping`."
+    },
+    {
+      "id": "rpc_status_latency",
+      "category": "rpc_latency",
+      "kind": "rpc_benchmark",
+      "method": "status",
+      "iterations": 25,
+      "maxP95Ms": 50.0,
+      "expectedField": "ready",
+      "expectedValue": true,
+      "description": "Measure warm stdio JSON-RPC round-trip p50/p95 latency on `status`."
+    },
+    {
+      "id": "index_workspace_throughput",
+      "category": "indexing",
+      "kind": "index_workspace",
+      "minFiles": 12,
+      "description": "Index full Rursor repository (`index_workspace`) and measure elapsed ms & files/sec."
+    },
+    {
+      "id": "symbol_recall_agent_panel",
+      "category": "symbol_recall",
+      "kind": "search_symbols",
+      "query": "AgentPanelProvider",
+      "limit": 5,
+      "expectedPath": "extension/src/agentPanel.ts",
+      "expectedSymbol": "AgentPanelProvider",
+      "description": "Recall@5 symbol lookup for TypeScript class `AgentPanelProvider`."
+    },
+    {
+      "id": "symbol_recall_gemini_client",
+      "category": "symbol_recall",
+      "kind": "search_symbols",
+      "query": "GeminiClient",
+      "limit": 5,
+      "expectedPath": "sidecar/src/gemini.rs",
+      "expectedSymbol": "GeminiClient",
+      "description": "Recall@5 symbol lookup for Rust struct `GeminiClient`."
+    },
+    {
+      "id": "symbol_recall_workspace_index",
+      "category": "symbol_recall",
+      "kind": "search_symbols",
+      "query": "WorkspaceIndex",
+      "limit": 5,
+      "expectedPath": "sidecar/src/context.rs",
+      "expectedSymbol": "WorkspaceIndex",
+      "description": "Recall@5 symbol lookup for Rust struct `WorkspaceIndex`."
+    },
+    {
+      "id": "symbol_recall_mcp_manager",
+      "category": "symbol_recall",
+      "kind": "search_symbols",
+      "query": "McpManager",
+      "limit": 5,
+      "expectedPath": "sidecar/src/mcp.rs",
+      "expectedSymbol": "McpManager",
+      "description": "Recall@5 symbol lookup for Rust struct `McpManager`."
+    },
+    {
+      "id": "symbol_recall_sidecar_client",
+      "category": "symbol_recall",
+      "kind": "search_symbols",
+      "query": "SidecarClient",
+      "limit": 5,
+      "expectedPath": "extension/src/sidecarClient.ts",
+      "expectedSymbol": "SidecarClient",
+      "description": "Recall@5 symbol lookup for TypeScript class `SidecarClient`."
+    },
+    {
+      "id": "symbol_recall_telemetry_tracker",
+      "category": "symbol_recall",
+      "kind": "search_symbols",
+      "query": "TelemetryTracker",
+      "limit": 5,
+      "expectedPath": "extension/src/voiceAndTelemetry.ts",
+      "expectedSymbol": "TelemetryTracker",
+      "description": "Recall@5 symbol lookup for `TelemetryTracker` HUD controller."
+    },
+    {
+      "id": "hybrid_recall_gemini_sse",
+      "category": "hybrid_context",
+      "kind": "search_context",
+      "query": "GeminiClient streamGenerateContent parse_sse_data",
+      "limit": 5,
+      "expectedPath": "sidecar/src/gemini.rs",
+      "description": "Hybrid BM25+vector Recall@5 for Gemini SSE streaming implementation."
+    },
+    {
+      "id": "hybrid_recall_inline_edit_codelens",
+      "category": "hybrid_context",
+      "kind": "search_context",
+      "query": "InlineEditSessionManager acceptInlineEdit CodeLens",
+      "limit": 5,
+      "expectedPath": "extension/src/inlineEdit.ts",
+      "description": "Hybrid BM25+vector Recall@5 for Cmd+K inline diff & CodeLens manager."
+    },
+    {
+      "id": "hybrid_recall_workspace_bm25_rrf",
+      "category": "hybrid_context",
+      "kind": "search_context",
+      "query": "WorkspaceIndex search_hybrid rrf_score in_memory_bm25_search",
+      "limit": 5,
+      "expectedPath": "sidecar/src/context.rs",
+      "description": "Hybrid BM25+vector Recall@5 for RRF hybrid search engine."
+    },
+    {
+      "id": "hybrid_recall_mcp_stdio",
+      "category": "hybrid_context",
+      "kind": "search_context",
+      "query": "McpManager McpConnection mcpServers reload",
+      "limit": 5,
+      "expectedPath": "sidecar/src/mcp.rs",
+      "description": "Hybrid BM25+vector Recall@5 for stdio MCP server manager."
+    },
+    {
+      "id": "grep_precision_sse_endpoint",
+      "category": "grep_workspace",
+      "kind": "grep_workspace",
+      "query": "streamGenerateContent?alt=sse",
+      "caseSensitive": true,
+      "limit": 20,
+      "expectedPath": "sidecar/src/gemini.rs",
+      "description": "Exact `grep_workspace` precision & latency for Gemini SSE endpoint."
+    },
+    {
+      "id": "grep_precision_agent_view",
+      "category": "grep_workspace",
+      "kind": "grep_workspace",
+      "query": "rursor.agentView",
+      "caseSensitive": true,
+      "limit": 20,
+      "expectedPath": "extension/src/agentPanel.ts",
+      "description": "Exact `grep_workspace` precision & latency for `rursor.agentView`."
+    },
+    {
+      "id": "git_context_latency",
+      "category": "git",
+      "kind": "git_context",
+      "expectedSubstring": "git status --short",
+      "description": "Measure `git_context` status + unified diff latency."
+    },
+    {
+      "id": "session_persistence_roundtrip",
+      "category": "sessions",
+      "kind": "session_roundtrip",
+      "title": "Rursor Eval Persistence Check",
+      "description": "Verify `save_session` -> `load_session` -> `delete_session` integrity & latency."
+    },
+    {
+      "id": "live_gemini_inline_edit_clamp",
+      "category": "live_gemini",
+      "kind": "live_inline_edit",
+      "requiresApiKey": true,
+      "filePath": "src/math.ts",
+      "languageId": "typescript",
+      "prefix": "export function normalizeRatio(x: number): number {\n",
+      "selection": "  return Math.max(0, Math.max(1, x));",
+      "suffix": "\n}\n",
+      "instruction": "Fix the bug so x is clamped between 0 and 1 inclusive.",
+      "mustContainAny": ["Math.min(1", "Math.min(x, 1)"],
+      "description": "Live Gemini `inline_edit` Pass@1 bugfix on clamped numeric range."
+    },
+    {
+      "id": "live_gemini_agent_architecture_qa",
+      "category": "live_gemini",
+      "kind": "live_agent_chat",
+      "requiresApiKey": true,
+      "mode": "ask",
+      "prompt": "Which Rust struct in sidecar/src/context.rs manages workspace indexing and hybrid search? Reply concisely with the exact struct name.",
+      "mustContainAny": ["WorkspaceIndex"],
+      "description": "Live Gemini `agent_chat` (`ask` + workspace search) Pass@1 codebase QA."
+    }
+  ]
+}

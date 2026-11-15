@@ -1,0 +1,114 @@
+diff --git a/src/vs/workbench/api/browser/viewsExtensionPoint.ts b/src/vs/workbench/api/browser/viewsExtensionPoint.ts
+index f5a0648..445e538 100644
+--- a/src/vs/workbench/api/browser/viewsExtensionPoint.ts
++++ b/src/vs/workbench/api/browser/viewsExtensionPoint.ts
+@@ -18,7 +18,7 @@ import { Extensions as ViewletExtensions, PaneCompositeRegistry } from '../../br
+ import { CustomTreeView, TreeViewPane } from '../../browser/parts/views/treeView.js';
+ import { ViewPaneContainer } from '../../browser/parts/views/viewPaneContainer.js';
+ import { IWorkbenchContribution, WorkbenchPhase, registerWorkbenchContribution2 } from '../../common/contributions.js';
+-import { Extensions as ViewContainerExtensions, ICustomViewDescriptor, IViewContainersRegistry, IViewDescriptor, IViewsRegistry, ViewContainer, ViewContainerLocation } from '../../common/views.js';
++import { Extensions as ViewContainerExtensions, ICustomViewDescriptor, IViewContainersRegistry, IViewDescriptor, IViewsRegistry, ViewContainer, ViewContainerLocation, defaultViewIcon } from '../../common/views.js';
+ import { VIEWLET_ID as DEBUG } from '../../contrib/debug/common/debug.js';
+ import { VIEWLET_ID as EXPLORER } from '../../contrib/files/common/files.js';
+ import { VIEWLET_ID as REMOTE } from '../../contrib/remote/browser/remoteExplorer.js';
+@@ -70,6 +70,11 @@ export const viewsContainersContribution: IJSONSchema = {
+ 			description: localize('views.container.panel', "Contribute views containers to Panel"),
+ 			type: 'array',
+ 			items: viewsContainerSchema
++		},
++		'auxiliarybar': {
++			description: localize('views.container.auxiliarybar', "Contribute views containers to Secondary Side Bar (Auxiliary Bar)"),
++			type: 'array',
++			items: viewsContainerSchema
+ 		}
+ 	}
+ };
+@@ -232,6 +237,12 @@ const viewsContribution: IJSONSchema = {
+ 			type: 'array',
+ 			items: remoteViewDescriptor,
+ 			default: []
++		},
++		'auxiliarybar': {
++			description: localize('views.auxiliarybar', "Contributes views to the Secondary Side Bar (Auxiliary Bar)"),
++			type: 'array',
++			items: viewDescriptor,
++			default: []
+ 		}
+ 	},
+ 	additionalProperties: {
+@@ -300,6 +311,7 @@ class ViewsExtensionHandler implements IWorkbenchContribution {
+ 		const viewContainersRegistry = Registry.as<IViewContainersRegistry>(ViewContainerExtensions.ViewContainersRegistry);
+ 		let activityBarOrder = CUSTOM_VIEWS_START_ORDER + viewContainersRegistry.all.filter(v => !!v.extensionId && viewContainersRegistry.getViewContainerLocation(v) === ViewContainerLocation.Sidebar).length;
+ 		let panelOrder = 5 + viewContainersRegistry.all.filter(v => !!v.extensionId && viewContainersRegistry.getViewContainerLocation(v) === ViewContainerLocation.Panel).length + 1;
++		let auxiliaryBarOrder = viewContainersRegistry.all.filter(v => !!v.extensionId && viewContainersRegistry.getViewContainerLocation(v) === ViewContainerLocation.AuxiliaryBar).length + 1;
+ 		for (const { value, collector, description } of extensionPoints) {
+ 			Object.entries(value).forEach(([key, value]) => {
+ 				if (!this.isValidViewsContainer(value, collector)) {
+@@ -312,6 +324,9 @@ class ViewsExtensionHandler implements IWorkbenchContribution {
+ 					case 'panel':
+ 						panelOrder = this.registerCustomViewContainers(value, description, panelOrder, existingViewContainers, ViewContainerLocation.Panel);
+ 						break;
++					case 'auxiliarybar':
++						auxiliaryBarOrder = this.registerCustomViewContainers(value, description, auxiliaryBarOrder, existingViewContainers, ViewContainerLocation.AuxiliaryBar);
++						break;
+ 				}
+ 			});
+ 		}
+@@ -405,7 +420,9 @@ class ViewsExtensionHandler implements IWorkbenchContribution {
+ 				hideIfEmpty: true,
+ 				order,
+ 				icon,
+-			}, location);
++			}, location, {
++				isDefault: location === ViewContainerLocation.AuxiliaryBar && !this.viewContainersRegistry.getDefaultViewContainer(ViewContainerLocation.AuxiliaryBar)
++			});
+ 
+ 		}
+ 
+@@ -415,6 +432,8 @@ class ViewsExtensionHandler implements IWorkbenchContribution {
+ 	private deregisterCustomViewContainer(viewContainer: ViewContainer): void {
+ 		this.viewContainersRegistry.deregisterViewContainer(viewContainer);
+ 		Registry.as<PaneCompositeRegistry>(ViewletExtensions.Viewlets).deregisterPaneComposite(viewContainer.id);
++		Registry.as<PaneCompositeRegistry>(ViewletExtensions.Panels).deregisterPaneComposite(viewContainer.id);
++		Registry.as<PaneCompositeRegistry>(ViewletExtensions.Auxiliary).deregisterPaneComposite(viewContainer.id);
+ 	}
+ 
+ 	private handleAndRegisterCustomViews() {
+@@ -613,6 +632,10 @@ class ViewsExtensionHandler implements IWorkbenchContribution {
+ 			case 'debug': return this.viewContainersRegistry.get(DEBUG);
+ 			case 'scm': return this.viewContainersRegistry.get(SCM);
+ 			case 'remote': return this.viewContainersRegistry.get(REMOTE);
++			case 'auxiliarybar':
++				return this.viewContainersRegistry.get('workbench.view.extension.auxiliarybar')
++					?? this.viewContainersRegistry.getDefaultViewContainer(ViewContainerLocation.AuxiliaryBar)
++					?? this.registerCustomViewContainer('workbench.view.auxiliarybar', localize('auxiliarybar', "Secondary Side Bar"), defaultViewIcon, 0, undefined, ViewContainerLocation.AuxiliaryBar);
+ 			default: return this.viewContainersRegistry.get(`workbench.view.extension.${value}`);
+ 		}
+ 	}
+diff --git a/src/vs/workbench/contrib/chat/browser/chat.contribution.ts b/src/vs/workbench/contrib/chat/browser/chat.contribution.ts
+index d192af7..5b517de 100644
+--- a/src/vs/workbench/contrib/chat/browser/chat.contribution.ts
++++ b/src/vs/workbench/contrib/chat/browser/chat.contribution.ts
+@@ -7,7 +7,7 @@ import { timeout } from '../../../../base/common/async.js';
+ import { MarkdownString, isMarkdownString } from '../../../../base/common/htmlContent.js';
+ import { Disposable } from '../../../../base/common/lifecycle.js';
+ import { Schemas } from '../../../../base/common/network.js';
+-import { isMacintosh, isNative } from '../../../../base/common/platform.js';
++import { isMacintosh } from '../../../../base/common/platform.js';
+ import { EditorContributionInstantiation, registerEditorContribution } from '../../../../editor/browser/editorExtensions.js';
+ import { registerEditorFeature } from '../../../../editor/common/editorFeatures.js';
+ import * as nls from '../../../../nls.js';
+@@ -119,11 +119,11 @@ configurationRegistry.registerConfiguration({
+ 			type: 'boolean',
+ 			tags: ['preview'],
+ 			markdownDescription: nls.localize('chat.commandCenter.enabled', "Controls whether the command center shows a menu for actions to control Copilot (requires {0}).", '`#window.commandCenter#`'),
+-			default: true
++			default: false
+ 		},
+ 		'chat.experimental.offerSetup': {
+ 			type: 'boolean',
+-			default: isNative,
++			default: false,
+ 			scope: ConfigurationScope.APPLICATION,
+ 			markdownDescription: nls.localize('chat.experimental.offerSetup', "Controls whether setup is offered for Chat if not done already."),
+ 			tags: ['experimental', 'onExP']

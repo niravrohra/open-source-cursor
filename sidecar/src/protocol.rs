@@ -42,6 +42,8 @@ pub struct SetConfigParams {
     pub thinking_budget: Option<u32>,
     pub enable_prompt_cache: Option<bool>,
     pub auto_verify: Option<bool>,
+    pub permission_profile: Option<String>,
+    pub sandbox_allow_network: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -101,6 +103,16 @@ pub struct InlineEditParams {
     pub instruction: String,
     #[serde(default)]
     pub diagnostics: Vec<DiagnosticItem>,
+    #[serde(default)]
+    pub lsp_context: Option<String>,
+    #[serde(default)]
+    pub developer_intent: Option<String>,
+    #[serde(default)]
+    pub before_file_content: Option<String>,
+    #[serde(default)]
+    pub selection_start_offset: Option<usize>,
+    #[serde(default)]
+    pub selection_end_offset: Option<usize>,
     pub model: Option<String>,
 }
 
@@ -152,6 +164,8 @@ pub struct AgentChatParams {
     #[serde(default)]
     pub diagnostics: Vec<DiagnosticItem>,
     #[serde(default)]
+    pub developer_intent: Option<String>,
+    #[serde(default)]
     pub use_workspace_search: bool,
     #[serde(default)]
     pub include_git_diff: bool,
@@ -179,6 +193,8 @@ pub struct NextEditPredictParams {
     pub focus_start_line: usize,
     #[serde(default)]
     pub recent_edits: Vec<String>,
+    #[serde(default)]
+    pub developer_intent: Option<String>,
     pub model: Option<String>,
 }
 
@@ -305,6 +321,53 @@ pub struct SaveSessionParams {
 #[serde(rename_all = "camelCase")]
 pub struct CancelParams {
     pub request_id: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ValidateSyntaxParams {
+    pub path: String,
+    pub before: String,
+    pub after: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepoMapParams {
+    #[serde(default)]
+    pub active_files: Vec<String>,
+    #[serde(default)]
+    pub dirty_files: Vec<String>,
+    #[serde(default)]
+    pub query_terms: Vec<String>,
+    #[serde(default = "default_repomap_budget")]
+    pub token_budget_chars: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateCowCloneParams {
+    pub task_label: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CowCloneIdParams {
+    pub clone_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunSandboxedCommandParams {
+    pub command: String,
+    pub cwd: Option<String>,
+    pub timeout_secs: Option<u64>,
+    pub allow_network: Option<bool>,
+    pub profile: Option<String>,
+}
+
+fn default_repomap_budget() -> usize {
+    6_000
 }
 
 fn default_one() -> usize {

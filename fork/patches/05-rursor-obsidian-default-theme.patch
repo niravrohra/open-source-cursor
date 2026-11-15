@@ -1,0 +1,147 @@
+diff --git a/src/vs/workbench/contrib/welcomeGettingStarted/common/media/theme_picker.ts b/src/vs/workbench/contrib/welcomeGettingStarted/common/media/theme_picker.ts
+index eb9fbfc..92e7b61 100644
+--- a/src/vs/workbench/contrib/welcomeGettingStarted/common/media/theme_picker.ts
++++ b/src/vs/workbench/contrib/welcomeGettingStarted/common/media/theme_picker.ts
+@@ -12,7 +12,7 @@ export default () => `
+ 	<div class="theme-picker-row">
+ 		<checkbox when-checked="setTheme:${ThemeSettingDefaults.COLOR_THEME_DARK}" checked-on="config.workbench.colorTheme == '${ThemeSettingDefaults.COLOR_THEME_DARK}'">
+ 			<img width="200" src="./dark.png"/>
+-			${escape(localize('dark', "Dark Modern"))}
++			${escape(localize('dark', "Rursor Obsidian"))}
+ 		</checkbox>
+ 		<checkbox when-checked="setTheme:${ThemeSettingDefaults.COLOR_THEME_LIGHT}" checked-on="config.workbench.colorTheme == '${ThemeSettingDefaults.COLOR_THEME_LIGHT}'">
+ 			<img width="200" src="./light.png"/>
+diff --git a/src/vs/workbench/services/themes/browser/workbenchThemeService.ts b/src/vs/workbench/services/themes/browser/workbenchThemeService.ts
+index a74a0b2..e95174d 100644
+--- a/src/vs/workbench/services/themes/browser/workbenchThemeService.ts
++++ b/src/vs/workbench/services/themes/browser/workbenchThemeService.ts
+@@ -143,7 +143,7 @@ export class WorkbenchThemeService extends Disposable implements IWorkbenchTheme
+ 		// a color theme document with good defaults until the theme is loaded
+ 		let themeData: ColorThemeData | undefined = ColorThemeData.fromStorageData(this.storageService);
+ 		const colorThemeSetting = this.settings.colorTheme;
+-		if (themeData && colorThemeSetting !== themeData.settingsId && this.settings.isDefaultColorTheme()) {
++		if (themeData && colorThemeSetting !== themeData.settingsId && colorThemeSetting !== themeData.label && this.settings.isDefaultColorTheme()) {
+ 			this.hasDefaultUpdated = themeData.settingsId === ThemeSettingDefaults.COLOR_THEME_DARK_OLD || themeData.settingsId === ThemeSettingDefaults.COLOR_THEME_LIGHT_OLD;
+ 
+ 			// the web has different defaults than the desktop, therefore do not restore when the setting is the default theme and the storage doesn't match that.
+@@ -210,7 +210,8 @@ export class WorkbenchThemeService extends Disposable implements IWorkbenchTheme
+ 				await this.userDataInitializationService.whenInitializationFinished();
+ 				// try to get the theme again, now with a fallback to the default themes
+ 				const fallbackTheme = this.currentColorTheme.type === ColorScheme.LIGHT ? ThemeSettingDefaults.COLOR_THEME_LIGHT : ThemeSettingDefaults.COLOR_THEME_DARK;
+-				theme = this.colorThemeRegistry.findThemeBySettingsId(this.settings.colorTheme, fallbackTheme);
++				theme = this.colorThemeRegistry.findThemeBySettingsId(this.settings.colorTheme, fallbackTheme)
++					?? (this.currentColorTheme.type === ColorScheme.LIGHT ? undefined : this.colorThemeRegistry.findThemeBySettingsId('Default Dark Modern'));
+ 			}
+ 			return this.setColorTheme(theme && theme.id, undefined);
+ 		};
+@@ -306,7 +307,7 @@ export class WorkbenchThemeService extends Disposable implements IWorkbenchTheme
+ 			} else if (event.removed.some(t => t.settingsId === this.currentColorTheme.settingsId)) {
+ 				// current theme is no longer available
+ 				prevColorId = this.currentColorTheme.id;
+-				const defaultTheme = this.colorThemeRegistry.findThemeBySettingsId(ThemeSettingDefaults.COLOR_THEME_DARK);
++				const defaultTheme = this.colorThemeRegistry.findThemeBySettingsId(ThemeSettingDefaults.COLOR_THEME_DARK, 'Default Dark Modern');
+ 				await this.setColorTheme(defaultTheme, 'auto');
+ 			}
+ 		}));
+diff --git a/src/vs/workbench/services/themes/common/themeExtensionPoints.ts b/src/vs/workbench/services/themes/common/themeExtensionPoints.ts
+index 8ab53a6..827a77d 100644
+--- a/src/vs/workbench/services/themes/common/themeExtensionPoints.ts
++++ b/src/vs/workbench/services/themes/common/themeExtensionPoints.ts
+@@ -161,6 +161,7 @@ export interface ThemeChangeEvent<T> {
+ 
+ export interface IThemeData {
+ 	id: string;
++	label?: string;
+ 	settingsId: string | null;
+ 	location?: URI;
+ }
+@@ -270,15 +271,19 @@ export class ThemeRegistry<T extends IThemeData> implements IDisposable {
+ 		}
+ 		const allThemes = this.getThemes();
+ 		let defaultTheme: T | undefined = undefined;
++		let labelMatch: T | undefined = undefined;
+ 		for (const t of allThemes) {
+ 			if (t.settingsId === settingsId) {
+ 				return t;
+ 			}
+-			if (t.settingsId === defaultSettingsId) {
++			if (!labelMatch && settingsId && (t.label === settingsId || (settingsId === 'Rursor Obsidian' && (t.settingsId === 'rursor-obsidian-dark' || t.settingsId === 'rursor-obsidian')))) {
++				labelMatch = t;
++			}
++			if (t.settingsId === defaultSettingsId || (defaultSettingsId && t.label === defaultSettingsId)) {
+ 				defaultTheme = t;
+ 			}
+ 		}
+-		return defaultTheme;
++		return labelMatch ?? defaultTheme;
+ 	}
+ 
+ 	public findThemeByExtensionLocation(extLocation: URI | undefined): T[] {
+diff --git a/src/vs/workbench/services/themes/common/workbenchThemeService.ts b/src/vs/workbench/services/themes/common/workbenchThemeService.ts
+index ba08080..ed4cac0 100644
+--- a/src/vs/workbench/services/themes/common/workbenchThemeService.ts
++++ b/src/vs/workbench/services/themes/common/workbenchThemeService.ts
+@@ -44,7 +44,7 @@ export enum ThemeSettings {
+ }
+ 
+ export enum ThemeSettingDefaults {
+-	COLOR_THEME_DARK = 'Default Dark Modern',
++	COLOR_THEME_DARK = 'Rursor Obsidian',
+ 	COLOR_THEME_LIGHT = 'Default Light Modern',
+ 	COLOR_THEME_HC_DARK = 'Default High Contrast',
+ 	COLOR_THEME_HC_LIGHT = 'Default High Contrast Light',
+@@ -57,30 +57,30 @@ export enum ThemeSettingDefaults {
+ }
+ 
+ export const COLOR_THEME_DARK_INITIAL_COLORS = {
+-	'activityBar.activeBorder': '#0078d4',
+-	'activityBar.background': '#181818',
+-	'activityBar.border': '#2b2b2b',
+-	'activityBar.foreground': '#d7d7d7',
+-	'activityBar.inactiveForeground': '#868686',
+-	'editorGroup.border': '#ffffff17',
+-	'editorGroupHeader.tabsBackground': '#181818',
+-	'editorGroupHeader.tabsBorder': '#2b2b2b',
+-	'statusBar.background': '#181818',
+-	'statusBar.border': '#2b2b2b',
+-	'statusBar.foreground': '#cccccc',
+-	'statusBar.noFolderBackground': '#1f1f1f',
+-	'tab.activeBackground': '#1f1f1f',
+-	'tab.activeBorder': '#1f1f1f',
+-	'tab.activeBorderTop': '#0078d4',
+-	'tab.activeForeground': '#ffffff',
+-	'tab.border': '#2b2b2b',
+-	'textLink.foreground': '#4daafc',
+-	'titleBar.activeBackground': '#181818',
+-	'titleBar.activeForeground': '#cccccc',
+-	'titleBar.border': '#2b2b2b',
+-	'titleBar.inactiveBackground': '#1f1f1f',
+-	'titleBar.inactiveForeground': '#9d9d9d',
+-	'welcomePage.tileBackground': '#2b2b2b'
++	'activityBar.activeBorder': '#7c6af7',
++	'activityBar.background': '#0b0d10',
++	'activityBar.border': '#1e222d',
++	'activityBar.foreground': '#e2e8f0',
++	'activityBar.inactiveForeground': '#64748b',
++	'editorGroup.border': '#1e222d',
++	'editorGroupHeader.tabsBackground': '#0b0d10',
++	'editorGroupHeader.tabsBorder': '#1e222d',
++	'statusBar.background': '#0b0d10',
++	'statusBar.border': '#1e222d',
++	'statusBar.foreground': '#94a3b8',
++	'statusBar.noFolderBackground': '#0b0d10',
++	'tab.activeBackground': '#0f1117',
++	'tab.activeBorder': '#0f1117',
++	'tab.activeBorderTop': '#7c6af7',
++	'tab.activeForeground': '#f8fafc',
++	'tab.border': '#1e222d',
++	'textLink.foreground': '#8b7cf8',
++	'titleBar.activeBackground': '#0b0d10',
++	'titleBar.activeForeground': '#cbd5e1',
++	'titleBar.border': '#1e222d',
++	'titleBar.inactiveBackground': '#0b0d10',
++	'titleBar.inactiveForeground': '#64748b',
++	'welcomePage.tileBackground': '#13161f'
+ };
+ 
+ export const COLOR_THEME_LIGHT_INITIAL_COLORS = {

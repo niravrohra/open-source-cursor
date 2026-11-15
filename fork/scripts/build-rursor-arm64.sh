@@ -26,19 +26,34 @@ if [[ ! -d "${VSCODE_DIR}" ]]; then
   git clone --depth 1 --branch "${VSCODE_TAG}" https://github.com/microsoft/vscode.git "${VSCODE_DIR}"
 fi
 
-echo "=== 3b. Resetting tracked changes and applying Rursor patches ==="
-git -C "${VSCODE_DIR}" checkout -- .
-git -C "${VSCODE_DIR}" clean -fd src/
+echo "=== 3b. Applying Rursor patches idempotently ==="
 shopt -s nullglob
 for patch_file in "${ROOT_DIR}"/fork/patches/*.patch; do
-  echo "Applying patch: $(basename "${patch_file}")"
-  git -C "${VSCODE_DIR}" apply "${patch_file}"
+  patch_name="$(basename "${patch_file}")"
+  if git -C "${VSCODE_DIR}" apply --reverse --check "${patch_file}" >/dev/null 2>&1; then
+    echo "  [ok] ${patch_name} already applied"
+  elif git -C "${VSCODE_DIR}" apply --check "${patch_file}"; then
+    echo "  [apply] ${patch_name}"
+    git -C "${VSCODE_DIR}" apply "${patch_file}"
+  else
+    echo "Resetting ${VSCODE_DIR}/src for clean patch replay..."
+    git -C "${VSCODE_DIR}" checkout -- src/
+    git -C "${VSCODE_DIR}" clean -fd src/
+    for replay_patch in "${ROOT_DIR}"/fork/patches/*.patch; do
+      replay_name="$(basename "${replay_patch}")"
+      git -C "${VSCODE_DIR}" apply --check "${replay_patch}"
+      echo "  [apply] ${replay_name}"
+      git -C "${VSCODE_DIR}" apply "${replay_patch}"
+    done
+    break
+  fi
 done
 shopt -u nullglob
 
 echo "=== 4. Applying Rursor product.json, app icon & bundling rursor-ai ==="
 cp "${ROOT_DIR}/fork/product.json" "${VSCODE_DIR}/product.json"
 cp "${ROOT_DIR}/fork/resources/darwin/rursor.icns" "${VSCODE_DIR}/resources/darwin/code.icns"
+cp "${ROOT_DIR}/fork/resources/darwin/rursor.icns" "${VSCODE_DIR}/resources/darwin/rursor.icns"
 mkdir -p "${VSCODE_DIR}/extensions/rursor-ai"
 rsync -a --delete \
   --exclude 'node_modules/' \
