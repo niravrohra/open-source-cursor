@@ -778,6 +778,111 @@ def evaluate_task(
                 "details": {"pagesIndexed": 2, "mcpPresetCount": len(presets)},
             }
 
+        if kind == "browser_probe_check":
+            res, ms = harness.request("browser_probe", {})
+            status_res, _ = harness.request("status", {})
+            omni = status_res.get("omniStudio") or {}
+            chromium_found = bool(res.get("chromiumFound"))
+            ffmpeg_found = bool(res.get("ffmpegFound"))
+            status_browser = omni.get("browser") or {}
+            passed = (
+                chromium_found
+                and ffmpeg_found
+                and bool(res.get("walkthroughRecordingReady"))
+                and bool(status_browser.get("chromium"))
+                and bool(status_browser.get("ffmpeg"))
+                and omni.get("swarm") is True
+                and omni.get("media") is True
+                and omni.get("canvas") is True
+            )
+            return {
+                "id": task_id,
+                "category": category,
+                "kind": kind,
+                "status": "PASS" if passed else "FAIL",
+                "passed": passed,
+                "latencyMs": round(ms, 2),
+                "metricLabel": (
+                    f"chromium={chromium_found}, ffmpeg={ffmpeg_found}, "
+                    f"walkthroughReady={bool(res.get('walkthroughRecordingReady'))} ({ms:.2f}ms)"
+                ),
+                "details": {
+                    "chromiumPath": res.get("chromiumPath"),
+                    "ffmpegPath": res.get("ffmpegPath"),
+                },
+            }
+
+        if kind == "canvas_editor_check":
+            t0 = time.perf_counter()
+            pkg_path = workspace_root / "extension" / "package.json"
+            canvas_ts = workspace_root / "extension" / "src" / "canvasStudio.ts"
+            sample = {
+                "version": 1,
+                "viewport": {"panX": 0, "panY": 0, "zoom": 1, "snapToGrid": True},
+                "nodes": [
+                    {
+                        "id": "n1",
+                        "kind": "frame",
+                        "title": "Hero",
+                        "body": "Landing frame",
+                        "x": 40,
+                        "y": 40,
+                        "width": 320,
+                        "height": 200,
+                    }
+                ],
+                "edges": [],
+                "previews": [],
+            }
+            pkg = json.loads(pkg_path.read_text(encoding="utf-8"))
+            custom_editors = (
+                ((pkg.get("contributes") or {}).get("customEditors") or [])
+            )
+            editor_ok = any(
+                e.get("viewType") == "rursor.canvasEditor"
+                and "*.rursor.canvas" in str(e.get("selector", []))
+                for e in custom_editors
+            )
+            commands = ((pkg.get("contributes") or {}).get("commands") or [])
+            cmd_ok = any(c.get("command") == "rursor.openCanvas" for c in commands)
+            ts_text = canvas_ts.read_text(encoding="utf-8") if canvas_ts.is_file() else ""
+            ts_ok = (
+                "CANVAS_EDITOR_VIEW_TYPE" in ts_text
+                and "registerCanvasStudio" in ts_text
+                and "RursorCanvasProvider" in ts_text
+            )
+            # Round-trip a sample *.rursor.canvas document through JSON schema expectations.
+            tmp_canvas = harness.isolated_home / "canvas_eval" / "demo.rursor.canvas"
+            tmp_canvas.parent.mkdir(parents=True, exist_ok=True)
+            tmp_canvas.write_text(json.dumps(sample, indent=2), encoding="utf-8")
+            loaded = json.loads(tmp_canvas.read_text(encoding="utf-8"))
+            schema_ok = (
+                loaded.get("version") == 1
+                and isinstance(loaded.get("nodes"), list)
+                and len(loaded["nodes"]) == 1
+                and loaded["nodes"][0].get("kind") == "frame"
+            )
+            total_ms = (time.perf_counter() - t0) * 1000.0
+            passed = editor_ok and cmd_ok and ts_ok and schema_ok
+            return {
+                "id": task_id,
+                "category": category,
+                "kind": kind,
+                "status": "PASS" if passed else "FAIL",
+                "passed": passed,
+                "latencyMs": round(total_ms, 2),
+                "metricLabel": (
+                    f"customEditor={editor_ok}, openCanvas={cmd_ok}, "
+                    f"provider={ts_ok}, schema={schema_ok} ({total_ms:.2f}ms)"
+                ),
+                "details": {
+                    "customEditor": editor_ok,
+                    "openCanvasCommand": cmd_ok,
+                    "canvasStudioSurface": ts_ok,
+                    "sampleSchema": schema_ok,
+                },
+            }
+
         if kind == "live_inline_edit":
             res, ms = harness.request(
                 "inline_edit",

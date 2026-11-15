@@ -220,6 +220,18 @@
       "description": "Index documentation pages into persistent SQLite FTS5+vector `@docs` store (`Recall@1`) and verify 1-Click MCP catalog."
     },
     {
+      "id": "browser_cdp_media_probe",
+      "category": "omni_browser",
+      "kind": "browser_probe_check",
+      "description": "Probe local Chromium + ffmpeg discovery used by native CDP browser / Set-of-Mark / .mp4 walkthrough recorder (`browser_probe`)."
+    },
+    {
+      "id": "infinite_canvas_editor_contract",
+      "category": "omni_canvas",
+      "kind": "canvas_editor_check",
+      "description": "Verify `*.rursor.canvas` custom editor contribution, sample document schema, and canvasStudio TypeScript surface."
+    },
+    {
       "id": "live_gemini_inline_edit_clamp",
       "category": "live_gemini",
       "kind": "live_inline_edit",

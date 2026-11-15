@@ -19,7 +19,9 @@ mod swarm;
 mod syntax_gate;
 mod worktree;
 
-use crate::browser::BrowserSessionManager;
+use crate::browser::{
+    discover_chromium_binary, discover_ffmpeg_binary, BrowserSessionManager,
+};
 use crate::context::WorkspaceIndex;
 use crate::gemini::{
     chat_message_to_gemini_content, estimate_messages_tokens, GeminiClient, GeminiTurnOptions,
@@ -329,6 +331,13 @@ async fn dispatch(
             let index = state.index.read().await;
             let skills_count = list_skills(index.root.as_deref()).len();
             let memories_count = load_memories(index.root.as_deref()).len();
+            let chromium = discover_chromium_binary()
+                .ok()
+                .map(|p| p.display().to_string());
+            let ffmpeg = discover_ffmpeg_binary()
+                .ok()
+                .map(|p| p.display().to_string());
+            let docs_sources = state.docs_index.list_sources().unwrap_or_default().len();
             RpcResponse::ok(
                 req.id,
                 json!({
@@ -351,6 +360,17 @@ async fn dispatch(
                     "memoriesCount": memories_count,
                     "backgroundProcesses": bg_processes.len(),
                     "workspaceRoot": index.root.as_ref().map(|p| p.display().to_string()),
+                    "omniStudio": {
+                        "swarm": true,
+                        "browser": {
+                            "chromium": chromium,
+                            "ffmpeg": ffmpeg,
+                        },
+                        "media": true,
+                        "docsSources": docs_sources,
+                        "mcpCatalogPresets": builtin_mcp_catalog().len(),
+                        "canvas": true,
+                    },
                 }),
             )
         }
@@ -1133,6 +1153,20 @@ async fn dispatch(
             )
             .await;
             RpcResponse::ok(req.id, json!({ "candidates": candidates }))
+        }
+        "browser_probe" => {
+            let chromium = discover_chromium_binary().ok();
+            let ffmpeg = discover_ffmpeg_binary().ok();
+            RpcResponse::ok(
+                req.id,
+                json!({
+                    "chromiumPath": chromium.as_ref().map(|p| p.display().to_string()),
+                    "ffmpegPath": ffmpeg.as_ref().map(|p| p.display().to_string()),
+                    "chromiumFound": chromium.is_some(),
+                    "ffmpegFound": ffmpeg.is_some(),
+                    "walkthroughRecordingReady": chromium.is_some() && ffmpeg.is_some(),
+                }),
+            )
         }
         "browser_navigate"
         | "browser_snapshot"

@@ -82,6 +82,7 @@ Right now, that future is being locked behind closed doors:
    - [12. Voice-to-Code (`Cmd+Shift+V`) & Real-Time Latency / Cache / Cost Telemetry](#12-voice-to-code-cmdshiftv--real-time-latency--cache--cost-telemetry)
    - [13. Universal Rules Compatibility (`.cursorrules`, `CLAUDE.md`, `AGENTS.md`), Memory, Skills & MCP](#13-universal-rules-compatibility-cursorrules-claudemd-agentsmd-memory-skills--mcp)
    - [14. Native `Code - OSS` Fork Patches & Rursor Obsidian Theme](#14-native-code---oss-fork-patches--rursor-obsidian-theme)
+   - [15. Rursor 1.0 Omni-Studio (Swarm, CDP Browser, Media, `@docs`, Canvas)](#15-rursor-10-omni-studio-swarm-cdp-browser-media-docs-canvas)
 5. [Algorithmic Internals & Local Disk Schema](#-algorithmic-internals--local-disk-schema)
 6. [Quick Start (Up and Running in 15 Seconds)](#-quick-start-up-and-running-in-15-seconds)
    - [Prerequisites](#prerequisites)
@@ -547,6 +548,22 @@ Unlike plain marketplace extensions constrained by stock VS Code UI limitations,
 
 ---
 
+### 15. Rursor 1.0 Omni-Studio (Swarm, CDP Browser, Media, `@docs`, Canvas)
+
+Beyond the coding IDE loop, Rursor ships a full **Omni-Studio** multimodal creation & research stack — all wired into Agent tools, Command Palette shortcuts, inline chat artifact cards, CLI/RPC methods, and `rursor-eval` benchmarks:
+
+| Wave | Shortcut | Surface | What It Ships |
+| :--- | :--- | :--- | :--- |
+| **A — Swarm Mission Control** | `Cmd+Shift+M` | [`swarm.rs`](sidecar/src/swarm.rs) + [`missionControl.ts`](extension/src/missionControl.ts) | Topological worker DAG planner, 1.9 ms APFS CoW clones per worker, blackboard/mailbox, conflict-aware merge, Best-of-N Model Arena (`spawn_worker_swarm`, `plan_swarm_waves`, `run_swarm`). |
+| **B — Chromium CDP Browser Studio** | `Cmd+Shift+B` | [`browser.rs`](sidecar/src/browser.rs) + [`browserStudio.ts`](extension/src/browserStudio.ts) | Pure-Rust RFC 6455 CDP controller over local Chrome, Set-of-Mark `[1][2][3]` visual grounding, Click-to-Component → `Cmd+K`, and `ffmpeg` `.mp4` walkthrough recording (`browser_navigate` / `browser_snapshot` / `browser_act` / `browser_record_walkthrough`). |
+| **C — Media & Office Studio** | `Cmd+Shift+A` | [`media_studio.rs`](sidecar/src/media_studio.rs) + [`artifactStudio.ts`](extension/src/artifactStudio.ts) | Native OpenXML `.pptx` + interactive `.deck.html`, programmatic `1080p`/`720p` `.mp4` explainers (+ macOS TTS / Gemini Veo), Imagen/local diagram cards, `.xlsx` / `.docx`, and sandboxed Generative UI chat widgets. |
+| **D — Deep Web + `@docs` + MCP Registry** | Command Palette | [`research.rs`](sidecar/src/research.rs) + [`docsAndMcpRegistry.ts`](extension/src/docsAndMcpRegistry.ts) | Gemini Google Search Grounding + keyless fallback, URL→Markdown reader, persistent SQLite FTS5 + 128-dim `@docs` crawler (`@docs:handle` in chat), and 1-click MCP catalog installer. |
+| **E — Infinite Design-to-Code Canvas** | `Cmd+Shift+C` | [`canvasStudio.ts`](extension/src/canvasStudio.ts) | Interactive `*.rursor.canvas` pan/zoom wireframe & architecture whiteboard with live HTML preview tiles and Agent-assisted frame codegen. |
+
+Agent chat renders produced artifacts inline (PPTX/HTML decks, MP4s, GenUI iframes, spreadsheet/doc paths). `status` now reports `omniStudio` readiness (Chromium/ffmpeg discovery, docs source count, MCP catalog size).
+
+---
+
 ## 🔬 Algorithmic Internals & Local Disk Schema
 
 For systems engineers and researchers who want to understand (and improve!) what happens inside `rursor-sidecar`, here are the core algorithms and storage layouts powering Rursor:
@@ -697,16 +714,20 @@ Once the window opens:
 | **`Cmd+Right`** | `rursor.acceptNextWord` | `editorTextFocus` | Accepts inline ghost-text completion **one word at a time** |
 | **`Cmd+Shift+J`** | `rursor.openSettings` | Global | Opens the **Rursor Settings & Control Center** dashboard |
 | **`Cmd+Shift+V`** | `rursor.voicePrompt` | `editorTextFocus` | Starts/stops **Voice-to-Code** audio prompt recording |
+| **`Cmd+Shift+M`** | `rursor.missionControl` | Global | Opens **Swarm Mission Control** / Model Arena |
+| **`Cmd+Shift+B`** | `rursor.openBrowserStudio` | Global | Opens **Chromium CDP Browser Studio** |
+| **`Cmd+Shift+A`** | `rursor.openArtifactStudio` | Global | Opens **Media / PPTX / Video / GenUI Studio** |
+| **`Cmd+Shift+C`** | `rursor.openCanvas` | Global | Opens / creates an **Infinite Design-to-Code Canvas** |
 | **`Alt+Cmd+D`** | `rursor.openMultiDiff` | Global | Opens unified **Multi-Diff Editor** across all AI-modified files |
 
 ---
 
-### All 30 Command Palette Actions
+### All Command Palette Actions
 
-Open the Command Palette (`Cmd+Shift+P`) and type **`Rursor:`** to access any of the 30 built-in commands:
+Open the Command Palette (`Cmd+Shift+P`) and type **`Rursor:`** to access any built-in command:
 
 <details>
-<summary><b>Click to expand all 30 <code>rursor.*</code> commands</b></summary>
+<summary><b>Click to expand all <code>rursor.*</code> commands</b></summary>
 
 | Command ID | Command Palette Title | Category |
 | :--- | :--- | :--- |
@@ -740,6 +761,18 @@ Open the Command Palette (`Cmd+Shift+P`) and type **`Rursor:`** to access any of
 | `rursor.openPreview` | **Rursor: Open Web Preview** | Browser & Preview |
 | `rursor.manageWorktrees` | **Rursor: Manage Git Worktree Sandboxes** | Sandboxes |
 | `rursor.manageCowClones` | **Rursor: Manage macOS APFS Copy-on-Write Sandboxes** | Sandboxes |
+| `rursor.missionControl` | **Rursor: Open Mission Control** | Omni-Studio Swarm |
+| `rursor.openMissionControl` | **Rursor: Open Swarm Mission Control** | Omni-Studio Swarm |
+| `rursor.openModelArena` | **Rursor: Open Best-of-N Model Arena** | Omni-Studio Swarm |
+| `rursor.openBrowserStudio` | **Rursor: Open Browser Studio** | Omni-Studio Browser |
+| `rursor.openArtifactStudio` | **Rursor: Open Artifact / Media Studio** | Omni-Studio Media |
+| `rursor.createSlideDeck` | **Rursor: Create Slide Deck (.pptx + .deck.html)** | Omni-Studio Media |
+| `rursor.createExplainerVideo` | **Rursor: Create Explainer Video (.mp4)** | Omni-Studio Media |
+| `rursor.previewArtifact` | **Rursor: Preview Generated Artifact** | Omni-Studio Media |
+| `rursor.addDocsSource` | **Rursor: Add @docs Documentation Source** | Omni-Studio Research |
+| `rursor.manageDocsSources` | **Rursor: Manage @docs Sources** | Omni-Studio Research |
+| `rursor.installMcpPreset` | **Rursor: Install MCP Preset from Catalog** | Omni-Studio Research |
+| `rursor.openCanvas` | **Rursor: Open Infinite Canvas** | Omni-Studio Canvas |
 
 </details>
 
