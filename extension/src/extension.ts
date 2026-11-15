@@ -1,8 +1,13 @@
 import * as vscode from 'vscode';
 import { AgentPanelProvider, RursorDiffContentProvider } from './agentPanel';
+import { registerArtifactStudio } from './artifactStudio';
+import { registerBrowserStudio } from './browserStudio';
+import { registerCanvasStudio } from './canvasStudio';
+import { registerDocsAndMcpCommands } from './docsAndMcpRegistry';
 import { registerInlineCompletionCommands, RursorInlineCompletionProvider } from './inlineCompletion';
 import { InlineEditSessionManager, RursorCodeActionProvider } from './inlineEdit';
 import { TemporalIntentLedger } from './lspContext';
+import { registerMissionControlCommands } from './missionControl';
 import { registerNativeForkFeatures } from './nativeForkFeatures';
 import { RursorSettingsPanel } from './settingsPanel';
 import { SidecarClient } from './sidecarClient';
@@ -158,6 +163,42 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     vscode.window.registerWebviewViewProvider(AgentPanelProvider.viewType, agentProvider, {
       webviewOptions: { retainContextWhenHidden: true },
     })
+  );
+
+  // Omni-Studio subsystems: Swarm Mission Control, CDP Browser Studio, Media/PPTX/Video/GenUI Studio,
+  // Persistent @docs Crawler + 1-Click MCP Registry, and Infinite Design-to-Code Canvas.
+  registerMissionControlCommands(context, client);
+  registerBrowserStudio(context, client, {
+    onSendToAgent: async (prompt, images, mode) => {
+      await agentProvider?.submitExternalPrompt(
+        prompt,
+        (images ?? []).map((img) => ({
+          mimeType: img.mimeType,
+          data: img.data,
+          name: img.name,
+        })),
+        mode ?? 'agent'
+      );
+    },
+    onRunInlineEdit: async (instruction) => {
+      await inlineEditManager.runInlineEdit(instruction);
+    },
+  });
+  registerArtifactStudio(context, client);
+  registerDocsAndMcpCommands(
+    context,
+    client,
+    () => vscode.workspace.workspaceFolders?.[0]?.uri.fsPath
+  );
+  registerCanvasStudio(context, client);
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('rursor.openMissionControl', () =>
+      vscode.commands.executeCommand('rursor.missionControl', 'swarm')
+    ),
+    vscode.commands.registerCommand('rursor.openModelArena', () =>
+      vscode.commands.executeCommand('rursor.missionControl', 'arena')
+    )
   );
 
   // Incremental workspace indexing on save/create/delete

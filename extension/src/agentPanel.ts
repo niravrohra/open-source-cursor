@@ -2,6 +2,7 @@ import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { spawn } from 'node:child_process';
 import * as vscode from 'vscode';
+import { buildInlineGenUiSrcdoc, INLINE_GENUI_HOST_RESIZE_SCRIPT } from './artifactStudio';
 import {
   captureDiagnostics,
   TemporalIntentLedger,
@@ -156,6 +157,9 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
         code?: string;
         sessionId?: string;
         checkpointId?: string;
+        artifactPath?: string;
+        external?: boolean;
+        studioTarget?: string;
       }) => {
         if (msg.type === 'webviewReady') {
           this.syncContextBar();
@@ -225,6 +229,37 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
           await this.insertSnippetAtCursor(msg.code);
         } else if (msg.type === 'reloadMcp') {
           await this.reloadMcp();
+        } else if (msg.type === 'openStudioArtifact' && msg.artifactPath) {
+          const uri = vscode.Uri.file(msg.artifactPath);
+          if (msg.external) {
+            await vscode.env.openExternal(uri);
+          } else {
+            await vscode.commands.executeCommand('rursor.previewArtifact', uri);
+          }
+        } else if (msg.type === 'launchStudio' && msg.studioTarget) {
+          switch (msg.studioTarget) {
+            case 'swarm':
+              await vscode.commands.executeCommand('rursor.missionControl', 'swarm');
+              break;
+            case 'arena':
+              await vscode.commands.executeCommand('rursor.missionControl', 'arena');
+              break;
+            case 'browser':
+              await vscode.commands.executeCommand('rursor.openBrowserStudio');
+              break;
+            case 'artifacts':
+              await vscode.commands.executeCommand('rursor.openArtifactStudio');
+              break;
+            case 'canvas':
+              await vscode.commands.executeCommand('rursor.openCanvas');
+              break;
+            case 'addDocs':
+              await vscode.commands.executeCommand('rursor.addDocsSource');
+              break;
+            case 'mcpStore':
+              await vscode.commands.executeCommand('rursor.installMcpPreset');
+              break;
+          }
         }
       }
     );
@@ -560,6 +595,41 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
       }
     }
 
+    const docsMatch = prompt.match(/(?:^|\s)@docs(?::([a-zA-Z0-9_-]+))?(?:\s|$)/i);
+    if (docsMatch) {
+      const requestedSource = docsMatch[1]?.trim() || undefined;
+      try {
+        const docsRes = await this.client.request<{
+          chunks: Array<{
+            sourceName: string;
+            url: string;
+            title: string;
+            sectionHeading: string;
+            content: string;
+          }>;
+        }>('search_docs', {
+          query: prompt.replace(/@docs(?::[a-zA-Z0-9_-]+)?/gi, '').trim() || prompt,
+          sourceName: requestedSource,
+          limit: 5,
+        }).promise;
+        const hits = docsRes.chunks ?? [];
+        if (hits.length > 0) {
+          const formattedDocs = hits
+            .map(
+              (h) =>
+                `### [${h.sourceName}] ${h.title} — ${h.sectionHeading}\nURL: ${h.url}\n${h.content}`
+            )
+            .join('\n\n---\n\n');
+          contextFiles.push({
+            path: `@docs/${requestedSource ?? 'all'}`,
+            content: formattedDocs.slice(0, 16_000),
+          });
+        }
+      } catch {
+        // Ignore if no docs indexed yet
+      }
+    }
+
     const diagnostics = collectWorkspaceDiagnostics();
     const cfg = vscode.workspace.getConfiguration('rursor');
     const thinkingBudget = cfg.get<number>('agent.thinkingBudget', 0);
@@ -610,6 +680,30 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
         },
         onSubagentEvent: (payload) => {
           void this.view?.webview.postMessage({ type: 'subagentEvent', payload });
+        },
+        onSwarmEvent: (payload) => {
+          void this.view?.webview.postMessage({ type: 'swarmEvent', payload });
+        },
+        onArtifactCreated: (payload) => {
+          const kind = String(payload.kind ?? '');
+          if (kind === 'gen_ui') {
+            const iframeHtml = buildInlineGenUiSrcdoc(
+              String(payload.title ?? 'Interactive Widget'),
+              String(payload.html ?? '')
+            );
+            void this.view?.webview.postMessage({
+              type: 'artifactCreated',
+              artifact: {
+                ...payload,
+                iframeHtml,
+              },
+            });
+          } else {
+            void this.view?.webview.postMessage({
+              type: 'artifactCreated',
+              artifact: payload,
+            });
+          }
         },
       }
     );
@@ -1398,6 +1492,64 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
     border-radius: 10px;
     background: rgba(127, 127, 127, 0.16);
   }
+  .studio-strip {
+    display: flex;
+    gap: 4px;
+    flex-wrap: wrap;
+    align-items: center;
+  }
+  .studio-strip button {
+    font-size: 10px;
+    padding: 2px 7px;
+    border-radius: 999px;
+    background: rgba(124, 92, 255, 0.14);
+    border: 1px solid rgba(124, 92, 255, 0.35);
+    color: var(--vscode-foreground);
+  }
+  .studio-strip button:hover {
+    background: rgba(124, 92, 255, 0.28);
+  }
+  .studio-card {
+    border: 1px solid rgba(124, 92, 255, 0.38);
+    border-radius: 8px;
+    padding: 9px 11px;
+    background: rgba(19, 24, 34, 0.88);
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .studio-card-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 8px;
+    font-weight: 600;
+    font-size: 12px;
+  }
+  .studio-badge {
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    padding: 2px 6px;
+    border-radius: 999px;
+    background: rgba(124, 92, 255, 0.22);
+    color: #b7a5ff;
+  }
+  .studio-card-meta {
+    font-size: 11px;
+    opacity: 0.8;
+    word-break: break-all;
+  }
+  .studio-card-actions {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+  }
+  .studio-genui-wrap {
+    margin: 4px 0;
+    width: 100%;
+  }
 </style>
 </head>
 <body>
@@ -1433,6 +1585,15 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
     </div>
   </div>
   <footer>
+    <div class="studio-strip">
+      <button type="button" onclick="launchStudio('swarm')" title="Open Multi-Agent Swarm Mission Control (Cmd+Shift+M)">Swarm</button>
+      <button type="button" onclick="launchStudio('arena')" title="Run Best-of-N Model Arena">Arena</button>
+      <button type="button" onclick="launchStudio('browser')" title="Open Native Chromium CDP Browser Studio (Cmd+Shift+B)">Browser</button>
+      <button type="button" onclick="launchStudio('artifacts')" title="Open Slide Deck, Video & Office Studio (Cmd+Shift+A)">Decks &amp; Video</button>
+      <button type="button" onclick="launchStudio('canvas')" title="Open Infinite Design-to-Code Canvas (Cmd+Shift+C)">Canvas</button>
+      <button type="button" onclick="launchStudio('addDocs')" title="Crawl & Index Documentation Site (@docs)">+ @docs</button>
+      <button type="button" onclick="launchStudio('mcpStore')" title="1-Click MCP Server Store">MCP+</button>
+    </div>
     <div class="chips" id="chips">
       <button id="addFileBtn" type="button">+ File</button>
       <button id="addImgBtn" type="button">+ Img</button>
@@ -1696,6 +1857,7 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
   function getFilteredMentions(query) {
     const builtins = [
       { kind: 'workspace', label: '@workspace', detail: 'Toggle workspace search on' },
+      { kind: 'docs', label: '@docs', detail: 'Search indexed documentation sites' },
       { kind: 'git', label: '@git', detail: 'Include git diff in this turn' },
       { kind: 'errors', label: '@errors', detail: 'Insert active diagnostics (' + latestDiagnostics.length + ')' },
     ];
@@ -1767,6 +1929,8 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
     if (item.kind === 'workspace') {
       wsEl.checked = true;
       inserted = '@workspace ';
+    } else if (item.kind === 'docs') {
+      inserted = '@docs ';
     } else if (item.kind === 'git') {
       gitEl.checked = true;
       inserted = '@git ';
@@ -2034,6 +2198,86 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
   window.revertEdit = (callId) => vscode.postMessage({ type: 'revertEdit', callId });
   window.decideCmd = (callId, decision) => vscode.postMessage({ type: 'commandDecision', callId, text: decision });
   window.restoreCheckpoint = (checkpointId) => vscode.postMessage({ type: 'restoreCheckpoint', checkpointId });
+  window.launchStudio = (studioTarget) => vscode.postMessage({ type: 'launchStudio', studioTarget });
+  window.openStudioArtifact = (encPath, external) =>
+    vscode.postMessage({
+      type: 'openStudioArtifact',
+      artifactPath: decodeURIComponent(encPath),
+      external: Boolean(external),
+    });
+
+  function renderStudioArtifactCard(art) {
+    if (!art) return;
+    activeAssistantEl = null;
+    activeAssistantRaw = '';
+    if (art.kind === 'gen_ui' && art.iframeHtml) {
+      const wrap = document.createElement('div');
+      wrap.className = 'studio-genui-wrap';
+      wrap.innerHTML = art.iframeHtml;
+      messagesEl.appendChild(wrap);
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+      return;
+    }
+
+    const card = document.createElement('div');
+    card.className = 'studio-card';
+    const kindLabel = String(art.kind || 'artifact').toUpperCase();
+    const primaryPath =
+      art.htmlDeckPath ||
+      art.pptxPath ||
+      art.videoPath ||
+      art.imagePath ||
+      art.xlsxPath ||
+      art.docxPath ||
+      '';
+    const exportPath =
+      art.pptxPath ||
+      art.videoPath ||
+      art.xlsxPath ||
+      art.docxPath ||
+      art.imagePath ||
+      primaryPath;
+    const titleText =
+      art.title ||
+      (primaryPath ? primaryPath.split('/').pop().split('\\\\').pop() : 'Studio Artifact');
+
+    let metaParts = [];
+    if (art.slideCount) metaParts.push(art.slideCount + ' slides');
+    if (art.durationSecs) metaParts.push(art.durationSecs + 's');
+    if (art.sheetCount) metaParts.push(art.sheetCount + ' sheet(s)');
+    if (art.sectionCount) metaParts.push(art.sectionCount + ' section(s)');
+    if (exportPath) metaParts.push(exportPath);
+
+    let buttonsHtml = '';
+    if (primaryPath) {
+      const encPrimary = encodeURIComponent(primaryPath);
+      buttonsHtml +=
+        '<button class="primary" onclick="openStudioArtifact(\\'' +
+        encPrimary +
+        '\\', false)">Preview in Rursor</button>';
+    }
+    if (exportPath) {
+      const encExport = encodeURIComponent(exportPath);
+      buttonsHtml +=
+        '<button onclick="openStudioArtifact(\\'' +
+        encExport +
+        '\\', true)">Open Externally</button>';
+    }
+
+    card.innerHTML =
+      '<div class="studio-card-head"><span>' +
+      escHtml(titleText) +
+      '</span><span class="studio-badge">' +
+      escHtml(kindLabel) +
+      '</span></div>' +
+      (metaParts.length > 0
+        ? '<div class="studio-card-meta">' + escHtml(metaParts.join(' · ')) + '</div>'
+        : '') +
+      (buttonsHtml ? '<div class="studio-card-actions">' + buttonsHtml + '</div>' : '');
+
+    messagesEl.appendChild(card);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+  }
 
   window.addEventListener('message', (event) => {
     const msg = event.data;
@@ -2093,6 +2337,23 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
       pill.textContent = 'Subagent [' + (ev.taskId || 'task') + ']: ' + (ev.status || '');
       messagesEl.appendChild(pill);
       messagesEl.scrollTop = messagesEl.scrollHeight;
+    } else if (msg.type === 'swarmEvent' && msg.payload) {
+      const ev = msg.payload;
+      if (ev.kind === 'wave_started' || ev.kind === 'worker_done' || ev.kind === 'mission_done') {
+        const pill = document.createElement('div');
+        pill.className = 'tool-pill';
+        const detail =
+          ev.kind === 'wave_started'
+            ? 'Swarm Wave ' + ((ev.waveIndex || 0) + 1) + ' started'
+            : ev.kind === 'worker_done'
+              ? 'Worker [' + (ev.workerId || 'worker') + '] ' + (ev.status || 'done')
+              : 'Swarm mission completed';
+        pill.textContent = detail;
+        messagesEl.appendChild(pill);
+        messagesEl.scrollTop = messagesEl.scrollHeight;
+      }
+    } else if (msg.type === 'artifactCreated' && msg.artifact) {
+      renderStudioArtifactCard(msg.artifact);
     } else if (msg.type === 'sessionsSync') {
       renderSessions(msg.sessions, msg.currentSessionId);
     } else if (msg.type === 'sessionLoaded') {
@@ -2179,6 +2440,8 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
       }
     }
   });
+
+  ${INLINE_GENUI_HOST_RESIZE_SCRIPT}
 
   vscode.postMessage({ type: 'webviewReady' });
 </script>

@@ -31,8 +31,15 @@ export interface StreamCallbacks {
   onToolRequest?: (payload: ToolRequestPayload) => void;
   onCheckpointCreated?: (checkpoint: Record<string, unknown>) => void;
   onSubagentEvent?: (payload: { taskId?: string; status?: string }) => void;
+  onSwarmEvent?: (payload: Record<string, unknown>) => void;
+  onArtifactCreated?: (payload: Record<string, unknown>) => void;
   onPtyChunk?: (text: string) => void;
 }
+
+export type RpcRequestHandle<T> = Promise<T> & {
+  id: number;
+  promise: Promise<T>;
+};
 
 interface PendingCall {
   resolve: (value: unknown) => void;
@@ -40,11 +47,14 @@ interface PendingCall {
   callbacks?: StreamCallbacks;
 }
 
+type GlobalEventListener = (event: string, payload: unknown, requestId?: number) => void;
+
 export class SidecarClient implements vscode.Disposable {
   private proc: ChildProcessWithoutNullStreams | undefined;
   private buffer = '';
   private nextId = 1;
   private pending = new Map<number, PendingCall>();
+  private eventListeners = new Set<GlobalEventListener>();
   private readonly outputChannel = vscode.window.createOutputChannel('Rursor AI');
 
   constructor(private readonly extensionPath: string) {}
@@ -114,6 +124,16 @@ export class SidecarClient implements vscode.Disposable {
       return;
     }
 
+    if (parsed.event) {
+      for (const listener of this.eventListeners) {
+        try {
+          listener(parsed.event, parsed.payload, parsed.requestId);
+        } catch {
+          // Ignore listener exceptions
+        }
+      }
+    }
+
     if (parsed.event && typeof parsed.requestId === 'number') {
       const call = this.pending.get(parsed.requestId);
       if (!call?.callbacks) {
@@ -137,6 +157,10 @@ export class SidecarClient implements vscode.Disposable {
         call.callbacks.onSubagentEvent?.(
           (parsed.payload as { taskId?: string; status?: string }) ?? {}
         );
+      } else if (parsed.event === 'swarm_event') {
+        call.callbacks.onSwarmEvent?.((parsed.payload as Record<string, unknown>) ?? {});
+      } else if (parsed.event === 'artifact_created') {
+        call.callbacks.onArtifactCreated?.((parsed.payload as Record<string, unknown>) ?? {});
       } else if (parsed.event === 'pty_chunk') {
         const payload = parsed.payload as { text?: string } | undefined;
         if (payload?.text) {
@@ -160,11 +184,29 @@ export class SidecarClient implements vscode.Disposable {
     }
   }
 
+  onEvent(
+    eventOrListener: string | ((event: string, payload: unknown, requestId?: number) => void),
+    maybeListener?: (payload: unknown, requestId?: number) => void
+  ): vscode.Disposable {
+    const wrapped: GlobalEventListener =
+      typeof eventOrListener === 'function'
+        ? eventOrListener
+        : (ev, payload, reqId) => {
+            if (ev === eventOrListener) {
+              maybeListener?.(payload, reqId);
+            }
+          };
+    this.eventListeners.add(wrapped);
+    return new vscode.Disposable(() => {
+      this.eventListeners.delete(wrapped);
+    });
+  }
+
   request<T = Record<string, unknown>>(
     method: string,
     params: Record<string, unknown> = {},
     callbacks?: StreamCallbacks | ((text: string) => void)
-  ): { id: number; promise: Promise<T> } {
+  ): RpcRequestHandle<T> {
     this.start();
     const id = this.nextId++;
     const normalizedCallbacks: StreamCallbacks | undefined =
@@ -182,7 +224,9 @@ export class SidecarClient implements vscode.Disposable {
       });
       this.proc.stdin.write(`${JSON.stringify({ id, method, params })}\n`);
     });
-    return { id, promise };
+
+    const handle = Object.assign(promise, { id, promise }) as RpcRequestHandle<T>;
+    return handle;
   }
 
   async submitToolResult(

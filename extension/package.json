@@ -1,9 +1,9 @@
 {
   "name": "rursor-ai",
   "displayName": "Rursor AI",
-  "description": "Built-in AI editing, Tab/NES prediction, LSP+AST codebase intelligence, APFS/Seatbelt sandboxes, and Gemini-powered agent runtime for Rursor IDE.",
+  "description": "Rursor 1.0 Omni-Studio: Multi-agent APFS CoW Swarm, native Chromium CDP Browser & Video Proof, PowerPoint/MP4/Office/GenUI Studio, persistent @docs & MCP Registry, Infinite Design-to-Code Canvas, and Tab/NES AI IDE.",
   "publisher": "rursor",
-  "version": "0.3.0",
+  "version": "1.0.0",
   "engines": {
     "vscode": "^1.95.0"
   },
@@ -48,6 +48,18 @@
         }
       ]
     },
+    "customEditors": [
+      {
+        "viewType": "rursor.canvasEditor",
+        "displayName": "Rursor Design-to-Code Canvas",
+        "selector": [
+          {
+            "filenamePattern": "*.rursor.canvas"
+          }
+        ],
+        "priority": "default"
+      }
+    ],
     "commands": [
       {
         "command": "rursor.openSettings",
@@ -168,9 +180,77 @@
       {
         "command": "rursor.manageCowClones",
         "title": "Rursor: Manage macOS APFS Copy-on-Write Sandboxes"
+      },
+      {
+        "command": "rursor.missionControl",
+        "title": "Rursor: Open Multi-Agent Swarm Mission Control"
+      },
+      {
+        "command": "rursor.openMissionControl",
+        "title": "Rursor: Launch Swarm Mission Control"
+      },
+      {
+        "command": "rursor.openModelArena",
+        "title": "Rursor: Run Best-of-N Model Arena"
+      },
+      {
+        "command": "rursor.openBrowserStudio",
+        "title": "Rursor: Open Native Chromium Browser & Computer-Use Studio"
+      },
+      {
+        "command": "rursor.openArtifactStudio",
+        "title": "Rursor: Open Multimodal Media, Slide Deck & Office Studio"
+      },
+      {
+        "command": "rursor.createSlideDeck",
+        "title": "Rursor: Create PowerPoint (.pptx) & Interactive Slide Deck"
+      },
+      {
+        "command": "rursor.createExplainerVideo",
+        "title": "Rursor: Create Explainer Video (.mp4)"
+      },
+      {
+        "command": "rursor.previewArtifact",
+        "title": "Rursor: Preview Studio Artifact (Deck / Video / Office)"
+      },
+      {
+        "command": "rursor.addDocsSource",
+        "title": "Rursor: Crawl & Index Documentation Site (@docs)"
+      },
+      {
+        "command": "rursor.manageDocsSources",
+        "title": "Rursor: Manage Indexed @docs Documentation Sources"
+      },
+      {
+        "command": "rursor.installMcpPreset",
+        "title": "Rursor: 1-Click Install MCP Server from Store"
+      },
+      {
+        "command": "rursor.openCanvas",
+        "title": "Rursor: Open Infinite Visual Design-to-Code Canvas"
       }
     ],
     "keybindings": [
+      {
+        "command": "rursor.missionControl",
+        "key": "cmd+shift+m",
+        "mac": "cmd+shift+m"
+      },
+      {
+        "command": "rursor.openBrowserStudio",
+        "key": "cmd+shift+b",
+        "mac": "cmd+shift+b"
+      },
+      {
+        "command": "rursor.openArtifactStudio",
+        "key": "cmd+shift+a",
+        "mac": "cmd+shift+a"
+      },
+      {
+        "command": "rursor.openCanvas",
+        "key": "cmd+shift+c",
+        "mac": "cmd+shift+c"
+      },
       {
         "command": "rursor.inlineEdit",
         "key": "cmd+k",

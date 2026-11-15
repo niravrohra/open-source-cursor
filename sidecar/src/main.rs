@@ -1,20 +1,25 @@
+mod browser;
 mod context;
 mod gemini;
 mod local_llm;
 mod macos_sandbox;
 mod mcp;
+mod media_studio;
 mod memory;
 mod nes;
 mod protocol;
 mod pty_runner;
 mod repomap;
+mod research;
 mod router;
 mod rules;
 mod sessions;
 mod subagents;
+mod swarm;
 mod syntax_gate;
 mod worktree;
 
+use crate::browser::BrowserSessionManager;
 use crate::context::WorkspaceIndex;
 use crate::gemini::{
     chat_message_to_gemini_content, estimate_messages_tokens, GeminiClient, GeminiTurnOptions,
@@ -24,6 +29,11 @@ use crate::macos_sandbox::{
     classify_command_risk, run_sandboxed_command_async, ApfsCloneManager, PermissionProfile,
 };
 use crate::mcp::McpManager;
+use crate::media_studio::{
+    create_document, create_presentation, create_spreadsheet, dispatch_media_studio_rpc,
+    generate_image_asset, render_explainer_video, DocumentSpec, ImageAssetSpec, PresentationSpec,
+    SpreadsheetSpec, VideoStoryboardSpec,
+};
 use crate::memory::{
     delete_memory, format_memory_prompt, list_skills, load_memories, resolve_slash_command,
     save_memory,
@@ -42,6 +52,9 @@ use crate::protocol::{
 };
 use crate::pty_runner::{run_pty_command, PtyManager};
 use crate::repomap::{build_pagerank_repo_map, RepoFileInput, RepoMapSeed};
+use crate::research::{
+    builtin_mcp_catalog, fetch_url_as_markdown, install_mcp_preset, web_search, DocsIndexStore,
+};
 use crate::router::{
     route_task, stream_anthropic_chat, stream_openai_chat, ProviderKeys, ProviderKind, TaskKind,
 };
@@ -50,6 +63,11 @@ use crate::sessions::SessionStore;
 use crate::subagents::{
     all_verify_passed, detect_verify_commands, format_verify_feedback, run_parallel_subagents,
     SubagentTask, VerifyResult,
+};
+use crate::swarm::{
+    cleanup_swarm_clones, compute_execution_waves, merge_worker_clones_to_staging,
+    merge_worker_clones_to_workspace, run_model_arena_with_events, run_swarm_mission, SmartRouter,
+    SwarmNodeState, SwarmTaskSpec,
 };
 use crate::syntax_gate::{is_syntax_gate_supported, validate_edit_syntax};
 use crate::worktree::{
@@ -105,6 +123,8 @@ struct AppState {
     checkpoints: CheckpointStore,
     cow_clones: ApfsCloneManager,
     pty_manager: PtyManager,
+    browser: BrowserSessionManager,
+    docs_index: DocsIndexStore,
     in_flight: Mutex<HashMap<u64, JoinHandle<()>>>,
     pending_tools: Mutex<HashMap<String, oneshot::Sender<ToolResultPayload>>>,
 }
@@ -144,9 +164,21 @@ impl AppState {
             checkpoints: CheckpointStore::default_store(),
             cow_clones: ApfsCloneManager::default_store(),
             pty_manager: PtyManager::new(),
+            browser: BrowserSessionManager::default(),
+            docs_index: DocsIndexStore::default_store(),
             in_flight: Mutex::new(HashMap::new()),
             pending_tools: Mutex::new(HashMap::new()),
         }
+    }
+
+    async fn smart_router(&self) -> SmartRouter {
+        SmartRouter::with_local(
+            self.http.clone(),
+            self.gemini.clone(),
+            self.autocomplete_backend.read().await.clone(),
+            self.local_endpoint.read().await.clone(),
+            self.local_model.read().await.clone(),
+        )
     }
 
     async fn provider_keys(&self) -> ProviderKeys {
@@ -402,6 +434,7 @@ async fn dispatch(
                     }
                 }
                 *state.workspace_rules.write().await = load_workspace_rules(&root_path);
+                state.browser.set_workspace_root(Some(root_path.clone())).await;
                 let _ = state.mcp.write().await.reload(Some(&root_path)).await;
             }
             RpcResponse::ok(req.id, json!({ "updated": true }))
@@ -422,6 +455,7 @@ async fn dispatch(
                 }
             };
             *state.workspace_rules.write().await = load_workspace_rules(&root_path);
+            state.browser.set_workspace_root(Some(root_path)).await;
             RpcResponse::ok(req.id, json!({ "indexedFiles": count }))
         }
         "reload_mcp" => {
@@ -897,6 +931,394 @@ async fn dispatch(
             let timeout = params.timeout_secs.unwrap_or(60);
             match run_sandboxed_command_async(&params.command, &cwd, profile, allow_network, timeout).await {
                 Ok(out) => RpcResponse::ok(req.id, json!({ "result": out })),
+                Err(e) => RpcResponse::err(req.id, e),
+            }
+        }
+        "plan_swarm_waves" => {
+            let tasks_val = req.params.get("tasks").cloned().unwrap_or(Value::Array(vec![]));
+            let tasks: Vec<SwarmTaskSpec> = match serde_json::from_value(tasks_val) {
+                Ok(t) => t,
+                Err(e) => return RpcResponse::err(req.id, format!("Invalid swarm tasks: {e}")),
+            };
+            match compute_execution_waves(&tasks) {
+                Ok(waves) => RpcResponse::ok(req.id, json!({ "waves": waves, "waveCount": waves.len() })),
+                Err(e) => RpcResponse::err(req.id, e),
+            }
+        }
+        "run_swarm" => {
+            let goal = req
+                .params
+                .get("goal")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let tasks_override: Option<Vec<SwarmTaskSpec>> = req
+                .params
+                .get("tasks")
+                .and_then(|v| serde_json::from_value(v.clone()).ok());
+            let max_parallel = req
+                .params
+                .get("maxParallelWorkers")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(3) as usize;
+            let max_turns = req
+                .params
+                .get("maxTurns")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(8) as usize;
+            let allow_net = match req.params.get("allowNetwork").and_then(|v| v.as_bool()) {
+                Some(b) => b,
+                None => *state.sandbox_allow_network.read().await,
+            };
+            let model_override = req
+                .params
+                .get("model")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let root = match req
+                .params
+                .get("workspaceRoot")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .map(PathBuf::from)
+            {
+                Some(r) => r,
+                None => match state.index.read().await.root.clone() {
+                    Some(r) => r,
+                    None => return RpcResponse::err(req.id, "No workspace root is open."),
+                },
+            };
+
+            let files: Vec<RepoFileInput> = {
+                let index = state.index.read().await;
+                index
+                    .files
+                    .iter()
+                    .take(400)
+                    .map(|f| RepoFileInput {
+                        path: f.rel_path.clone(),
+                        content: f.content.clone(),
+                    })
+                    .collect()
+            };
+            let repo_map = build_pagerank_repo_map(&files, &RepoMapSeed::default(), 4_000);
+            let router = state.smart_router().await;
+            let keys = state.provider_keys().await;
+            let tx = out_tx.clone();
+            let req_id = req.id;
+
+            match run_swarm_mission(
+                &goal,
+                tasks_override,
+                &repo_map,
+                max_parallel,
+                max_turns,
+                allow_net,
+                model_override.as_deref(),
+                &root,
+                &state.cow_clones,
+                &router,
+                &keys,
+                Arc::new(move |ev| {
+                    if let Ok(val) = serde_json::to_value(ev) {
+                        emit_event(&tx, req_id, "swarm_event", val);
+                    }
+                }),
+            )
+            .await
+            {
+                Ok(report) => {
+                    let val = serde_json::to_value(&report).unwrap_or_else(|_| json!({}));
+                    RpcResponse::ok(req.id, val)
+                }
+                Err(e) => RpcResponse::err(req.id, e),
+            }
+        }
+        "merge_swarm" => {
+            let nodes_val = req.params.get("nodes").cloned().unwrap_or(Value::Array(vec![]));
+            let nodes: Vec<SwarmNodeState> = match serde_json::from_value(nodes_val) {
+                Ok(n) => n,
+                Err(e) => return RpcResponse::err(req.id, format!("Invalid swarm nodes: {e}")),
+            };
+            let staging_only = req
+                .params
+                .get("stagingOnly")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let root = match req
+                .params
+                .get("workspaceRoot")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .map(PathBuf::from)
+            {
+                Some(r) => r,
+                None => match state.index.read().await.root.clone() {
+                    Some(r) => r,
+                    None => return RpcResponse::err(req.id, "No workspace root is open."),
+                },
+            };
+
+            let res = if staging_only {
+                merge_worker_clones_to_staging(&nodes, &root, &state.cow_clones)
+            } else {
+                let merged = merge_worker_clones_to_workspace(&nodes, &root, &state.cow_clones);
+                if merged.is_ok() {
+                    let mut idx = state.index.write().await;
+                    let _ = idx.index_directory(&root);
+                }
+                merged
+            };
+            match res {
+                Ok(report) => RpcResponse::ok(
+                    req.id,
+                    serde_json::to_value(&report).unwrap_or_else(|_| json!({})),
+                ),
+                Err(e) => RpcResponse::err(req.id, e),
+            }
+        }
+        "cleanup_swarm" => {
+            let clone_ids: Vec<String> = req
+                .params
+                .get("cloneIds")
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .unwrap_or_default();
+            let destroyed = cleanup_swarm_clones(&clone_ids, &state.cow_clones);
+            RpcResponse::ok(req.id, json!({ "destroyedCloneIds": destroyed }))
+        }
+        "run_arena" => {
+            let prompt = req
+                .params
+                .get("prompt")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let models: Vec<String> = req
+                .params
+                .get("models")
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .unwrap_or_else(|| vec![DEFAULT_GEMINI_MODEL.to_string()]);
+            let allow_net = *state.sandbox_allow_network.read().await;
+            let root = match req
+                .params
+                .get("workspaceRoot")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .map(PathBuf::from)
+            {
+                Some(r) => r,
+                None => match state.index.read().await.root.clone() {
+                    Some(r) => r,
+                    None => return RpcResponse::err(req.id, "No workspace root is open."),
+                },
+            };
+            let router = state.smart_router().await;
+            let keys = state.provider_keys().await;
+            let tx = out_tx.clone();
+            let req_id = req.id;
+
+            let candidates = run_model_arena_with_events(
+                &prompt,
+                models,
+                &root,
+                &state.cow_clones,
+                &router,
+                &keys,
+                allow_net,
+                Arc::new(move |ev| {
+                    if let Ok(val) = serde_json::to_value(ev) {
+                        emit_event(&tx, req_id, "swarm_event", val);
+                    }
+                }),
+            )
+            .await;
+            RpcResponse::ok(req.id, json!({ "candidates": candidates }))
+        }
+        "browser_navigate"
+        | "browser_snapshot"
+        | "browser_act"
+        | "browser_diagnostics"
+        | "browser_clear_diagnostics"
+        | "browser_export_pdf"
+        | "browser_record_walkthrough"
+        | "browser_close" => match state.browser.handle_rpc(&req.method, req.params).await {
+            Ok(val) => RpcResponse::ok(req.id, val),
+            Err(e) => RpcResponse::err(req.id, e),
+        },
+        "create_presentation"
+        | "render_explainer_video"
+        | "generate_veo_video"
+        | "generate_image_asset"
+        | "create_spreadsheet"
+        | "create_document" => {
+            let root = match req
+                .params
+                .get("workspaceRoot")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .map(PathBuf::from)
+            {
+                Some(r) => r,
+                None => match state.index.read().await.root.clone() {
+                    Some(r) => r,
+                    None => return RpcResponse::err(req.id, "No workspace root is open."),
+                },
+            };
+            let api_key = state.api_key.read().await.clone();
+            match dispatch_media_studio_rpc(
+                &req.method,
+                &req.params,
+                &root,
+                &state.http,
+                api_key.as_deref(),
+            )
+            .await
+            {
+                Some(Ok(val)) => RpcResponse::ok(req.id, val),
+                Some(Err(e)) => RpcResponse::err(req.id, e),
+                None => RpcResponse::err(req.id, format!("Unhandled media RPC: {}", req.method)),
+            }
+        }
+        "web_search" => {
+            let query = req.params.get("query").and_then(|v| v.as_str()).unwrap_or("");
+            let limit = req.params.get("limit").and_then(|v| v.as_u64()).unwrap_or(6) as usize;
+            let api_key = state.api_key.read().await.clone();
+            let model = state.model.read().await.clone();
+            match web_search(&state.http, query, limit, api_key.as_deref(), Some(&model)).await {
+                Ok(res) => RpcResponse::ok(req.id, serde_json::to_value(res).unwrap_or_else(|_| json!({}))),
+                Err(e) => RpcResponse::err(req.id, e),
+            }
+        }
+        "read_url_markdown" => {
+            let url = req.params.get("url").and_then(|v| v.as_str()).unwrap_or("");
+            let max_chars = req
+                .params
+                .get("maxChars")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(24_000) as usize;
+            let allow_localhost = req
+                .params
+                .get("allowLocalhost")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            match fetch_url_as_markdown(&state.http, url, max_chars, allow_localhost).await {
+                Ok(res) => RpcResponse::ok(req.id, serde_json::to_value(res).unwrap_or_else(|_| json!({}))),
+                Err(e) => RpcResponse::err(req.id, e),
+            }
+        }
+        "index_docs_source" => {
+            let name = req.params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let start_url = req.params.get("startUrl").and_then(|v| v.as_str()).unwrap_or("");
+            let max_pages = req
+                .params
+                .get("maxPages")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(25) as usize;
+            let allow_localhost = req
+                .params
+                .get("allowLocalhost")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            match state
+                .docs_index
+                .crawl_and_index(&state.http, name, start_url, max_pages, allow_localhost)
+                .await
+            {
+                Ok(summary) => RpcResponse::ok(req.id, json!({ "source": summary })),
+                Err(e) => RpcResponse::err(req.id, e),
+            }
+        }
+        "index_docs_pages" => {
+            let name = req.params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let root_url = req
+                .params
+                .get("rootUrl")
+                .and_then(|v| v.as_str())
+                .unwrap_or("https://local.docs/");
+            let raw_pages = req
+                .params
+                .get("pages")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let mut pages: Vec<(String, String, String)> = Vec::new();
+            for p in raw_pages {
+                let url = p.get("url").and_then(|v| v.as_str()).unwrap_or(root_url).to_string();
+                let title = p.get("title").and_then(|v| v.as_str()).unwrap_or(name).to_string();
+                let markdown = p.get("markdown").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                if !markdown.trim().is_empty() {
+                    pages.push((url, title, markdown));
+                }
+            }
+            match state.docs_index.index_pages(name, root_url, &pages, false) {
+                Ok(summary) => RpcResponse::ok(req.id, json!({ "source": summary })),
+                Err(e) => RpcResponse::err(req.id, e),
+            }
+        }
+        "search_docs" => {
+            let query = req.params.get("query").and_then(|v| v.as_str()).unwrap_or("");
+            let source_filter = req.params.get("source").and_then(|v| v.as_str());
+            let limit = req.params.get("limit").and_then(|v| v.as_u64()).unwrap_or(6) as usize;
+            match state.docs_index.search_docs(query, source_filter, limit) {
+                Ok(hits) => RpcResponse::ok(req.id, json!({ "hits": hits })),
+                Err(e) => RpcResponse::err(req.id, e),
+            }
+        }
+        "list_docs_sources" => match state.docs_index.list_sources() {
+            Ok(sources) => RpcResponse::ok(req.id, json!({ "sources": sources })),
+            Err(e) => RpcResponse::err(req.id, e),
+        },
+        "remove_docs_source" => {
+            let name = req.params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            match state.docs_index.remove_source(name) {
+                Ok(removed) => RpcResponse::ok(req.id, json!({ "removed": removed })),
+                Err(e) => RpcResponse::err(req.id, e),
+            }
+        }
+        "list_mcp_catalog" => {
+            let presets = builtin_mcp_catalog();
+            RpcResponse::ok(req.id, json!({ "presets": presets }))
+        }
+        "install_mcp_preset" => {
+            let preset_id = req.params.get("presetId").and_then(|v| v.as_str()).unwrap_or("");
+            let scope = req
+                .params
+                .get("scope")
+                .and_then(|v| v.as_str())
+                .unwrap_or("workspace");
+            let env_values: HashMap<String, String> = req
+                .params
+                .get("envValues")
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .unwrap_or_default();
+            let extra_args: Vec<String> = req
+                .params
+                .get("extraArgs")
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .unwrap_or_default();
+            let ws_root = req
+                .params
+                .get("workspaceRoot")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .map(PathBuf::from)
+                .or_else(|| state.index.try_read().ok().and_then(|idx| idx.root.clone()));
+
+            let target_path = if scope == "workspace" {
+                match ws_root {
+                    Some(root) => root.join(".rursor").join("mcp.json"),
+                    None => return RpcResponse::err(req.id, "No workspace root open for workspace MCP config."),
+                }
+            } else {
+                std::env::var("HOME")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|_| PathBuf::from("."))
+                    .join(".rursor")
+                    .join("mcp.json")
+            };
+
+            match install_mcp_preset(&target_path, preset_id, env_values, extra_args) {
+                Ok(val) => RpcResponse::ok(req.id, val),
                 Err(e) => RpcResponse::err(req.id, e),
             }
         }
@@ -2123,6 +2545,370 @@ async fn execute_agent_tool(
                 Err(e) => json!({ "ok": false, "result": { "error": e } }),
             }
         }
+        "spawn_worker_swarm" => {
+            emit_event(
+                out_tx,
+                req_id,
+                "tool_event",
+                json!({ "callId": call_id, "phase": "start", "name": name, "args": args }),
+            );
+            let goal = args.get("goal").and_then(|v| v.as_str()).unwrap_or("");
+            let max_workers = args
+                .get("max_parallel_workers")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(3) as usize;
+            let Some(root) = state.index.read().await.root.clone() else {
+                return json!({ "ok": false, "result": { "error": "No workspace root open." } });
+            };
+            let router = state.smart_router().await;
+            let keys = state.provider_keys().await;
+            let allow_net = *state.sandbox_allow_network.read().await;
+            let tx = out_tx.clone();
+            let (ok, output) = match run_swarm_mission(
+                goal,
+                None,
+                "",
+                max_workers,
+                6,
+                allow_net,
+                Some(model),
+                &root,
+                &state.cow_clones,
+                &router,
+                &keys,
+                Arc::new(move |ev| {
+                    if let Ok(val) = serde_json::to_value(ev) {
+                        emit_event(&tx, req_id, "swarm_event", val);
+                    }
+                }),
+            )
+            .await
+            {
+                Ok(rep) => (true, serde_json::to_value(rep).unwrap_or_else(|_| json!({}))),
+                Err(e) => (false, json!({ "error": e })),
+            };
+            emit_event(
+                out_tx,
+                req_id,
+                "tool_event",
+                json!({ "callId": call_id, "phase": "done", "name": name, "ok": ok, "output": output }),
+            );
+            json!({ "ok": ok, "result": output })
+        }
+        "browser_navigate" | "browser_snapshot" | "browser_act" | "browser_record_walkthrough" => {
+            emit_event(
+                out_tx,
+                req_id,
+                "tool_event",
+                json!({ "callId": call_id, "phase": "start", "name": name, "args": args }),
+            );
+            let (ok, output) = match state.browser.handle_rpc(name, args.clone()).await {
+                Ok(val) => {
+                    if name == "browser_record_walkthrough" {
+                        if let Some(mp4_path) = val.get("outputMp4Path").and_then(|v| v.as_str()) {
+                            emit_event(
+                                out_tx,
+                                req_id,
+                                "artifact_created",
+                                json!({
+                                    "kind": "video",
+                                    "title": "Browser Walkthrough Proof",
+                                    "path": mp4_path,
+                                }),
+                            );
+                        }
+                    }
+                    (true, val)
+                }
+                Err(e) => (false, json!({ "error": e })),
+            };
+            emit_event(
+                out_tx,
+                req_id,
+                "tool_event",
+                json!({ "callId": call_id, "phase": "done", "name": name, "ok": ok, "output": output }),
+            );
+            json!({ "ok": ok, "result": output })
+        }
+        "create_presentation" => {
+            emit_event(
+                out_tx,
+                req_id,
+                "tool_event",
+                json!({ "callId": call_id, "phase": "start", "name": name, "args": args }),
+            );
+            let Some(root) = state.index.read().await.root.clone() else {
+                return json!({ "ok": false, "result": { "error": "No workspace root open." } });
+            };
+            let (ok, output) = match serde_json::from_value::<PresentationSpec>(args.clone()) {
+                Ok(spec) => match create_presentation(&root, &spec) {
+                    Ok(art) => {
+                        emit_event(
+                            out_tx,
+                            req_id,
+                            "artifact_created",
+                            json!({
+                                "kind": "presentation",
+                                "title": spec.title,
+                                "pptxPath": art.pptx_path,
+                                "htmlDeckPath": art.html_deck_path,
+                                "slideCount": art.slide_count,
+                            }),
+                        );
+                        (true, serde_json::to_value(art).unwrap_or_else(|_| json!({})))
+                    }
+                    Err(e) => (false, json!({ "error": e })),
+                },
+                Err(e) => (false, json!({ "error": format!("Invalid presentation spec: {e}") })),
+            };
+            emit_event(
+                out_tx,
+                req_id,
+                "tool_event",
+                json!({ "callId": call_id, "phase": "done", "name": name, "ok": ok, "output": output }),
+            );
+            json!({ "ok": ok, "result": output })
+        }
+        "create_explainer_video" => {
+            emit_event(
+                out_tx,
+                req_id,
+                "tool_event",
+                json!({ "callId": call_id, "phase": "start", "name": name, "args": args }),
+            );
+            let Some(root) = state.index.read().await.root.clone() else {
+                return json!({ "ok": false, "result": { "error": "No workspace root open." } });
+            };
+            let (ok, output) = match serde_json::from_value::<VideoStoryboardSpec>(args.clone()) {
+                Ok(spec) => {
+                    let video_title = spec.title.clone();
+                    match render_explainer_video(&root, &spec).await {
+                        Ok(art) => {
+                            emit_event(
+                                out_tx,
+                                req_id,
+                                "artifact_created",
+                                json!({
+                                    "kind": "video",
+                                    "title": video_title,
+                                    "path": art.video_path,
+                                    "durationSecs": art.duration_secs,
+                                }),
+                            );
+                            (true, serde_json::to_value(art).unwrap_or_else(|_| json!({})))
+                        }
+                        Err(e) => (false, json!({ "error": e })),
+                    }
+                }
+                Err(e) => (false, json!({ "error": format!("Invalid video storyboard spec: {e}") })),
+            };
+            emit_event(
+                out_tx,
+                req_id,
+                "tool_event",
+                json!({ "callId": call_id, "phase": "done", "name": name, "ok": ok, "output": output }),
+            );
+            json!({ "ok": ok, "result": output })
+        }
+        "generate_image" => {
+            emit_event(
+                out_tx,
+                req_id,
+                "tool_event",
+                json!({ "callId": call_id, "phase": "start", "name": name, "args": args }),
+            );
+            let Some(root) = state.index.read().await.root.clone() else {
+                return json!({ "ok": false, "result": { "error": "No workspace root open." } });
+            };
+            let (ok, output) = match serde_json::from_value::<ImageAssetSpec>(args.clone()) {
+                Ok(spec) => {
+                    let key_opt = if api_key.trim().is_empty() { None } else { Some(api_key) };
+                    match generate_image_asset(&state.http, key_opt, &root, &spec).await {
+                        Ok(art) => {
+                            emit_event(
+                                out_tx,
+                                req_id,
+                                "artifact_created",
+                                json!({
+                                    "kind": "image",
+                                    "title": spec.prompt,
+                                    "path": art.image_path,
+                                }),
+                            );
+                            (true, serde_json::to_value(art).unwrap_or_else(|_| json!({})))
+                        }
+                        Err(e) => (false, json!({ "error": e })),
+                    }
+                }
+                Err(e) => (false, json!({ "error": format!("Invalid image asset spec: {e}") })),
+            };
+            emit_event(
+                out_tx,
+                req_id,
+                "tool_event",
+                json!({ "callId": call_id, "phase": "done", "name": name, "ok": ok, "output": output }),
+            );
+            json!({ "ok": ok, "result": output })
+        }
+        "create_spreadsheet" => {
+            emit_event(
+                out_tx,
+                req_id,
+                "tool_event",
+                json!({ "callId": call_id, "phase": "start", "name": name, "args": args }),
+            );
+            let Some(root) = state.index.read().await.root.clone() else {
+                return json!({ "ok": false, "result": { "error": "No workspace root open." } });
+            };
+            let (ok, output) = match serde_json::from_value::<SpreadsheetSpec>(args.clone()) {
+                Ok(spec) => match create_spreadsheet(&root, &spec) {
+                    Ok(art) => {
+                        emit_event(
+                            out_tx,
+                            req_id,
+                            "artifact_created",
+                            json!({
+                                "kind": "spreadsheet",
+                                "title": spec.output_path,
+                                "path": art.xlsx_path,
+                            }),
+                        );
+                        (true, serde_json::to_value(art).unwrap_or_else(|_| json!({})))
+                    }
+                    Err(e) => (false, json!({ "error": e })),
+                },
+                Err(e) => (false, json!({ "error": format!("Invalid spreadsheet spec: {e}") })),
+            };
+            emit_event(
+                out_tx,
+                req_id,
+                "tool_event",
+                json!({ "callId": call_id, "phase": "done", "name": name, "ok": ok, "output": output }),
+            );
+            json!({ "ok": ok, "result": output })
+        }
+        "create_document" => {
+            emit_event(
+                out_tx,
+                req_id,
+                "tool_event",
+                json!({ "callId": call_id, "phase": "start", "name": name, "args": args }),
+            );
+            let Some(root) = state.index.read().await.root.clone() else {
+                return json!({ "ok": false, "result": { "error": "No workspace root open." } });
+            };
+            let (ok, output) = match serde_json::from_value::<DocumentSpec>(args.clone()) {
+                Ok(spec) => {
+                    let doc_title = spec.title.clone();
+                    match create_document(&root, &spec) {
+                        Ok(art) => {
+                            emit_event(
+                                out_tx,
+                                req_id,
+                                "artifact_created",
+                                json!({
+                                    "kind": "document",
+                                    "title": doc_title,
+                                    "path": art.docx_path,
+                                }),
+                            );
+                            (true, serde_json::to_value(art).unwrap_or_else(|_| json!({})))
+                        }
+                        Err(e) => (false, json!({ "error": e })),
+                    }
+                }
+                Err(e) => (false, json!({ "error": format!("Invalid document spec: {e}") })),
+            };
+            emit_event(
+                out_tx,
+                req_id,
+                "tool_event",
+                json!({ "callId": call_id, "phase": "done", "name": name, "ok": ok, "output": output }),
+            );
+            json!({ "ok": ok, "result": output })
+        }
+        "render_ui_widget" => {
+            let title = args
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Interactive Widget");
+            let html = args.get("html").and_then(|v| v.as_str()).unwrap_or("");
+            emit_event(
+                out_tx,
+                req_id,
+                "artifact_created",
+                json!({
+                    "kind": "gen_ui",
+                    "title": title,
+                    "html": html,
+                }),
+            );
+            json!({ "ok": true, "result": { "rendered": true, "title": title } })
+        }
+        "web_search" => {
+            emit_event(
+                out_tx,
+                req_id,
+                "tool_event",
+                json!({ "callId": call_id, "phase": "start", "name": name, "args": args }),
+            );
+            let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
+            let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(6) as usize;
+            let key_opt = if api_key.trim().is_empty() { None } else { Some(api_key) };
+            let (ok, output) = match web_search(&state.http, query, limit, key_opt, Some(model)).await {
+                Ok(res) => (true, serde_json::to_value(res).unwrap_or_else(|_| json!({}))),
+                Err(e) => (false, json!({ "error": e })),
+            };
+            emit_event(
+                out_tx,
+                req_id,
+                "tool_event",
+                json!({ "callId": call_id, "phase": "done", "name": name, "ok": ok, "output": output }),
+            );
+            json!({ "ok": ok, "result": output })
+        }
+        "read_url_markdown" => {
+            emit_event(
+                out_tx,
+                req_id,
+                "tool_event",
+                json!({ "callId": call_id, "phase": "start", "name": name, "args": args }),
+            );
+            let url = args.get("url").and_then(|v| v.as_str()).unwrap_or("");
+            let (ok, output) = match fetch_url_as_markdown(&state.http, url, 24_000, false).await {
+                Ok(res) => (true, serde_json::to_value(res).unwrap_or_else(|_| json!({}))),
+                Err(e) => (false, json!({ "error": e })),
+            };
+            emit_event(
+                out_tx,
+                req_id,
+                "tool_event",
+                json!({ "callId": call_id, "phase": "done", "name": name, "ok": ok, "output": output }),
+            );
+            json!({ "ok": ok, "result": output })
+        }
+        "search_docs" => {
+            emit_event(
+                out_tx,
+                req_id,
+                "tool_event",
+                json!({ "callId": call_id, "phase": "start", "name": name, "args": args }),
+            );
+            let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
+            let source = args.get("source").and_then(|v| v.as_str());
+            let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(6) as usize;
+            let (ok, output) = match state.docs_index.search_docs(query, source, limit) {
+                Ok(hits) => (true, json!({ "hits": hits })),
+                Err(e) => (false, json!({ "error": e })),
+            };
+            emit_event(
+                out_tx,
+                req_id,
+                "tool_event",
+                json!({ "callId": call_id, "phase": "done", "name": name, "ok": ok, "output": output }),
+            );
+            json!({ "ok": ok, "result": output })
+        }
         "edit_file" | "write_file" | "run_command" | "inspect_web_page" => {
             let (tx, rx) = oneshot::channel::<ToolResultPayload>();
             state.pending_tools.lock().await.insert(call_id.to_string(), tx);
@@ -2463,6 +3249,185 @@ fn agent_tool_declarations(mcp_decls: &[Value]) -> Vec<Value> {
                     "clone_id": { "type": "STRING", "description": "Clone ID returned by create_cow_clone." }
                 },
                 "required": ["clone_id"]
+            }
+        }),
+        json!({
+            "name": "spawn_worker_swarm",
+            "description": "Decompose a complex multi-part goal into a topological DAG of autonomous tool-using worker agents running in parallel APFS Copy-on-Write workspace clones.",
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {
+                    "goal": { "type": "STRING", "description": "High-level engineering goal to decompose and execute in parallel." },
+                    "max_parallel_workers": { "type": "INTEGER", "description": "Max concurrent worker agents (default 3)." }
+                },
+                "required": ["goal"]
+            }
+        }),
+        json!({
+            "name": "browser_navigate",
+            "description": "Navigate Rursor's real Chromium CDP browser to an HTTP/HTTPS URL (including localhost dev servers).",
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {
+                    "url": { "type": "STRING", "description": "Target http:// or https:// URL." },
+                    "viewportWidth": { "type": "INTEGER", "description": "Optional viewport width (default 1280)." },
+                    "viewportHeight": { "type": "INTEGER", "description": "Optional viewport height (default 800)." }
+                },
+                "required": ["url"]
+            }
+        }),
+        json!({
+            "name": "browser_snapshot",
+            "description": "Capture a Set-of-Mark [1..N] interactive element list, page text summary, and screenshot from Rursor's Chromium CDP browser.",
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {
+                    "drawSomBadges": { "type": "BOOLEAN", "description": "Draw numbered [1][2] visual badges on interactive elements." },
+                    "includeScreenshot": { "type": "BOOLEAN", "description": "Capture base64 PNG screenshot." }
+                }
+            }
+        }),
+        json!({
+            "name": "browser_act",
+            "description": "Interact with Rursor's Chromium CDP browser (`click`, `type`, `scroll`, `evaluate`, `clear_overlay`).",
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {
+                    "action": {
+                        "type": "OBJECT",
+                        "description": "Action object with `kind` ('click' | 'type' | 'scroll' | 'evaluate' | 'clear_overlay'), optional `somId`, `selector`, `text`, `pressEnter`."
+                    }
+                },
+                "required": ["action"]
+            }
+        }),
+        json!({
+            "name": "browser_record_walkthrough",
+            "description": "Execute a sequence of browser steps and encode an .mp4 video walkthrough proof.",
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {
+                    "outputMp4Path": { "type": "STRING", "description": "Output .mp4 path (e.g. .rursor/artifacts/demo.mp4)." },
+                    "steps": { "type": "ARRAY", "description": "Array of walkthrough step objects (navigate, click, type, scroll, wait_ms)." }
+                },
+                "required": ["steps"]
+            }
+        }),
+        json!({
+            "name": "create_presentation",
+            "description": "Generate both a native editable Microsoft PowerPoint (.pptx) deck and an interactive HTML5 slide deck (.deck.html).",
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {
+                    "title": { "type": "STRING", "description": "Presentation title." },
+                    "subtitle": { "type": "STRING", "description": "Presentation subtitle." },
+                    "author": { "type": "STRING", "description": "Author or team name." },
+                    "theme": { "type": "STRING", "description": "'obsidian', 'executive', or 'minimal'." },
+                    "outputPath": { "type": "STRING", "description": "Workspace-relative .pptx path (e.g. decks/roadmap.pptx)." },
+                    "slides": { "type": "ARRAY", "description": "Array of slide objects ({ layout, title, subtitle, bullets, rightBullets, metrics, code, speakerNotes })." }
+                },
+                "required": ["title", "outputPath", "slides"]
+            }
+        }),
+        json!({
+            "name": "create_explainer_video",
+            "description": "Render an H.264 .mp4 explainer/product video on macOS with scene cards, code snippets, and optional synthesized voiceover narration.",
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {
+                    "title": { "type": "STRING", "description": "Video title." },
+                    "outputPath": { "type": "STRING", "description": "Workspace-relative .mp4 path (e.g. videos/overview.mp4)." },
+                    "scenes": { "type": "ARRAY", "description": "Array of scenes ({ heading, subheading, bullets, codeSnippet, narration, durationSecs, accentHex })." }
+                },
+                "required": ["title", "outputPath", "scenes"]
+            }
+        }),
+        json!({
+            "name": "generate_image",
+            "description": "Generate a PNG/SVG illustration, UI mockup, or diagram card into the workspace.",
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {
+                    "prompt": { "type": "STRING", "description": "Visual prompt or diagram heading." },
+                    "outputPath": { "type": "STRING", "description": "Workspace-relative .png path (e.g. assets/hero.png)." },
+                    "subtitle": { "type": "STRING", "description": "Optional subtitle for local card fallback." },
+                    "bullets": { "type": "ARRAY", "description": "Optional key points for architecture/card rendering." }
+                },
+                "required": ["prompt", "outputPath"]
+            }
+        }),
+        json!({
+            "name": "create_spreadsheet",
+            "description": "Create a native Excel (.xlsx) workbook with multiple sheets, numbers, and live Excel formulas (=SUM, =AVERAGE).",
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {
+                    "outputPath": { "type": "STRING", "description": "Workspace-relative .xlsx path (e.g. reports/metrics.xlsx)." },
+                    "sheets": { "type": "ARRAY", "description": "Array of { name, headers, rows } sheet objects." }
+                },
+                "required": ["outputPath", "sheets"]
+            }
+        }),
+        json!({
+            "name": "create_document",
+            "description": "Create a native Microsoft Word (.docx) document with headings, paragraphs, bullets, code blocks, and tables.",
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {
+                    "title": { "type": "STRING", "description": "Document title." },
+                    "subtitle": { "type": "STRING", "description": "Document subtitle." },
+                    "outputPath": { "type": "STRING", "description": "Workspace-relative .docx path (e.g. docs/rfc.docx)." },
+                    "sections": { "type": "ARRAY", "description": "Array of { heading, paragraphs, bullets, codeBlock, table } sections." }
+                },
+                "required": ["title", "outputPath", "sections"]
+            }
+        }),
+        json!({
+            "name": "render_ui_widget",
+            "description": "Render an interactive sandboxed HTML/SVG/Chart/Canvas Generative UI widget inline inside the Rursor Agent chat.",
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {
+                    "title": { "type": "STRING", "description": "Short widget title." },
+                    "html": { "type": "STRING", "description": "Self-contained HTML/CSS/JS body or document to render interactively." }
+                },
+                "required": ["title", "html"]
+            }
+        }),
+        json!({
+            "name": "web_search",
+            "description": "Search the live web using Gemini Google Search Grounding (with keyless fallback) and return cited answers.",
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {
+                    "query": { "type": "STRING", "description": "Web search query." },
+                    "limit": { "type": "INTEGER", "description": "Max citations to return (default 6)." }
+                },
+                "required": ["query"]
+            }
+        }),
+        json!({
+            "name": "read_url_markdown",
+            "description": "Fetch an external HTTP/HTTPS documentation page or article and convert it into clean Markdown.",
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {
+                    "url": { "type": "STRING", "description": "HTTP/HTTPS URL to read." }
+                },
+                "required": ["url"]
+            }
+        }),
+        json!({
+            "name": "search_docs",
+            "description": "Search persistent @docs documentation sites indexed into Rursor's hybrid FTS5 + vector store.",
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {
+                    "query": { "type": "STRING", "description": "Documentation search query." },
+                    "source": { "type": "STRING", "description": "Optional @docs source handle filter." },
+                    "limit": { "type": "INTEGER", "description": "Max chunks to return (default 6)." }
+                },
+                "required": ["query"]
             }
         }),
     ];
