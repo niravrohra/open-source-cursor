@@ -116,7 +116,7 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
     private readonly extensionUri: vscode.Uri,
     private readonly onModelChange: (model: string) => Promise<void>,
     private readonly deps?: AgentPanelDeps
-  ) {}
+  ) { }
 
   public async submitExternalPrompt(
     prompt: string,
@@ -1788,7 +1788,7 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
   function updateMentionState() {
     const cursor = promptEl.selectionStart ?? promptEl.value.length;
     const beforeCursor = promptEl.value.slice(0, cursor);
-    const slashMatch = beforeCursor.match(/^\\/([a-zA-Z0-9_-]*)$/);
+    const slashMatch = beforeCursor.match(new RegExp('^/([a-zA-Z0-9_-]*)$'));
     if (slashMatch) {
       const q = (slashMatch[1] || '').toLowerCase();
       mentionStart = 0;
