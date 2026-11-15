@@ -3,6 +3,7 @@ import * as path from 'node:path';
 import { spawn } from 'node:child_process';
 import * as vscode from 'vscode';
 import { SidecarClient, ToolEventPayload, ToolRequestPayload } from './sidecarClient';
+import { inspectWebUrl, RursorWebPreviewPanel } from './webPreview';
 
 interface ImageAttachment {
   mimeType: string;
@@ -99,6 +100,7 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
   constructor(
     private readonly client: SidecarClient,
     private readonly diffProvider: RursorDiffContentProvider,
+    private readonly extensionUri: vscode.Uri,
     private readonly onModelChange: (model: string) => Promise<void>
   ) {}
 
@@ -117,15 +119,17 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
         includeWorkspace?: boolean;
         includeGitDiff?: boolean;
         autoApply?: boolean;
+        autoVerify?: boolean;
         callId?: string;
         filePath?: string;
         code?: string;
         sessionId?: string;
+        checkpointId?: string;
       }) => {
         if (msg.type === 'webviewReady') {
           this.syncContextBar();
           this.syncReviewBar();
-          await Promise.all([this.refreshSessions(), this.refreshStatus()]);
+          await Promise.all([this.refreshSessions(), this.refreshStatus(), this.sendSkillsList()]);
         } else if (
           msg.type === 'send' &&
           (Boolean(msg.text) || (Array.isArray(msg.images) && msg.images.length > 0))
@@ -137,6 +141,7 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
             Boolean(msg.includeWorkspace),
             Boolean(msg.includeGitDiff),
             Boolean(msg.autoApply),
+            Boolean(msg.autoVerify),
             msg.model
           );
         } else if (msg.type === 'stop') {
@@ -163,6 +168,12 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
           this.syncContextBar();
         } else if (msg.type === 'listFiles') {
           await this.sendFilesList();
+        } else if (msg.type === 'listSkills') {
+          await this.sendSkillsList();
+        } else if (msg.type === 'openPreview') {
+          RursorWebPreviewPanel.createOrShow(this.extensionUri);
+        } else if (msg.type === 'restoreCheckpoint' && msg.checkpointId) {
+          await this.restoreCheckpoint(msg.checkpointId);
         } else if (msg.type === 'editDecision' && msg.callId) {
           const snap = this.editSnapshots.get(msg.callId);
           snap?.resolveDecision?.(msg.text === 'approve');
@@ -332,6 +343,48 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
     void this.view?.webview.postMessage({ type: 'done' });
   }
 
+  private async sendSkillsList(): Promise<void> {
+    try {
+      const { promise } = this.client.request<{
+        skills: Array<{ name: string; description: string; source: string }>;
+      }>('list_skills');
+      const res = await promise;
+      void this.view?.webview.postMessage({
+        type: 'skillsList',
+        skills: res.skills ?? [],
+      });
+    } catch {
+      void this.view?.webview.postMessage({
+        type: 'skillsList',
+        skills: [],
+      });
+    }
+  }
+
+  private async restoreCheckpoint(checkpointId: string): Promise<void> {
+    try {
+      const { promise } = this.client.request<{
+        restored: { checkpointId: string; restoredFiles: string[]; removedFiles: string[] };
+      }>('restore_checkpoint', { checkpointId });
+      const res = await promise;
+      const restoredCount = (res.restored?.restoredFiles?.length ?? 0) + (res.restored?.removedFiles?.length ?? 0);
+      this.editSnapshots.clear();
+      this.syncReviewBar();
+      vscode.window.showInformationMessage(
+        `Rursor restored checkpoint ${checkpointId} (${restoredCount} file change(s) reverted).`
+      );
+      void this.view?.webview.postMessage({
+        type: 'checkpointRestored',
+        checkpointId,
+        restoredCount,
+      });
+    } catch (err) {
+      vscode.window.showErrorMessage(
+        `Failed to restore checkpoint: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+  }
+
   private async sendFilesList(): Promise<void> {
     try {
       const { promise } = this.client.request<{ files: string[] }>('list_files', { limit: 600 });
@@ -433,6 +486,7 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
     includeWorkspace: boolean,
     includeGitDiff: boolean,
     autoApply: boolean,
+    autoVerify: boolean,
     model?: string
   ): Promise<void> {
     const turn: ChatTurn = {
@@ -474,6 +528,8 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
     }
 
     const diagnostics = collectWorkspaceDiagnostics();
+    const cfg = vscode.workspace.getConfiguration('rursor');
+    const thinkingBudget = cfg.get<number>('agent.thinkingBudget', 0);
 
     const { id, promise } = this.client.request<{ text: string }>(
       'agent_chat',
@@ -488,6 +544,8 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
         diagnostics,
         useWorkspaceSearch: includeWorkspace,
         includeGitDiff,
+        autoVerify: autoVerify || cfg.get<boolean>('agent.autoVerify', false),
+        thinkingBudget: thinkingBudget > 0 ? thinkingBudget : undefined,
         mode,
         model,
       },
@@ -500,6 +558,12 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
         },
         onToolRequest: (req) => {
           void this.handleToolRequest(req, autoApply);
+        },
+        onCheckpointCreated: (checkpoint) => {
+          void this.view?.webview.postMessage({ type: 'checkpointCreated', checkpoint });
+        },
+        onSubagentEvent: (payload) => {
+          void this.view?.webview.postMessage({ type: 'subagentEvent', payload });
         },
       }
     );
@@ -544,9 +608,66 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
       return;
     }
 
+    if (req.name === 'inspect_web_page') {
+      await this.handleInspectWebPageRequest(req);
+      return;
+    }
+
     await this.client.submitToolResult(req.callId, false, {
       error: `Unsupported tool request: ${req.name}`,
     });
+  }
+
+  private async handleInspectWebPageRequest(req: ToolRequestPayload): Promise<void> {
+    const rawUrl = String(req.args.url ?? 'http://localhost:3000');
+    const openPreview = Boolean(req.args.open_preview ?? true);
+
+    void this.view?.webview.postMessage({
+      type: 'toolEvent',
+      payload: {
+        callId: req.callId,
+        phase: 'start',
+        name: 'inspect_web_page',
+        args: { path: rawUrl },
+      },
+    });
+
+    try {
+      if (openPreview) {
+        RursorWebPreviewPanel.createOrShow(this.extensionUri, rawUrl);
+      }
+      const inspection = await inspectWebUrl(rawUrl);
+      void this.view?.webview.postMessage({
+        type: 'toolEvent',
+        payload: {
+          callId: req.callId,
+          phase: 'done',
+          name: 'inspect_web_page',
+          ok: inspection.ok,
+          output: { status: inspection.status, title: inspection.title },
+        },
+      });
+      await this.client.submitToolResult(req.callId, true, {
+        url: inspection.url,
+        status: inspection.status,
+        title: inspection.title,
+        errors: inspection.errors,
+        textSummary: inspection.textSummary,
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      void this.view?.webview.postMessage({
+        type: 'toolEvent',
+        payload: {
+          callId: req.callId,
+          phase: 'done',
+          name: 'inspect_web_page',
+          ok: false,
+          output: { error: message },
+        },
+      });
+      await this.client.submitToolResult(req.callId, false, { error: message });
+    }
   }
 
   private async handleFileMutationRequest(
@@ -766,13 +887,50 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
       status: 'running',
     });
 
-    const result = await executeShellCommand(command, root, (chunk) => {
-      void this.view?.webview.postMessage({
-        type: 'toolCardStream',
-        callId: req.callId,
-        chunk,
+    const usePty = vscode.workspace
+      .getConfiguration('rursor')
+      .get<boolean>('agent.usePty', true);
+
+    let result: { exitCode: number; combinedOutput: string };
+    if (usePty) {
+      try {
+        const { promise } = this.client.request<{ exitCode: number; output: string }>(
+          'run_pty_command',
+          { command, cwd: root, timeoutSecs: 60 },
+          {
+            onPtyChunk: (chunk) => {
+              void this.view?.webview.postMessage({
+                type: 'toolCardStream',
+                callId: req.callId,
+                chunk,
+              });
+            },
+          }
+        );
+        const ptyRes = await promise;
+        result = {
+          exitCode: ptyRes.exitCode ?? 1,
+          combinedOutput: ptyRes.output ?? '(no output)',
+        };
+      } catch {
+        result = await executeShellCommand(command, root, (chunk) => {
+          void this.view?.webview.postMessage({
+            type: 'toolCardStream',
+            callId: req.callId,
+            chunk,
+          });
+        });
+      }
+    } else {
+      result = await executeShellCommand(command, root, (chunk) => {
+        void this.view?.webview.postMessage({
+          type: 'toolCardStream',
+          callId: req.callId,
+          chunk,
+        });
       });
-    });
+    }
+
     void this.view?.webview.postMessage({
       type: 'toolCardUpdate',
       callId: req.callId,
@@ -1165,10 +1323,15 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
       <option value="agent">Agent</option>
       <option value="ask">Ask</option>
     </select>
-    <select id="model" title="Gemini Model">
-      <option value="gemini-2.5-flash">gemini-2.5-flash</option>
+    <select id="model" title="Model / Smart Router">
+      <option value="auto">Auto (Smart Router)</option>
+      <option value="gemini-2.5-flash" selected>gemini-2.5-flash</option>
       <option value="gemini-2.5-pro">gemini-2.5-pro</option>
       <option value="gemini-2.5-flash-lite">gemini-2.5-flash-lite</option>
+      <option value="claude-sonnet-4-20250514">claude-sonnet-4</option>
+      <option value="claude-3-5-haiku-latest">claude-3.5-haiku</option>
+      <option value="gpt-4o-mini">gpt-4o-mini</option>
+      <option value="o3-mini">o3-mini</option>
     </select>
     <button id="keyBtn">API Key</button>
     <button id="clearBtn">Clear</button>
@@ -1185,17 +1348,19 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
     <div class="chips" id="chips">
       <button id="addFileBtn" type="button">+ File</button>
       <button id="addImgBtn" type="button">+ Img</button>
+      <button id="previewBtn" type="button" title="Open Web Preview">Preview</button>
       <input type="file" id="imgFileInput" accept="image/*" multiple hidden />
     </div>
     <div class="composer-wrap">
       <div id="mentionPopover" class="mention-popover" hidden></div>
-      <textarea id="prompt" placeholder="Ask or instruct Rursor Agent (type @ for context, paste images, Enter to send)…"></textarea>
+      <textarea id="prompt" placeholder="Ask or instruct Rursor Agent (type @ for context, / for skills, paste images)…"></textarea>
     </div>
     <div class="row">
       <div class="toggles">
         <label><input type="checkbox" id="wsCheck" checked /> @workspace</label>
         <label title="Include git status and diff in this turn"><input type="checkbox" id="gitCheck" /> @git</label>
         <label title="Automatically apply agent file edits without prompting"><input type="checkbox" id="autoApplyCheck" /> Auto-apply</label>
+        <label title="Run project tests/typecheck after edits and auto-fix failures"><input type="checkbox" id="autoVerifyCheck" /> Auto-verify</label>
       </div>
       <div>
         <button id="stopBtn">Stop</button>
@@ -1219,6 +1384,7 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
   const wsEl = document.getElementById('wsCheck');
   const gitEl = document.getElementById('gitCheck');
   const autoApplyEl = document.getElementById('autoApplyCheck');
+  const autoVerifyEl = document.getElementById('autoVerifyCheck');
   const chipsEl = document.getElementById('chips');
   const imgFileInput = document.getElementById('imgFileInput');
   const sessionSelectEl = document.getElementById('sessionSelect');
@@ -1240,6 +1406,7 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
   let pendingImages = [];
 
   let cachedFiles = [];
+  let cachedSkills = [];
   let filesRequested = false;
   let mentionOpen = false;
   let mentionStart = -1;
@@ -1351,9 +1518,11 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
 
     const addFileBtn = document.getElementById('addFileBtn');
     const addImgBtn = document.getElementById('addImgBtn');
+    const previewBtn = document.getElementById('previewBtn');
     chipsEl.innerHTML = '';
     chipsEl.appendChild(addFileBtn);
     chipsEl.appendChild(addImgBtn);
+    chipsEl.appendChild(previewBtn);
     chipsEl.appendChild(imgFileInput);
 
     if (lastActiveFile) {
@@ -1511,6 +1680,8 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
     } else if (item.kind === 'file') {
       vscode.postMessage({ type: 'attachFile', filePath: item.path });
       inserted = '';
+    } else if (item.kind === 'skill') {
+      inserted = item.label + ' ';
     }
     promptEl.value = before + inserted + after;
     const nextPos = before.length + inserted.length;
@@ -1522,6 +1693,33 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
   function updateMentionState() {
     const cursor = promptEl.selectionStart ?? promptEl.value.length;
     const beforeCursor = promptEl.value.slice(0, cursor);
+    const slashMatch = beforeCursor.match(/^\/([a-zA-Z0-9_-]*)$/);
+    if (slashMatch) {
+      const q = (slashMatch[1] || '').toLowerCase();
+      mentionStart = 0;
+      mentionOpen = true;
+      const skills = cachedSkills.length > 0 ? cachedSkills : [
+        { name: 'review', description: 'Code review' },
+        { name: 'test', description: 'Write & run tests' },
+        { name: 'fix', description: 'Fix diagnostics/bugs' },
+        { name: 'commit', description: 'Summarize git changes' },
+        { name: 'explain', description: 'Explain code' },
+      ];
+      mentionItems = skills
+        .map((s) => ({
+          item: { kind: 'skill', label: '/' + s.name, detail: s.description || 'Skill' },
+          score: fuzzyScore(q, s.name),
+        }))
+        .filter((x) => x.score > 0)
+        .sort((a, b) => b.score - a.score)
+        .map((x) => x.item);
+      if (mentionIndex >= mentionItems.length) {
+        mentionIndex = 0;
+      }
+      renderMentionPopover();
+      return;
+    }
+
     const match = beforeCursor.match(/(?:^|\\s)@([^\\s@]*)$/);
     if (!match) {
       closeMentionPopover();
@@ -1567,6 +1765,7 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
       includeWorkspace,
       includeGitDiff,
       autoApply: autoApplyEl.checked,
+      autoVerify: autoVerifyEl.checked,
     });
   }
 
@@ -1588,6 +1787,7 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
   document.getElementById('keyBtn').onclick = () => vscode.postMessage({ type: 'setKey' });
   document.getElementById('addFileBtn').onclick = () => vscode.postMessage({ type: 'pickFile' });
   document.getElementById('addImgBtn').onclick = () => imgFileInput.click();
+  document.getElementById('previewBtn').onclick = () => vscode.postMessage({ type: 'openPreview' });
   imgFileInput.onchange = () => {
     for (const file of imgFileInput.files || []) {
       readImageFile(file);
@@ -1738,6 +1938,7 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
   window.decideEdit = (callId, decision) => vscode.postMessage({ type: 'editDecision', callId, text: decision });
   window.revertEdit = (callId) => vscode.postMessage({ type: 'revertEdit', callId });
   window.decideCmd = (callId, decision) => vscode.postMessage({ type: 'commandDecision', callId, text: decision });
+  window.restoreCheckpoint = (checkpointId) => vscode.postMessage({ type: 'restoreCheckpoint', checkpointId });
 
   window.addEventListener('message', (event) => {
     const msg = event.data;
@@ -1769,6 +1970,30 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
       if (mentionOpen) {
         updateMentionState();
       }
+    } else if (msg.type === 'skillsList') {
+      cachedSkills = Array.isArray(msg.skills) ? msg.skills : [];
+    } else if (msg.type === 'checkpointCreated' && msg.checkpoint) {
+      const cp = msg.checkpoint;
+      const pill = document.createElement('div');
+      pill.className = 'tool-pill';
+      pill.innerHTML =
+        '<span>Checkpoint: ' + escHtml(cp.label || cp.checkpointId) + ' (' + (cp.fileCount || 0) + ' files)</span> ' +
+        '<button onclick="restoreCheckpoint(\\'' + escHtml(cp.checkpointId) + '\\')">Restore</button>';
+      messagesEl.appendChild(pill);
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+    } else if (msg.type === 'checkpointRestored') {
+      const pill = document.createElement('div');
+      pill.className = 'tool-pill';
+      pill.textContent = 'Restored checkpoint ' + (msg.checkpointId || '') + ' (' + (msg.restoredCount || 0) + ' change(s)) ✓';
+      messagesEl.appendChild(pill);
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+    } else if (msg.type === 'subagentEvent' && msg.payload) {
+      const ev = msg.payload;
+      const pill = document.createElement('div');
+      pill.className = 'tool-pill';
+      pill.textContent = 'Subagent [' + (ev.taskId || 'task') + ']: ' + (ev.status || '');
+      messagesEl.appendChild(pill);
+      messagesEl.scrollTop = messagesEl.scrollHeight;
     } else if (msg.type === 'sessionsSync') {
       renderSessions(msg.sessions, msg.currentSessionId);
     } else if (msg.type === 'sessionLoaded') {

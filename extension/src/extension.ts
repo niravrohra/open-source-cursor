@@ -1,10 +1,13 @@
 import * as vscode from 'vscode';
 import { AgentPanelProvider, RursorDiffContentProvider } from './agentPanel';
-import { RursorInlineCompletionProvider } from './inlineCompletion';
+import { registerInlineCompletionCommands, RursorInlineCompletionProvider } from './inlineCompletion';
 import { InlineEditSessionManager, RursorCodeActionProvider } from './inlineEdit';
 import { SidecarClient } from './sidecarClient';
+import { RursorWebPreviewPanel } from './webPreview';
 
 const SECRET_GEMINI_KEY = 'rursor.geminiApiKey';
+const SECRET_ANTHROPIC_KEY = 'rursor.anthropicApiKey';
+const SECRET_OPENAI_KEY = 'rursor.openaiApiKey';
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   const client = new SidecarClient(context.extensionPath);
@@ -34,20 +37,32 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
   const syncConfig = async (modelOverride?: string): Promise<void> => {
     const cfg = vscode.workspace.getConfiguration('rursor');
-    const apiKey = await context.secrets.get(SECRET_GEMINI_KEY);
+    const [apiKey, anthropicApiKey, openaiApiKey] = await Promise.all([
+      context.secrets.get(SECRET_GEMINI_KEY),
+      context.secrets.get(SECRET_ANTHROPIC_KEY),
+      context.secrets.get(SECRET_OPENAI_KEY),
+    ]);
     const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
     const model = modelOverride ?? cfg.get<string>('defaultModel', 'gemini-2.5-flash');
     const autocompleteModel = cfg.get<string>('autocomplete.model', 'gemini-2.5-flash-lite');
     const autocompleteBackend = cfg.get<string>('autocomplete.backend', 'gemini');
     const localEndpoint = cfg.get<string>('autocomplete.localEndpoint', 'http://127.0.0.1:11434');
     const localModel = cfg.get<string>('autocomplete.localModel', 'qwen2.5-coder:7b');
+    const thinkingBudget = cfg.get<number>('agent.thinkingBudget', 0);
+    const enablePromptCache = cfg.get<boolean>('agent.promptCache', true);
+    const autoVerify = cfg.get<boolean>('agent.autoVerify', false);
     const { promise } = client.request('set_config', {
       apiKey,
+      anthropicApiKey,
+      openaiApiKey,
       model,
       autocompleteModel,
       autocompleteBackend,
       localEndpoint,
       localModel,
+      thinkingBudget,
+      enablePromptCache,
+      autoVerify,
       workspaceRoot,
     });
     await promise.catch(() => undefined);
@@ -78,8 +93,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     completionProvider,
     vscode.languages.registerInlineCompletionItemProvider({ pattern: '**' }, completionProvider)
   );
+  registerInlineCompletionCommands(context, completionProvider);
 
-  agentProvider = new AgentPanelProvider(client, diffProvider, async (model) => {
+  agentProvider = new AgentPanelProvider(client, diffProvider, context.extensionUri, async (model) => {
     await syncConfig(model);
   });
   context.subscriptions.push(
@@ -132,6 +148,34 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       await syncConfig();
       vscode.window.showInformationMessage('Rursor: Gemini API key saved.');
     }),
+    vscode.commands.registerCommand('rursor.setAnthropicApiKey', async () => {
+      const key = await vscode.window.showInputBox({
+        title: 'Set Anthropic API Key (Optional BYOK)',
+        prompt: 'Stored securely in your OS keychain via VS Code SecretStorage',
+        password: true,
+        ignoreFocusOut: true,
+      });
+      if (key === undefined) {
+        return;
+      }
+      await context.secrets.store(SECRET_ANTHROPIC_KEY, key.trim());
+      await syncConfig();
+      vscode.window.showInformationMessage('Rursor: Anthropic API key saved.');
+    }),
+    vscode.commands.registerCommand('rursor.setOpenAiApiKey', async () => {
+      const key = await vscode.window.showInputBox({
+        title: 'Set OpenAI API Key (Optional BYOK)',
+        prompt: 'Stored securely in your OS keychain via VS Code SecretStorage',
+        password: true,
+        ignoreFocusOut: true,
+      });
+      if (key === undefined) {
+        return;
+      }
+      await context.secrets.store(SECRET_OPENAI_KEY, key.trim());
+      await syncConfig();
+      vscode.window.showInformationMessage('Rursor: OpenAI API key saved.');
+    }),
     vscode.commands.registerCommand('rursor.status', async () => {
       const { promise } = client.request('status');
       const status = await promise;
@@ -149,8 +193,125 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       const res = await promise;
       vscode.window.showInformationMessage(`Rursor indexed ${res.indexedFiles} files.`);
     }),
-    vscode.commands.registerCommand('rursor.inlineEdit', async () => {
-      await inlineEditManager.runInlineEdit();
+    vscode.commands.registerCommand('rursor.inlineEdit', async (arg?: unknown) => {
+      await inlineEditManager.runInlineEdit(
+        arg as
+          | string
+          | {
+              prompt?: string;
+              range?: {
+                startLineNumber: number;
+                startColumn: number;
+                endLineNumber: number;
+                endColumn: number;
+              };
+              uri?: string;
+            }
+          | undefined
+      );
+    }),
+    vscode.commands.registerCommand('rursor.openPreview', () => {
+      RursorWebPreviewPanel.createOrShow(context.extensionUri);
+    }),
+    vscode.commands.registerCommand('rursor.restoreCheckpoint', async () => {
+      try {
+        const { promise } = client.request<{
+          checkpoints: Array<{ checkpointId: string; label: string; fileCount: number }>;
+        }>('list_checkpoints');
+        const res = await promise;
+        const checkpoints = res.checkpoints ?? [];
+        if (checkpoints.length === 0) {
+          vscode.window.showInformationMessage('No Rursor checkpoints saved yet.');
+          return;
+        }
+        const picked = await vscode.window.showQuickPick(
+          checkpoints.map((cp) => ({
+            label: cp.label,
+            description: `${cp.fileCount} files (${cp.checkpointId})`,
+            checkpointId: cp.checkpointId,
+          })),
+          { placeHolder: 'Select checkpoint to restore' }
+        );
+        if (!picked) {
+          return;
+        }
+        await client.request('restore_checkpoint', { checkpointId: picked.checkpointId }).promise;
+        vscode.window.showInformationMessage(`Restored checkpoint: ${picked.label}`);
+      } catch (err) {
+        vscode.window.showErrorMessage(
+          `Failed to restore checkpoint: ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
+    }),
+    vscode.commands.registerCommand('rursor.manageWorktrees', async () => {
+      try {
+        const action = await vscode.window.showQuickPick(
+          ['Create Worktree Sandbox', 'Diff Worktree', 'Merge Worktree', 'Remove Worktree'],
+          { placeHolder: 'Rursor Git Worktree Sandboxes' }
+        );
+        if (!action) {
+          return;
+        }
+        if (action === 'Create Worktree Sandbox') {
+          const taskName = await vscode.window.showInputBox({
+            title: 'Create Git Worktree Sandbox',
+            prompt: 'Short task slug (e.g. feat-auth)',
+          });
+          if (!taskName?.trim()) {
+            return;
+          }
+          const { promise } = client.request<{ worktree: { path: string; branch?: string } }>(
+            'create_worktree',
+            { taskName: taskName.trim() }
+          );
+          const created = await promise;
+          vscode.window.showInformationMessage(
+            `Created worktree at ${created.worktree.path} (${created.worktree.branch ?? ''})`
+          );
+          return;
+        }
+        const { promise: listPromise } = client.request<{
+          worktrees: Array<{ path: string; branch?: string; isMain: boolean }>;
+        }>('list_worktrees');
+        const listRes = await listPromise;
+        const candidates = (listRes.worktrees ?? []).filter((w) => !w.isMain);
+        if (candidates.length === 0) {
+          vscode.window.showInformationMessage('No secondary git worktree sandboxes found.');
+          return;
+        }
+        const picked = await vscode.window.showQuickPick(
+          candidates.map((w) => ({
+            label: w.branch ?? w.path,
+            description: w.path,
+            worktree: w,
+          })),
+          { placeHolder: `Select worktree for: ${action}` }
+        );
+        if (!picked) {
+          return;
+        }
+        if (action === 'Diff Worktree') {
+          const { promise } = client.request<{ diff: string }>('diff_worktree', {
+            worktreePath: picked.worktree.path,
+          });
+          const res = await promise;
+          const doc = await vscode.workspace.openTextDocument({
+            content: res.diff || '(no changes)',
+            language: 'diff',
+          });
+          await vscode.window.showTextDocument(doc);
+        } else if (action === 'Merge Worktree' && picked.worktree.branch) {
+          await client.request('merge_worktree', { branchName: picked.worktree.branch }).promise;
+          vscode.window.showInformationMessage(`Merged worktree branch ${picked.worktree.branch}.`);
+        } else if (action === 'Remove Worktree') {
+          await client.request('remove_worktree', { worktreePath: picked.worktree.path }).promise;
+          vscode.window.showInformationMessage(`Removed worktree ${picked.worktree.path}.`);
+        }
+      } catch (err) {
+        vscode.window.showErrorMessage(
+          `Worktree error: ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
     }),
     vscode.commands.registerCommand('rursor.fixDiagnostics', async () => {
       await inlineEditManager.runInlineEdit('Fix the diagnostics in this code');

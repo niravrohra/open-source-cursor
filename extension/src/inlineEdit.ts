@@ -65,7 +65,20 @@ export class InlineEditSessionManager implements vscode.CodeLensProvider, vscode
     ];
   }
 
-  async runInlineEdit(presetInstruction?: string): Promise<void> {
+  async runInlineEdit(
+    presetOrBridge?:
+      | string
+      | {
+          prompt?: string;
+          range?: {
+            startLineNumber: number;
+            startColumn: number;
+            endLineNumber: number;
+            endColumn: number;
+          };
+          uri?: string;
+        }
+  ): Promise<void> {
     const editor = vscode.window.activeTextEditor;
     if (!editor) {
       vscode.window.showWarningMessage('Open a file to run Rursor Inline Edit.');
@@ -77,12 +90,41 @@ export class InlineEditSessionManager implements vscode.CodeLensProvider, vscode
     }
 
     const doc = editor.document;
-    const selection = editor.selection.isEmpty
-      ? new vscode.Selection(
-          new vscode.Position(editor.selection.active.line, 0),
-          doc.lineAt(editor.selection.active.line).range.end
-        )
-      : editor.selection;
+    let selection: vscode.Selection;
+    let presetInstruction: string | undefined;
+
+    if (typeof presetOrBridge === 'string') {
+      presetInstruction = presetOrBridge;
+      selection = editor.selection.isEmpty
+        ? new vscode.Selection(
+            new vscode.Position(editor.selection.active.line, 0),
+            doc.lineAt(editor.selection.active.line).range.end
+          )
+        : editor.selection;
+    } else if (presetOrBridge && typeof presetOrBridge === 'object') {
+      presetInstruction = presetOrBridge.prompt;
+      if (presetOrBridge.range) {
+        const r = presetOrBridge.range;
+        selection = new vscode.Selection(
+          new vscode.Position(Math.max(0, r.startLineNumber - 1), Math.max(0, r.startColumn - 1)),
+          new vscode.Position(Math.max(0, r.endLineNumber - 1), Math.max(0, r.endColumn - 1))
+        );
+      } else {
+        selection = editor.selection.isEmpty
+          ? new vscode.Selection(
+              new vscode.Position(editor.selection.active.line, 0),
+              doc.lineAt(editor.selection.active.line).range.end
+            )
+          : editor.selection;
+      }
+    } else {
+      selection = editor.selection.isEmpty
+        ? new vscode.Selection(
+            new vscode.Position(editor.selection.active.line, 0),
+            doc.lineAt(editor.selection.active.line).range.end
+          )
+        : editor.selection;
+    }
 
     const matchingDiagnostics = collectDiagnosticsNearRange(doc.uri, selection);
 
@@ -236,6 +278,7 @@ export class InlineEditSessionManager implements vscode.CodeLensProvider, vscode
     this.session = undefined;
     await vscode.commands.executeCommand('setContext', 'rursor.hasActiveInlineEdit', false);
     this.onDidChangeCodeLensesEmitter.fire();
+    void Promise.resolve(vscode.commands.executeCommand('rursor.inlineEdit.hideWidget')).catch(() => undefined);
   }
 
   async revertSession(): Promise<void> {
@@ -262,6 +305,7 @@ export class InlineEditSessionManager implements vscode.CodeLensProvider, vscode
     this.session = undefined;
     await vscode.commands.executeCommand('setContext', 'rursor.hasActiveInlineEdit', false);
     this.onDidChangeCodeLensesEmitter.fire();
+    void Promise.resolve(vscode.commands.executeCommand('rursor.inlineEdit.hideWidget')).catch(() => undefined);
   }
 
   private async executeEdit(
@@ -289,15 +333,37 @@ export class InlineEditSessionManager implements vscode.CodeLensProvider, vscode
         cancellable: true,
       },
       async (_progress, token) => {
-        const { id, promise } = this.client.request<{ replacement: string }>('inline_edit', {
-          filePath: relPath,
-          languageId: doc.languageId,
-          prefix,
-          selection: selectedText,
-          suffix,
-          instruction,
-          diagnostics,
-        });
+        let streamedSoFar = '';
+        const { id, promise } = this.client.request<{ replacement: string }>(
+          'inline_edit',
+          {
+            filePath: relPath,
+            languageId: doc.languageId,
+            prefix,
+            selection: selectedText,
+            suffix,
+            instruction,
+            diagnostics,
+          },
+          (delta) => {
+            streamedSoFar += delta;
+            void Promise.resolve(
+              vscode.commands.executeCommand('rursor.inlineEdit.updateDiffPreview', {
+                startLineNumber: targetRange.start.line + 1,
+                streaming: true,
+                statusText: 'Streaming Rursor edit…',
+                hunks: [
+                  {
+                    kind: 'added',
+                    startLineNumber: targetRange.start.line + 1,
+                    endLineNumber: targetRange.end.line + 1,
+                    text: streamedSoFar,
+                  },
+                ],
+              })
+            ).catch(() => undefined);
+          }
+        );
 
         token.onCancellationRequested(() => {
           void this.client.cancel(id);

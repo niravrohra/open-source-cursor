@@ -29,6 +29,9 @@ export interface StreamCallbacks {
   onStream?: (text: string) => void;
   onToolEvent?: (payload: ToolEventPayload) => void;
   onToolRequest?: (payload: ToolRequestPayload) => void;
+  onCheckpointCreated?: (checkpoint: Record<string, unknown>) => void;
+  onSubagentEvent?: (payload: { taskId?: string; status?: string }) => void;
+  onPtyChunk?: (text: string) => void;
 }
 
 interface PendingCall {
@@ -125,6 +128,20 @@ export class SidecarClient implements vscode.Disposable {
         call.callbacks.onToolEvent?.(parsed.payload as ToolEventPayload);
       } else if (parsed.event === 'tool_request') {
         call.callbacks.onToolRequest?.(parsed.payload as ToolRequestPayload);
+      } else if (parsed.event === 'checkpoint_created') {
+        const payload = parsed.payload as { checkpoint?: Record<string, unknown> } | undefined;
+        if (payload?.checkpoint) {
+          call.callbacks.onCheckpointCreated?.(payload.checkpoint);
+        }
+      } else if (parsed.event === 'subagent_event') {
+        call.callbacks.onSubagentEvent?.(
+          (parsed.payload as { taskId?: string; status?: string }) ?? {}
+        );
+      } else if (parsed.event === 'pty_chunk') {
+        const payload = parsed.payload as { text?: string } | undefined;
+        if (payload?.text) {
+          call.callbacks.onPtyChunk?.(payload.text);
+        }
       }
       return;
     }

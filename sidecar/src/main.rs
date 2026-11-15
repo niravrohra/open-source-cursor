@@ -2,22 +2,52 @@ mod context;
 mod gemini;
 mod local_llm;
 mod mcp;
+mod memory;
+mod nes;
 mod protocol;
+mod pty_runner;
+mod router;
 mod rules;
 mod sessions;
+mod subagents;
+mod worktree;
 
 use crate::context::WorkspaceIndex;
-use crate::gemini::{chat_message_to_gemini_content, GeminiClient};
+use crate::gemini::{
+    chat_message_to_gemini_content, estimate_messages_tokens, GeminiClient, GeminiTurnOptions,
+};
 use crate::local_llm::LocalLlmClient;
 use crate::mcp::McpManager;
+use crate::memory::{
+    delete_memory, format_memory_prompt, list_skills, load_memories, resolve_slash_command,
+    save_memory,
+};
+use crate::nes::{build_nes_prompt, find_related_edit_sites, parse_nes_response};
 use crate::protocol::{
-    AgentChatParams, CancelParams, ChatMessage, GrepWorkspaceParams, IndexWorkspaceParams,
-    InlineCompleteParams, InlineEditParams, RemoveFileParams, RpcEvent, RpcRequest, RpcResponse,
-    SaveSessionParams, SearchContextParams, SessionIdParams, SetConfigParams,
-    SubmitToolResultParams, UpdateFileParams,
+    AgentChatParams, BgProcessIdParams, CancelParams, ChatMessage, CreateCheckpointParams,
+    CreateWorktreeParams, DeleteMemoryParams, FileOutlineParams, FindCallersParams,
+    GrepWorkspaceParams, IndexWorkspaceParams, InlineCompleteParams, InlineEditParams,
+    MergeWorktreeParams, NextEditPredictParams, RemoveFileParams, RestoreCheckpointParams,
+    RpcEvent, RpcRequest, RpcResponse, RunParallelSubagentsParams, RunPtyCommandParams,
+    SaveMemoryParams, SaveSessionParams, SearchContextParams, SessionIdParams, SetConfigParams,
+    StartBgProcessParams, SubmitToolResultParams, UpdateFileParams, WorktreePathParams,
+    WriteBgProcessParams,
+};
+use crate::pty_runner::{run_pty_command, PtyManager};
+use crate::router::{
+    route_task, stream_anthropic_chat, stream_openai_chat, ProviderKeys, ProviderKind, TaskKind,
 };
 use crate::rules::load_workspace_rules;
 use crate::sessions::SessionStore;
+use crate::subagents::{
+    all_verify_passed, detect_verify_commands, format_verify_feedback, run_parallel_subagents,
+    SubagentTask, VerifyResult,
+};
+use crate::worktree::{
+    create_worktree, diff_worktree, list_worktrees, merge_worktree, remove_worktree,
+    CheckpointStore,
+};
+use reqwest::Client;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -32,6 +62,8 @@ const DEFAULT_AUTOCOMPLETE_MODEL: &str = "gemini-2.5-flash-lite";
 const DEFAULT_LOCAL_ENDPOINT: &str = "http://127.0.0.1:11434";
 const DEFAULT_LOCAL_MODEL: &str = "qwen2.5-coder:7b";
 const MAX_AGENT_STEPS: usize = 16;
+const COMPACTION_TOKEN_THRESHOLD: usize = 48_000;
+const MIN_PROMPT_CACHE_CHARS: usize = 4_096;
 
 static NEXT_TOOL_CALL_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -42,17 +74,25 @@ struct ToolResultPayload {
 
 struct AppState {
     api_key: RwLock<Option<String>>,
+    anthropic_key: RwLock<Option<String>>,
+    openai_key: RwLock<Option<String>>,
     model: RwLock<String>,
     autocomplete_model: RwLock<String>,
     autocomplete_backend: RwLock<String>,
     local_endpoint: RwLock<String>,
     local_model: RwLock<String>,
+    thinking_budget: RwLock<Option<u32>>,
+    enable_prompt_cache: RwLock<bool>,
+    auto_verify: RwLock<bool>,
     workspace_rules: RwLock<Option<String>>,
     index: RwLock<WorkspaceIndex>,
+    http: Client,
     gemini: GeminiClient,
     local_llm: LocalLlmClient,
     mcp: RwLock<McpManager>,
     sessions: SessionStore,
+    checkpoints: CheckpointStore,
+    pty_manager: PtyManager,
     in_flight: Mutex<HashMap<u64, JoinHandle<()>>>,
     pending_tools: Mutex<HashMap<String, oneshot::Sender<ToolResultPayload>>>,
 }
@@ -62,21 +102,43 @@ impl AppState {
         let env_key = std::env::var("GEMINI_API_KEY")
             .ok()
             .filter(|s| !s.trim().is_empty());
+        let env_anthropic = std::env::var("ANTHROPIC_API_KEY")
+            .ok()
+            .filter(|s| !s.trim().is_empty());
+        let env_openai = std::env::var("OPENAI_API_KEY")
+            .ok()
+            .filter(|s| !s.trim().is_empty());
         Self {
             api_key: RwLock::new(env_key),
+            anthropic_key: RwLock::new(env_anthropic),
+            openai_key: RwLock::new(env_openai),
             model: RwLock::new(DEFAULT_GEMINI_MODEL.to_string()),
             autocomplete_model: RwLock::new(DEFAULT_AUTOCOMPLETE_MODEL.to_string()),
             autocomplete_backend: RwLock::new("gemini".to_string()),
             local_endpoint: RwLock::new(DEFAULT_LOCAL_ENDPOINT.to_string()),
             local_model: RwLock::new(DEFAULT_LOCAL_MODEL.to_string()),
+            thinking_budget: RwLock::new(None),
+            enable_prompt_cache: RwLock::new(true),
+            auto_verify: RwLock::new(false),
             workspace_rules: RwLock::new(None),
             index: RwLock::new(WorkspaceIndex::default()),
+            http: Client::new(),
             gemini: GeminiClient::new(),
             local_llm: LocalLlmClient::new(),
             mcp: RwLock::new(McpManager::default()),
             sessions: SessionStore::default_store(),
+            checkpoints: CheckpointStore::default_store(),
+            pty_manager: PtyManager::new(),
             in_flight: Mutex::new(HashMap::new()),
             pending_tools: Mutex::new(HashMap::new()),
+        }
+    }
+
+    async fn provider_keys(&self) -> ProviderKeys {
+        ProviderKeys {
+            gemini: self.api_key.read().await.clone(),
+            anthropic: self.anthropic_key.read().await.clone(),
+            openai: self.openai_key.read().await.clone(),
         }
     }
 }
@@ -204,23 +266,37 @@ async fn dispatch(
         ),
         "status" => {
             let has_key = state.api_key.read().await.is_some();
+            let has_anthropic_key = state.anthropic_key.read().await.is_some();
+            let has_openai_key = state.openai_key.read().await.is_some();
             let model = state.model.read().await.clone();
             let autocomplete_model = state.autocomplete_model.read().await.clone();
             let autocomplete_backend = state.autocomplete_backend.read().await.clone();
+            let thinking_budget = *state.thinking_budget.read().await;
+            let auto_verify = *state.auto_verify.read().await;
             let has_rules = state.workspace_rules.read().await.is_some();
             let mcp_servers = state.mcp.read().await.statuses();
+            let bg_processes = state.pty_manager.list_processes();
             let index = state.index.read().await;
+            let skills_count = list_skills(index.root.as_deref()).len();
+            let memories_count = load_memories(index.root.as_deref()).len();
             RpcResponse::ok(
                 req.id,
                 json!({
                     "ready": true,
                     "hasApiKey": has_key,
+                    "hasAnthropicKey": has_anthropic_key,
+                    "hasOpenAiKey": has_openai_key,
                     "model": model,
                     "autocompleteModel": autocomplete_model,
                     "autocompleteBackend": autocomplete_backend,
+                    "thinkingBudget": thinking_budget,
+                    "autoVerify": auto_verify,
                     "indexedFiles": index.files.len(),
                     "hasWorkspaceRules": has_rules,
                     "mcpServers": mcp_servers,
+                    "skillsCount": skills_count,
+                    "memoriesCount": memories_count,
+                    "backgroundProcesses": bg_processes.len(),
                     "workspaceRoot": index.root.as_ref().map(|p| p.display().to_string()),
                 }),
             )
@@ -233,6 +309,22 @@ async fn dispatch(
             if let Some(key) = params.api_key {
                 let cleaned = key.trim().to_string();
                 *state.api_key.write().await = if cleaned.is_empty() {
+                    None
+                } else {
+                    Some(cleaned)
+                };
+            }
+            if let Some(key) = params.anthropic_api_key {
+                let cleaned = key.trim().to_string();
+                *state.anthropic_key.write().await = if cleaned.is_empty() {
+                    None
+                } else {
+                    Some(cleaned)
+                };
+            }
+            if let Some(key) = params.openai_api_key {
+                let cleaned = key.trim().to_string();
+                *state.openai_key.write().await = if cleaned.is_empty() {
                     None
                 } else {
                     Some(cleaned)
@@ -262,6 +354,15 @@ async fn dispatch(
                 if !local_model.trim().is_empty() {
                     *state.local_model.write().await = local_model.trim().to_string();
                 }
+            }
+            if let Some(budget) = params.thinking_budget {
+                *state.thinking_budget.write().await = if budget == 0 { None } else { Some(budget) };
+            }
+            if let Some(cache) = params.enable_prompt_cache {
+                *state.enable_prompt_cache.write().await = cache;
+            }
+            if let Some(auto_verify) = params.auto_verify {
+                *state.auto_verify.write().await = auto_verify;
             }
             if let Some(root) = params.workspace_root {
                 let root_path = PathBuf::from(&root);
@@ -419,10 +520,364 @@ async fn dispatch(
             let files = index.list_files(prefix.as_deref(), limit);
             RpcResponse::ok(req.id, json!({ "files": files }))
         }
+        "find_callers" => {
+            let params: FindCallersParams = match serde_json::from_value(req.params) {
+                Ok(p) => p,
+                Err(e) => return RpcResponse::err(req.id, format!("Invalid find_callers params: {e}")),
+            };
+            let index = state.index.read().await;
+            let callers = index.find_callers(&params.symbol, params.limit);
+            RpcResponse::ok(req.id, json!({ "callers": callers }))
+        }
+        "file_outline" => {
+            let params: FileOutlineParams = match serde_json::from_value(req.params) {
+                Ok(p) => p,
+                Err(e) => return RpcResponse::err(req.id, format!("Invalid file_outline params: {e}")),
+            };
+            let index = state.index.read().await;
+            let chunks = index.file_outline(&params.path);
+            RpcResponse::ok(req.id, json!({ "chunks": chunks }))
+        }
+        "list_memories" => {
+            let root = state.index.read().await.root.clone();
+            let memories = load_memories(root.as_deref());
+            RpcResponse::ok(req.id, json!({ "memories": memories }))
+        }
+        "save_memory" => {
+            let params: SaveMemoryParams = match serde_json::from_value(req.params) {
+                Ok(p) => p,
+                Err(e) => return RpcResponse::err(req.id, format!("Invalid save_memory params: {e}")),
+            };
+            let root = state.index.read().await.root.clone();
+            match save_memory(root.as_deref(), &params.scope, &params.category, &params.content) {
+                Ok(entry) => RpcResponse::ok(req.id, json!({ "memory": entry })),
+                Err(e) => RpcResponse::err(req.id, e),
+            }
+        }
+        "delete_memory" => {
+            let params: DeleteMemoryParams = match serde_json::from_value(req.params) {
+                Ok(p) => p,
+                Err(e) => return RpcResponse::err(req.id, format!("Invalid delete_memory params: {e}")),
+            };
+            let root = state.index.read().await.root.clone();
+            match delete_memory(root.as_deref(), &params.id) {
+                Ok(deleted) => RpcResponse::ok(req.id, json!({ "deleted": deleted })),
+                Err(e) => RpcResponse::err(req.id, e),
+            }
+        }
+        "list_skills" => {
+            let root = state.index.read().await.root.clone();
+            let skills = list_skills(root.as_deref());
+            RpcResponse::ok(req.id, json!({ "skills": skills }))
+        }
+        "create_checkpoint" => {
+            let params: CreateCheckpointParams = match serde_json::from_value(req.params) {
+                Ok(p) => p,
+                Err(e) => return RpcResponse::err(req.id, format!("Invalid create_checkpoint params: {e}")),
+            };
+            let Some(root) = state.index.read().await.root.clone() else {
+                return RpcResponse::err(req.id, "No workspace root is open.");
+            };
+            let paths: Vec<PathBuf> = params.paths.iter().map(PathBuf::from).collect();
+            match state.checkpoints.create_checkpoint(&root, &params.label, &paths) {
+                Ok(summary) => RpcResponse::ok(req.id, json!({ "checkpoint": summary })),
+                Err(e) => RpcResponse::err(req.id, e),
+            }
+        }
+        "list_checkpoints" => {
+            let Some(root) = state.index.read().await.root.clone() else {
+                return RpcResponse::ok(req.id, json!({ "checkpoints": [] }));
+            };
+            let checkpoints = state.checkpoints.list_checkpoints(&root);
+            RpcResponse::ok(req.id, json!({ "checkpoints": checkpoints }))
+        }
+        "restore_checkpoint" => {
+            let params: RestoreCheckpointParams = match serde_json::from_value(req.params) {
+                Ok(p) => p,
+                Err(e) => return RpcResponse::err(req.id, format!("Invalid restore_checkpoint params: {e}")),
+            };
+            let Some(root) = state.index.read().await.root.clone() else {
+                return RpcResponse::err(req.id, "No workspace root is open.");
+            };
+            match state.checkpoints.restore_checkpoint(&root, &params.checkpoint_id) {
+                Ok(res) => {
+                    let mut index = state.index.write().await;
+                    let _ = index.index_directory(&root);
+                    RpcResponse::ok(req.id, json!({ "restored": res }))
+                }
+                Err(e) => RpcResponse::err(req.id, e),
+            }
+        }
+        "create_worktree" => {
+            let params: CreateWorktreeParams = match serde_json::from_value(req.params) {
+                Ok(p) => p,
+                Err(e) => return RpcResponse::err(req.id, format!("Invalid create_worktree params: {e}")),
+            };
+            let Some(root) = state.index.read().await.root.clone() else {
+                return RpcResponse::err(req.id, "No workspace root is open.");
+            };
+            match create_worktree(&root, &params.task_name) {
+                Ok(info) => RpcResponse::ok(req.id, json!({ "worktree": info })),
+                Err(e) => RpcResponse::err(req.id, e),
+            }
+        }
+        "list_worktrees" => {
+            let Some(root) = state.index.read().await.root.clone() else {
+                return RpcResponse::ok(req.id, json!({ "worktrees": [] }));
+            };
+            match list_worktrees(&root) {
+                Ok(items) => RpcResponse::ok(req.id, json!({ "worktrees": items })),
+                Err(e) => RpcResponse::err(req.id, e),
+            }
+        }
+        "diff_worktree" => {
+            let params: WorktreePathParams = match serde_json::from_value(req.params) {
+                Ok(p) => p,
+                Err(e) => return RpcResponse::err(req.id, format!("Invalid diff_worktree params: {e}")),
+            };
+            match diff_worktree(&PathBuf::from(&params.worktree_path)) {
+                Ok(diff) => RpcResponse::ok(req.id, json!({ "diff": diff })),
+                Err(e) => RpcResponse::err(req.id, e),
+            }
+        }
+        "merge_worktree" => {
+            let params: MergeWorktreeParams = match serde_json::from_value(req.params) {
+                Ok(p) => p,
+                Err(e) => return RpcResponse::err(req.id, format!("Invalid merge_worktree params: {e}")),
+            };
+            let Some(root) = state.index.read().await.root.clone() else {
+                return RpcResponse::err(req.id, "No workspace root is open.");
+            };
+            match merge_worktree(&root, &params.branch_name) {
+                Ok(out) => RpcResponse::ok(req.id, json!({ "output": out })),
+                Err(e) => RpcResponse::err(req.id, e),
+            }
+        }
+        "remove_worktree" => {
+            let params: WorktreePathParams = match serde_json::from_value(req.params) {
+                Ok(p) => p,
+                Err(e) => return RpcResponse::err(req.id, format!("Invalid remove_worktree params: {e}")),
+            };
+            let Some(root) = state.index.read().await.root.clone() else {
+                return RpcResponse::err(req.id, "No workspace root is open.");
+            };
+            match remove_worktree(&root, &PathBuf::from(&params.worktree_path)) {
+                Ok(()) => RpcResponse::ok(req.id, json!({ "removed": true })),
+                Err(e) => RpcResponse::err(req.id, e),
+            }
+        }
+        "run_pty_command" => {
+            let params: RunPtyCommandParams = match serde_json::from_value(req.params) {
+                Ok(p) => p,
+                Err(e) => return RpcResponse::err(req.id, format!("Invalid run_pty_command params: {e}")),
+            };
+            let cwd = match params.cwd {
+                Some(c) if !c.trim().is_empty() => PathBuf::from(c),
+                _ => match state.index.read().await.root.clone() {
+                    Some(r) => r,
+                    None => return RpcResponse::err(req.id, "No workspace root is open."),
+                },
+            };
+            let tx = out_tx.clone();
+            let req_id = req.id;
+            match run_pty_command(&params.command, &cwd, params.timeout_secs.unwrap_or(60), move |chunk| {
+                emit_event(&tx, req_id, "pty_chunk", json!({ "text": chunk }));
+            })
+            .await
+            {
+                Ok((exit_code, output)) => {
+                    RpcResponse::ok(req.id, json!({ "exitCode": exit_code, "output": output }))
+                }
+                Err(e) => RpcResponse::err(req.id, e),
+            }
+        }
+        "start_background_process" => {
+            let params: StartBgProcessParams = match serde_json::from_value(req.params) {
+                Ok(p) => p,
+                Err(e) => return RpcResponse::err(req.id, format!("Invalid start_background_process params: {e}")),
+            };
+            let cwd = match params.cwd {
+                Some(c) if !c.trim().is_empty() => PathBuf::from(c),
+                _ => match state.index.read().await.root.clone() {
+                    Some(r) => r,
+                    None => return RpcResponse::err(req.id, "No workspace root is open."),
+                },
+            };
+            match state.pty_manager.start_background(&params.command, &cwd) {
+                Ok(info) => RpcResponse::ok(req.id, json!({ "process": info })),
+                Err(e) => RpcResponse::err(req.id, e),
+            }
+        }
+        "read_background_process" => {
+            let params: BgProcessIdParams = match serde_json::from_value(req.params) {
+                Ok(p) => p,
+                Err(e) => return RpcResponse::err(req.id, format!("Invalid read_background_process params: {e}")),
+            };
+            match state.pty_manager.read_output(&params.proc_id) {
+                Ok(out) => RpcResponse::ok(req.id, json!({ "process": out })),
+                Err(e) => RpcResponse::err(req.id, e),
+            }
+        }
+        "write_background_process" => {
+            let params: WriteBgProcessParams = match serde_json::from_value(req.params) {
+                Ok(p) => p,
+                Err(e) => return RpcResponse::err(req.id, format!("Invalid write_background_process params: {e}")),
+            };
+            match state.pty_manager.write_input(&params.proc_id, &params.input) {
+                Ok(()) => RpcResponse::ok(req.id, json!({ "written": true })),
+                Err(e) => RpcResponse::err(req.id, e),
+            }
+        }
+        "stop_background_process" => {
+            let params: BgProcessIdParams = match serde_json::from_value(req.params) {
+                Ok(p) => p,
+                Err(e) => return RpcResponse::err(req.id, format!("Invalid stop_background_process params: {e}")),
+            };
+            match state.pty_manager.stop_process(&params.proc_id) {
+                Ok(stopped) => RpcResponse::ok(req.id, json!({ "stopped": stopped })),
+                Err(e) => RpcResponse::err(req.id, e),
+            }
+        }
+        "list_background_processes" => {
+            let procs = state.pty_manager.list_processes();
+            RpcResponse::ok(req.id, json!({ "processes": procs }))
+        }
+        "detect_verify_commands" => {
+            let Some(root) = state.index.read().await.root.clone() else {
+                return RpcResponse::ok(req.id, json!({ "commands": [] }));
+            };
+            let commands = detect_verify_commands(&root);
+            RpcResponse::ok(req.id, json!({ "commands": commands }))
+        }
+        "run_parallel_subagents" => {
+            let params: RunParallelSubagentsParams = match serde_json::from_value(req.params) {
+                Ok(p) => p,
+                Err(e) => return RpcResponse::err(req.id, format!("Invalid run_parallel_subagents params: {e}")),
+            };
+            let tasks: Vec<SubagentTask> = match serde_json::from_value(params.tasks) {
+                Ok(t) => t,
+                Err(e) => return RpcResponse::err(req.id, format!("Invalid tasks array: {e}")),
+            };
+            let Some(api_key) = state.api_key.read().await.clone() else {
+                return RpcResponse::err(req.id, "Gemini API key is not configured.");
+            };
+            let model = params.model.unwrap_or_else(|| DEFAULT_GEMINI_MODEL.to_string());
+            let rules = state.workspace_rules.read().await.clone();
+            let req_id = req.id;
+            let results = run_parallel_subagents(
+                &state.gemini,
+                &api_key,
+                &model,
+                rules.as_deref(),
+                tasks,
+                |task_id, status| {
+                    emit_event(
+                        out_tx,
+                        req_id,
+                        "subagent_event",
+                        json!({ "taskId": task_id, "status": status }),
+                    );
+                },
+            )
+            .await;
+            RpcResponse::ok(req.id, json!({ "results": results }))
+        }
+        "next_edit_predict" => handle_next_edit_predict(req, state).await,
         "inline_edit" => handle_inline_edit(req, state, out_tx).await,
         "inline_complete" => handle_inline_complete(req, state).await,
         "agent_chat" => handle_agent_chat(req, state, out_tx).await,
         other => RpcResponse::err(req.id, format!("Unknown method: {other}")),
+    }
+}
+
+async fn handle_next_edit_predict(req: RpcRequest, state: Arc<AppState>) -> RpcResponse {
+    let params: NextEditPredictParams = match serde_json::from_value(req.params) {
+        Ok(p) => p,
+        Err(e) => return RpcResponse::err(req.id, format!("Invalid next_edit_predict params: {e}")),
+    };
+
+    let related_sites = {
+        let index = state.index.read().await;
+        let files: Vec<(String, String)> = index
+            .files
+            .iter()
+            .take(500)
+            .map(|f| (f.rel_path.clone(), f.content.clone()))
+            .collect();
+        let hint = params
+            .recent_edits
+            .first()
+            .map(String::as_str)
+            .unwrap_or(params.focus_block.as_str());
+        find_related_edit_sites(hint, &params.file_path, &files, 6)
+    };
+
+    let (system_prompt, user_prompt) = build_nes_prompt(
+        &params.file_path,
+        &params.language_id,
+        &params.window_before,
+        &params.focus_block,
+        &params.window_after,
+        params.focus_start_line.max(1),
+        &params.recent_edits,
+        &related_sites,
+    );
+
+    let focus_lines = params.focus_block.lines().count().max(1);
+    let default_start = params.focus_start_line.max(1);
+    let default_end = default_start + focus_lines - 1;
+
+    let backend = state.autocomplete_backend.read().await.clone();
+    let local_endpoint = state.local_endpoint.read().await.clone();
+    let local_model = state.local_model.read().await.clone();
+
+    if backend == "ollama" || backend == "mlx" || backend == "auto" {
+        let try_backend = if backend == "auto" {
+            if local_endpoint.contains("11434") {
+                "ollama"
+            } else {
+                "mlx"
+            }
+        } else {
+            backend.as_str()
+        };
+
+        if let Ok(raw) = state
+            .local_llm
+            .complete_fim(try_backend, &local_endpoint, &local_model, &system_prompt, &user_prompt)
+            .await
+        {
+            if let Some(pred) = parse_nes_response(&raw, &params.file_path, default_start, default_end)
+            {
+                return RpcResponse::ok(req.id, json!({ "prediction": pred, "backend": try_backend }));
+            }
+        }
+    }
+
+    let Some(api_key) = state.api_key.read().await.clone() else {
+        return RpcResponse::ok(req.id, json!({ "prediction": Value::Null }));
+    };
+    let model = match params.model {
+        Some(m) if !m.trim().is_empty() => m,
+        _ => state.autocomplete_model.read().await.clone(),
+    };
+
+    let messages = vec![ChatMessage {
+        role: "user".to_string(),
+        content: user_prompt,
+        images: vec![],
+    }];
+
+    match state
+        .gemini
+        .stream_chat(&api_key, &model, Some(&system_prompt), &messages, 0.1, Some(320), |_| {})
+        .await
+    {
+        Ok(raw) => {
+            let pred = parse_nes_response(&raw, &params.file_path, default_start, default_end);
+            RpcResponse::ok(req.id, json!({ "prediction": pred, "backend": "gemini" }))
+        }
+        Err(e) => RpcResponse::err(req.id, e),
     }
 }
 
@@ -436,13 +891,24 @@ async fn handle_inline_edit(
         Err(e) => return RpcResponse::err(req.id, format!("Invalid inline_edit params: {e}")),
     };
 
-    let Some(api_key) = state.api_key.read().await.clone() else {
-        return RpcResponse::err(req.id, "Gemini API key is not configured. Run 'Rursor: Set Gemini API Key'.");
-    };
-    let model = match params.model {
-        Some(m) if !m.trim().is_empty() => m,
-        _ => state.model.read().await.clone(),
-    };
+    let keys = state.provider_keys().await;
+    let default_model = state.model.read().await.clone();
+    let requested_model = params
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .or(Some(default_model.as_str()));
+    let local_backend = state.autocomplete_backend.read().await.clone();
+    let local_model = state.local_model.read().await.clone();
+    let route = route_task(
+        TaskKind::InlineEdit,
+        &params.instruction,
+        requested_model,
+        &local_backend,
+        &local_model,
+        &keys,
+    );
 
     let mut diag_block = String::new();
     if !params.diagnostics.is_empty() {
@@ -482,12 +948,59 @@ async fn handle_inline_edit(
     }];
 
     let req_id = req.id;
-    let res = state
-        .gemini
-        .stream_chat(&api_key, &model, Some(&system_prompt), &messages, 0.2, None, |delta| {
-            emit_event(out_tx, req_id, "stream_chunk", json!({ "text": delta }));
-        })
-        .await;
+    let res = match route.provider {
+        ProviderKind::Anthropic => {
+            let Some(anth_key) = keys.anthropic else {
+                return RpcResponse::err(req.id, "Anthropic API key is not configured.");
+            };
+            stream_anthropic_chat(
+                &state.http,
+                &anth_key,
+                &route.model,
+                Some(&system_prompt),
+                &messages,
+                0.2,
+                None,
+                None,
+                |delta| {
+                    emit_event(out_tx, req_id, "stream_chunk", json!({ "text": delta }));
+                },
+            )
+            .await
+        }
+        ProviderKind::OpenAi => {
+            let Some(oai_key) = keys.openai else {
+                return RpcResponse::err(req.id, "OpenAI API key is not configured.");
+            };
+            stream_openai_chat(
+                &state.http,
+                &oai_key,
+                &route.model,
+                Some(&system_prompt),
+                &messages,
+                0.2,
+                None,
+                |delta| {
+                    emit_event(out_tx, req_id, "stream_chunk", json!({ "text": delta }));
+                },
+            )
+            .await
+        }
+        ProviderKind::Gemini | ProviderKind::LocalLlm => {
+            let Some(api_key) = keys.gemini else {
+                return RpcResponse::err(
+                    req.id,
+                    "Gemini API key is not configured. Run 'Rursor: Set Gemini API Key'.",
+                );
+            };
+            state
+                .gemini
+                .stream_chat(&api_key, &route.model, Some(&system_prompt), &messages, 0.2, None, |delta| {
+                    emit_event(out_tx, req_id, "stream_chunk", json!({ "text": delta }));
+                })
+                .await
+        }
+    };
 
     match res {
         Ok(full) => {
@@ -599,13 +1112,61 @@ async fn handle_agent_chat(
         Err(e) => return RpcResponse::err(req.id, format!("Invalid agent_chat params: {e}")),
     };
 
-    let Some(api_key) = state.api_key.read().await.clone() else {
-        return RpcResponse::err(req.id, "Gemini API key is not configured. Run 'Rursor: Set Gemini API Key'.");
-    };
-    let model = match params.model {
-        Some(m) if !m.trim().is_empty() => m,
-        _ => state.model.read().await.clone(),
-    };
+    let req_id = req.id;
+    let workspace_root = state.index.read().await.root.clone();
+    let original_messages = params.messages.clone();
+    let mut messages = params.messages;
+
+    // Expand `/slash` skill commands if the latest user message starts with `/`
+    if let Some(last_user) = messages.iter_mut().rev().find(|m| m.role == "user") {
+        if let Some((skill, expanded)) =
+            resolve_slash_command(workspace_root.as_deref(), &last_user.content)
+        {
+            emit_event(
+                out_tx,
+                req_id,
+                "tool_event",
+                json!({
+                    "callId": format!("skill_{}", skill.name),
+                    "phase": "done",
+                    "name": format!("/{}", skill.name),
+                    "ok": true,
+                    "output": { "source": skill.source, "description": skill.description },
+                }),
+            );
+            last_user.content = expanded;
+        }
+    }
+
+    let prompt_hint = messages
+        .iter()
+        .rev()
+        .find(|m| m.role == "user")
+        .map(|m| m.content.as_str())
+        .unwrap_or("");
+
+    let keys = state.provider_keys().await;
+    let default_model = state.model.read().await.clone();
+    let requested_model = params
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .or(Some(default_model.as_str()));
+    let local_backend = state.autocomplete_backend.read().await.clone();
+    let local_model = state.local_model.read().await.clone();
+    let route = route_task(
+        TaskKind::AgentFast,
+        prompt_hint,
+        requested_model,
+        &local_backend,
+        &local_model,
+        &keys,
+    );
+    let configured_thinking = params
+        .thinking_budget
+        .or(*state.thinking_budget.read().await)
+        .or(route.thinking_budget);
 
     let mut context_blocks = String::new();
     for snippet in &params.context_files {
@@ -626,7 +1187,7 @@ async fn handle_agent_chat(
     }
 
     if params.use_workspace_search {
-        if let Some(last_user) = params.messages.iter().rev().find(|m| m.role == "user") {
+        if let Some(last_user) = messages.iter().rev().find(|m| m.role == "user") {
             let hits = state.index.read().await.search(&last_user.content, 5);
             for hit in hits {
                 context_blocks.push_str(&format!(
@@ -637,8 +1198,6 @@ async fn handle_agent_chat(
         }
     }
 
-    let original_messages = params.messages.clone();
-    let mut messages = params.messages;
     if !context_blocks.is_empty() {
         if let Some(last) = messages.last_mut() {
             last.content = format!("Workspace Context:\n{context_blocks}\n\nRequest:\n{}", last.content);
@@ -653,49 +1212,197 @@ async fn handle_agent_chat(
         .map(|r| format!("\n\nProject Rules (must follow):\n{r}"))
         .unwrap_or_default();
 
-    let req_id = req.id;
+    let memory_block = format_memory_prompt(workspace_root.as_deref())
+        .map(|m| format!("\n\n{m}"))
+        .unwrap_or_default();
+
+    // Compact older conversation turns automatically when approaching context limits.
+    if estimate_messages_tokens(&messages) > COMPACTION_TOKEN_THRESHOLD {
+        if let Some(api_key) = keys.gemini.as_deref() {
+            if let Ok(compacted) = state
+                .gemini
+                .compact_messages(api_key, "gemini-2.5-flash-lite", &messages, 6)
+                .await
+            {
+                emit_event(
+                    out_tx,
+                    req_id,
+                    "tool_event",
+                    json!({
+                        "callId": format!("compact_{req_id}"),
+                        "phase": "done",
+                        "name": "compact_history",
+                        "ok": true,
+                        "output": { "keptMessages": compacted.len() },
+                    }),
+                );
+                messages = compacted;
+            }
+        }
+    }
 
     if params.mode == "ask" {
         let system_prompt = format!(
-            "You are Rursor, a concise, accurate AI coding assistant inside a macOS code editor. Reference exact file paths and symbols from context when available, and provide clean, directly applicable code blocks.{rules_block}"
+            "You are Rursor, a concise, accurate AI coding assistant inside a macOS code editor. Reference exact file paths and symbols from context when available, and provide clean, directly applicable code blocks.{rules_block}{memory_block}"
         );
-        let res = state
-            .gemini
-            .stream_chat(&api_key, &model, Some(&system_prompt), &messages, 0.3, None, |delta| {
-                emit_event(out_tx, req_id, "stream_chunk", json!({ "text": delta }));
-            })
-            .await;
+        let res = match route.provider {
+            ProviderKind::Anthropic => {
+                let Some(anth_key) = keys.anthropic else {
+                    return RpcResponse::err(req.id, "Anthropic API key is not configured.");
+                };
+                stream_anthropic_chat(
+                    &state.http,
+                    &anth_key,
+                    &route.model,
+                    Some(&system_prompt),
+                    &messages,
+                    0.3,
+                    None,
+                    configured_thinking,
+                    |delta| {
+                        emit_event(out_tx, req_id, "stream_chunk", json!({ "text": delta }));
+                    },
+                )
+                .await
+            }
+            ProviderKind::OpenAi => {
+                let Some(oai_key) = keys.openai else {
+                    return RpcResponse::err(req.id, "OpenAI API key is not configured.");
+                };
+                stream_openai_chat(
+                    &state.http,
+                    &oai_key,
+                    &route.model,
+                    Some(&system_prompt),
+                    &messages,
+                    0.3,
+                    None,
+                    |delta| {
+                        emit_event(out_tx, req_id, "stream_chunk", json!({ "text": delta }));
+                    },
+                )
+                .await
+            }
+            ProviderKind::Gemini | ProviderKind::LocalLlm => {
+                let Some(api_key) = keys.gemini else {
+                    return RpcResponse::err(
+                        req.id,
+                        "Gemini API key is not configured. Run 'Rursor: Set Gemini API Key'.",
+                    );
+                };
+                state
+                    .gemini
+                    .stream_chat(&api_key, &route.model, Some(&system_prompt), &messages, 0.3, None, |delta| {
+                        emit_event(out_tx, req_id, "stream_chunk", json!({ "text": delta }));
+                    })
+                    .await
+            }
+        };
 
         return match res {
             Ok(full) => {
                 persist_session_turn(&state, params.session_id.as_deref(), original_messages, &full).await;
-                RpcResponse::ok(req.id, json!({ "text": full }))
+                RpcResponse::ok(req.id, json!({ "text": full, "route": route }))
             }
             Err(e) => RpcResponse::err(req.id, e),
         };
     }
 
+    // In Agent mode, support Anthropic/OpenAI direct fallback if no Gemini key is set or user forced Claude/GPT.
+    if route.provider == ProviderKind::Anthropic && keys.has_anthropic() && !keys.has_gemini() {
+        let system_prompt = format!(
+            "You are Rursor Agent (text fallback mode — Gemini key not configured for tool calls). Provide exact, actionable code changes.{rules_block}{memory_block}"
+        );
+        let res = stream_anthropic_chat(
+            &state.http,
+            keys.anthropic.as_deref().unwrap_or_default(),
+            &route.model,
+            Some(&system_prompt),
+            &messages,
+            0.2,
+            None,
+            configured_thinking,
+            |delta| {
+                emit_event(out_tx, req_id, "stream_chunk", json!({ "text": delta }));
+            },
+        )
+        .await;
+        return match res {
+            Ok(full) => {
+                persist_session_turn(&state, params.session_id.as_deref(), original_messages, &full).await;
+                RpcResponse::ok(req.id, json!({ "text": full, "route": route }))
+            }
+            Err(e) => RpcResponse::err(req.id, e),
+        };
+    }
+    if route.provider == ProviderKind::OpenAi && keys.has_openai() && !keys.has_gemini() {
+        let system_prompt = format!(
+            "You are Rursor Agent (text fallback mode — Gemini key not configured for tool calls). Provide exact, actionable code changes.{rules_block}{memory_block}"
+        );
+        let res = stream_openai_chat(
+            &state.http,
+            keys.openai.as_deref().unwrap_or_default(),
+            &route.model,
+            Some(&system_prompt),
+            &messages,
+            0.2,
+            None,
+            |delta| {
+                emit_event(out_tx, req_id, "stream_chunk", json!({ "text": delta }));
+            },
+        )
+        .await;
+        return match res {
+            Ok(full) => {
+                persist_session_turn(&state, params.session_id.as_deref(), original_messages, &full).await;
+                RpcResponse::ok(req.id, json!({ "text": full, "route": route }))
+            }
+            Err(e) => RpcResponse::err(req.id, e),
+        };
+    }
+
+    let Some(api_key) = keys.gemini else {
+        return RpcResponse::err(req.id, "Gemini API key is not configured. Run 'Rursor: Set Gemini API Key'.");
+    };
+    let model = if route.provider == ProviderKind::Gemini {
+        route.model.clone()
+    } else {
+        default_model
+    };
+
     let mut contents: Vec<Value> = messages.iter().map(chat_message_to_gemini_content).collect();
     let mcp_decls = state.mcp.read().await.gemini_function_declarations();
     let tools = Some(agent_tool_declarations(&mcp_decls));
-    let workspace_root_label = state
-        .index
-        .read()
-        .await
-        .root
+    let workspace_root_label = workspace_root
         .as_ref()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "none".to_string());
 
     let system_prompt = format!(
         "You are Rursor Agent, an autonomous AI software engineer inside a macOS code editor (workspace root: {workspace_root_label}).\n\
-        Use the provided tools to inspect files, search/grep/symbol-search the workspace, check git diff, edit or create files, invoke MCP tools, and run terminal commands to verify changes.\n\
+        Use the provided tools to inspect files, search/grep/symbol-search/AST-call-graph the workspace, check git diff, edit or create files, run parallel research subagents, manage background PTY processes, use git worktree sandboxes, inspect localhost web previews, persist learned project memories, invoke MCP tools, and run terminal commands.\n\
         Rules:\n\
         - Always read a file before editing it unless creating a brand new file.\n\
         - Prefer minimal, exact replacements in edit_file (`old_text` must uniquely match existing text in the file).\n\
-        - Summarize the exact files modified and any verification commands run.{rules_block}"
+        - Summarize the exact files modified and any verification commands run.{rules_block}{memory_block}"
     );
 
+    let enable_cache = *state.enable_prompt_cache.read().await;
+    let static_prefix = format!("{rules_block}{memory_block}");
+    let cached_content = if enable_cache && static_prefix.len() >= MIN_PROMPT_CACHE_CHARS {
+        state
+            .gemini
+            .create_cached_content(&api_key, &model, Some(&system_prompt), &static_prefix, 600)
+            .await
+            .ok()
+    } else {
+        None
+    };
+
+    let auto_verify = params.auto_verify.unwrap_or(*state.auto_verify.read().await);
+    let mut mutated_files = false;
+    let mut checkpoint_created = false;
+    let mut verify_attempts: u8 = 0;
     let mut combined_text = String::new();
 
     for step in 0..MAX_AGENT_STEPS {
@@ -704,16 +1411,27 @@ async fn handle_agent_chat(
             combined_text.push('\n');
         }
 
+        let turn_options = GeminiTurnOptions {
+            thinking_budget: configured_thinking,
+            cached_content: cached_content.clone(),
+        };
+        let sys_for_turn = if cached_content.is_some() {
+            None
+        } else {
+            Some(system_prompt.as_str())
+        };
+
         let turn = match state
             .gemini
-            .stream_turn(
+            .stream_turn_with_options(
                 &api_key,
                 &model,
-                Some(&system_prompt),
+                sys_for_turn,
                 &contents,
                 tools.clone(),
                 0.2,
                 None,
+                turn_options,
                 |delta| {
                     emit_event(out_tx, req_id, "stream_chunk", json!({ "text": delta }));
                 },
@@ -727,6 +1445,64 @@ async fn handle_agent_chat(
         combined_text.push_str(&turn.text);
 
         if turn.function_calls.is_empty() {
+            if mutated_files && auto_verify && verify_attempts < 2 {
+                if let Some(root) = workspace_root.as_ref() {
+                    let cmds = detect_verify_commands(root);
+                    if !cmds.is_empty() {
+                        verify_attempts += 1;
+                        let mut results = Vec::new();
+                        for cmd in cmds {
+                            let call_id = format!("verify_{}", NEXT_TOOL_CALL_ID.fetch_add(1, Ordering::Relaxed));
+                            emit_event(
+                                out_tx,
+                                req_id,
+                                "tool_event",
+                                json!({
+                                    "callId": call_id,
+                                    "phase": "start",
+                                    "name": format!("auto_verify: {}", cmd.label),
+                                    "args": { "command": cmd.command },
+                                }),
+                            );
+                            let (exit_code, output) = match run_pty_command(&cmd.command, root, 60, |_| {}).await {
+                                Ok(res) => res,
+                                Err(e) => (1, e),
+                            };
+                            emit_event(
+                                out_tx,
+                                req_id,
+                                "tool_event",
+                                json!({
+                                    "callId": call_id,
+                                    "phase": "done",
+                                    "name": format!("auto_verify: {}", cmd.label),
+                                    "ok": exit_code == 0,
+                                    "output": { "exitCode": exit_code },
+                                }),
+                            );
+                            results.push(VerifyResult {
+                                label: cmd.label,
+                                command: cmd.command,
+                                exit_code,
+                                output,
+                            });
+                        }
+                        if !all_verify_passed(&results) {
+                            let feedback = format_verify_feedback(&results);
+                            contents.push(json!({
+                                "role": "model",
+                                "parts": coalesce_model_parts(turn.raw_model_parts)
+                            }));
+                            contents.push(json!({
+                                "role": "user",
+                                "parts": [{ "text": feedback }]
+                            }));
+                            continue;
+                        }
+                    }
+                }
+            }
+
             persist_session_turn(
                 &state,
                 params.session_id.as_deref(),
@@ -734,7 +1510,7 @@ async fn handle_agent_chat(
                 &combined_text,
             )
             .await;
-            return RpcResponse::ok(req.id, json!({ "text": combined_text }));
+            return RpcResponse::ok(req.id, json!({ "text": combined_text, "route": route }));
         }
 
         contents.push(json!({
@@ -744,9 +1520,39 @@ async fn handle_agent_chat(
 
         let mut response_parts = Vec::new();
         for fc in turn.function_calls {
+            if (fc.name == "edit_file" || fc.name == "write_file") && !checkpoint_created {
+                checkpoint_created = true;
+                if let Some(root) = workspace_root.as_ref() {
+                    if let Ok(summary) =
+                        state
+                            .checkpoints
+                            .create_checkpoint(root, "Pre-edit agent checkpoint", &[])
+                    {
+                        emit_event(
+                            out_tx,
+                            req_id,
+                            "checkpoint_created",
+                            json!({ "checkpoint": summary }),
+                        );
+                    }
+                }
+            }
+            if fc.name == "edit_file" || fc.name == "write_file" {
+                mutated_files = true;
+            }
+
             let call_id = format!("tc_{}", NEXT_TOOL_CALL_ID.fetch_add(1, Ordering::Relaxed));
-            let result_val =
-                execute_agent_tool(req_id, &call_id, &fc.name, &fc.args, &state, out_tx).await;
+            let result_val = execute_agent_tool(
+                req_id,
+                &call_id,
+                &fc.name,
+                &fc.args,
+                &state,
+                out_tx,
+                &api_key,
+                &model,
+            )
+            .await;
 
             response_parts.push(json!({
                 "functionResponse": {
@@ -772,7 +1578,7 @@ async fn handle_agent_chat(
         &combined_text,
     )
     .await;
-    RpcResponse::ok(req.id, json!({ "text": combined_text }))
+    RpcResponse::ok(req.id, json!({ "text": combined_text, "route": route }))
 }
 
 async fn persist_session_turn(
@@ -798,6 +1604,7 @@ async fn persist_session_turn(
     let _ = state.sessions.save(root.as_deref(), id, &title, messages);
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_agent_tool(
     req_id: u64,
     call_id: &str,
@@ -805,9 +1612,18 @@ async fn execute_agent_tool(
     args: &Value,
     state: &Arc<AppState>,
     out_tx: &mpsc::UnboundedSender<String>,
+    api_key: &str,
+    model: &str,
 ) -> Value {
     match name {
-        "read_file" | "list_files" | "search_workspace" | "search_symbols" | "grep_workspace" | "git_context" => {
+        "read_file"
+        | "list_files"
+        | "search_workspace"
+        | "search_symbols"
+        | "find_callers"
+        | "file_outline"
+        | "grep_workspace"
+        | "git_context" => {
             emit_event(
                 out_tx,
                 req_id,
@@ -850,6 +1666,17 @@ async fn execute_agent_tool(
                         let hits = index.search_symbols(query, limit);
                         (true, json!({ "symbols": hits }))
                     }
+                    "find_callers" => {
+                        let symbol = args.get("symbol").and_then(|v| v.as_str()).unwrap_or("");
+                        let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
+                        let callers = index.find_callers(symbol, limit);
+                        (true, json!({ "callers": callers }))
+                    }
+                    "file_outline" => {
+                        let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                        let chunks = index.file_outline(path);
+                        (true, json!({ "chunks": chunks }))
+                    }
                     "grep_workspace" => {
                         let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
                         let case_sensitive = args
@@ -883,7 +1710,95 @@ async fn execute_agent_tool(
 
             json!({ "ok": ok, "result": output })
         }
-        "edit_file" | "write_file" | "run_command" => {
+        "save_memory" => {
+            let root = state.index.read().await.root.clone();
+            let scope = args.get("scope").and_then(|v| v.as_str()).unwrap_or("workspace");
+            let category = args.get("category").and_then(|v| v.as_str()).unwrap_or("convention");
+            let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
+            match save_memory(root.as_deref(), scope, category, content) {
+                Ok(entry) => json!({ "ok": true, "result": { "memory": entry } }),
+                Err(e) => json!({ "ok": false, "result": { "error": e } }),
+            }
+        }
+        "spawn_subagents" => {
+            emit_event(
+                out_tx,
+                req_id,
+                "tool_event",
+                json!({ "callId": call_id, "phase": "start", "name": "spawn_subagents", "args": args }),
+            );
+            let tasks_val = args.get("tasks").cloned().unwrap_or_else(|| json!([]));
+            let tasks: Vec<SubagentTask> = match serde_json::from_value(tasks_val) {
+                Ok(t) => t,
+                Err(e) => return json!({ "ok": false, "result": { "error": format!("Invalid subagent tasks: {e}") } }),
+            };
+            let rules = state.workspace_rules.read().await.clone();
+            let results = run_parallel_subagents(
+                &state.gemini,
+                api_key,
+                model,
+                rules.as_deref(),
+                tasks,
+                |task_id, status| {
+                    emit_event(
+                        out_tx,
+                        req_id,
+                        "subagent_event",
+                        json!({ "taskId": task_id, "status": status }),
+                    );
+                },
+            )
+            .await;
+            emit_event(
+                out_tx,
+                req_id,
+                "tool_event",
+                json!({ "callId": call_id, "phase": "done", "name": "spawn_subagents", "ok": true, "output": { "count": results.len() } }),
+            );
+            json!({ "ok": true, "result": { "results": results } })
+        }
+        "start_background_process" => {
+            let command = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
+            let Some(root) = state.index.read().await.root.clone() else {
+                return json!({ "ok": false, "result": { "error": "No workspace root open." } });
+            };
+            match state.pty_manager.start_background(command, &root) {
+                Ok(info) => json!({ "ok": true, "result": { "process": info } }),
+                Err(e) => json!({ "ok": false, "result": { "error": e } }),
+            }
+        }
+        "read_background_process" => {
+            let proc_id = args.get("proc_id").and_then(|v| v.as_str()).unwrap_or("");
+            match state.pty_manager.read_output(proc_id) {
+                Ok(out) => json!({ "ok": true, "result": { "process": out } }),
+                Err(e) => json!({ "ok": false, "result": { "error": e } }),
+            }
+        }
+        "stop_background_process" => {
+            let proc_id = args.get("proc_id").and_then(|v| v.as_str()).unwrap_or("");
+            match state.pty_manager.stop_process(proc_id) {
+                Ok(stopped) => json!({ "ok": true, "result": { "stopped": stopped } }),
+                Err(e) => json!({ "ok": false, "result": { "error": e } }),
+            }
+        }
+        "create_worktree" => {
+            let task_name = args.get("task_name").and_then(|v| v.as_str()).unwrap_or("task");
+            let Some(root) = state.index.read().await.root.clone() else {
+                return json!({ "ok": false, "result": { "error": "No workspace root open." } });
+            };
+            match create_worktree(&root, task_name) {
+                Ok(info) => json!({ "ok": true, "result": { "worktree": info } }),
+                Err(e) => json!({ "ok": false, "result": { "error": e } }),
+            }
+        }
+        "diff_worktree" => {
+            let wt_path = args.get("worktree_path").and_then(|v| v.as_str()).unwrap_or("");
+            match diff_worktree(&PathBuf::from(wt_path)) {
+                Ok(diff) => json!({ "ok": true, "result": { "diff": diff } }),
+                Err(e) => json!({ "ok": false, "result": { "error": e } }),
+            }
+        }
+        "edit_file" | "write_file" | "run_command" | "inspect_web_page" => {
             let (tx, rx) = oneshot::channel::<ToolResultPayload>();
             state.pending_tools.lock().await.insert(call_id.to_string(), tx);
 
@@ -971,7 +1886,7 @@ fn agent_tool_declarations(mcp_decls: &[Value]) -> Vec<Value> {
         }),
         json!({
             "name": "search_workspace",
-            "description": "Rank workspace files by path, symbol definitions, and BM25 term relevance.",
+            "description": "Hybrid BM25 + semantic AST search across indexed workspace files.",
             "parameters": {
                 "type": "OBJECT",
                 "properties": {
@@ -983,7 +1898,7 @@ fn agent_tool_declarations(mcp_decls: &[Value]) -> Vec<Value> {
         }),
         json!({
             "name": "search_symbols",
-            "description": "Search extracted functions, structs, classes, interfaces, and types across the workspace.",
+            "description": "Search extracted Tree-sitter AST symbols (functions, structs, classes, interfaces, types) across the workspace.",
             "parameters": {
                 "type": "OBJECT",
                 "properties": {
@@ -991,6 +1906,29 @@ fn agent_tool_declarations(mcp_decls: &[Value]) -> Vec<Value> {
                     "limit": { "type": "INTEGER", "description": "Max symbols to return (default 25)." }
                 },
                 "required": ["query"]
+            }
+        }),
+        json!({
+            "name": "find_callers",
+            "description": "Find AST call-graph references/callers of a symbol across the workspace.",
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {
+                    "symbol": { "type": "STRING", "description": "Exact symbol or function name." },
+                    "limit": { "type": "INTEGER", "description": "Max caller sites (default 20)." }
+                },
+                "required": ["symbol"]
+            }
+        }),
+        json!({
+            "name": "file_outline",
+            "description": "Get the Tree-sitter AST outline (functions, classes, signatures, calls) for a workspace file.",
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {
+                    "path": { "type": "STRING", "description": "Workspace-relative file path." }
+                },
+                "required": ["path"]
             }
         }),
         json!({
@@ -1051,6 +1989,100 @@ fn agent_tool_declarations(mcp_decls: &[Value]) -> Vec<Value> {
                     "reason": { "type": "STRING", "description": "Why this command should be run." }
                 },
                 "required": ["command"]
+            }
+        }),
+        json!({
+            "name": "save_memory",
+            "description": "Persist a durable project or user convention into Rursor's cross-session memory.",
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {
+                    "scope": { "type": "STRING", "description": "'workspace' or 'global'." },
+                    "category": { "type": "STRING", "description": "Short category like 'architecture', 'testing', or 'style'." },
+                    "content": { "type": "STRING", "description": "Concise fact or convention to remember." }
+                },
+                "required": ["content"]
+            }
+        }),
+        json!({
+            "name": "spawn_subagents",
+            "description": "Run multiple parallel read-only research/analysis subtasks concurrently.",
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {
+                    "tasks": {
+                        "type": "ARRAY",
+                        "description": "List of { id, role, prompt } subtask objects."
+                    }
+                },
+                "required": ["tasks"]
+            }
+        }),
+        json!({
+            "name": "start_background_process",
+            "description": "Start a dev server or long-running process inside a background PTY.",
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {
+                    "command": { "type": "STRING", "description": "Shell command to run in background PTY." }
+                },
+                "required": ["command"]
+            }
+        }),
+        json!({
+            "name": "read_background_process",
+            "description": "Read unread PTY output and status from a background process.",
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {
+                    "proc_id": { "type": "STRING", "description": "Process ID returned by start_background_process." }
+                },
+                "required": ["proc_id"]
+            }
+        }),
+        json!({
+            "name": "stop_background_process",
+            "description": "Stop a running background PTY process.",
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {
+                    "proc_id": { "type": "STRING", "description": "Process ID returned by start_background_process." }
+                },
+                "required": ["proc_id"]
+            }
+        }),
+        json!({
+            "name": "create_worktree",
+            "description": "Create an isolated git worktree sandbox for parallel or risky task changes.",
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {
+                    "task_name": { "type": "STRING", "description": "Short task slug for the worktree branch." }
+                },
+                "required": ["task_name"]
+            }
+        }),
+        json!({
+            "name": "diff_worktree",
+            "description": "Inspect git diff inside a worktree sandbox.",
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {
+                    "worktree_path": { "type": "STRING", "description": "Filesystem path of the worktree." }
+                },
+                "required": ["worktree_path"]
+            }
+        }),
+        json!({
+            "name": "inspect_web_page",
+            "description": "Open a URL in Rursor's built-in Web Preview (optional) and inspect HTTP status, title, console/script errors, and visible text.",
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {
+                    "url": { "type": "STRING", "description": "HTTP or HTTPS URL (e.g. http://localhost:3000)." },
+                    "open_preview": { "type": "BOOLEAN", "description": "Whether to open/focus the Web Preview panel." }
+                },
+                "required": ["url"]
             }
         }),
     ];
