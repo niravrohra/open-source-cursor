@@ -16,6 +16,10 @@ trap 'rm -rf "${STAGING_DIR}"' EXIT
 
 echo "=== Staging Rursor.app for DMG ==="
 ditto "${APP_PATH}" "${STAGING_DIR}/Rursor.app"
+
+chmod +x "${FORK_DIR}/scripts/sign-rursor-app.sh"
+"${FORK_DIR}/scripts/sign-rursor-app.sh" "${STAGING_DIR}/Rursor.app"
+
 ln -s /Applications "${STAGING_DIR}/Applications"
 
 rm -f "${DMG_PATH}"

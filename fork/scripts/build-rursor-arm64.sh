@@ -39,13 +39,17 @@ shopt -u nullglob
 echo "=== 4. Applying Rursor product.json, app icon & bundling rursor-ai ==="
 cp "${ROOT_DIR}/fork/product.json" "${VSCODE_DIR}/product.json"
 cp "${ROOT_DIR}/fork/resources/darwin/rursor.icns" "${VSCODE_DIR}/resources/darwin/code.icns"
-rm -rf "${VSCODE_DIR}/extensions/rursor-ai"
 mkdir -p "${VSCODE_DIR}/extensions/rursor-ai"
-cp -R \
-  "${ROOT_DIR}/extension/package.json" \
-  "${ROOT_DIR}/extension/.vscodeignore" \
-  "${ROOT_DIR}/extension/out" \
-  "${ROOT_DIR}/extension/bin" \
+rsync -a --delete \
+  --exclude 'node_modules/' \
+  --exclude 'src/' \
+  --exclude '.vscode/' \
+  --exclude '.git/' \
+  --exclude 'tsconfig.json' \
+  --exclude 'package-lock.json' \
+  --exclude '*.tsbuildinfo' \
+  --exclude '.DS_Store' \
+  "${ROOT_DIR}/extension/" \
   "${VSCODE_DIR}/extensions/rursor-ai/"
 chmod +x "${VSCODE_DIR}/extensions/rursor-ai/bin/rursor-sidecar"
 
@@ -55,4 +59,8 @@ npm ci
 npm run gulp vscode-darwin-arm64
 popd >/dev/null
 
-echo "Build complete. Output bundle is under ${ROOT_DIR}/fork/VSCode-darwin-arm64/Rursor.app"
+APP_OUT="${ROOT_DIR}/fork/VSCode-darwin-arm64/Rursor.app"
+chmod +x "${ROOT_DIR}/fork/scripts/sign-rursor-app.sh"
+"${ROOT_DIR}/fork/scripts/sign-rursor-app.sh" "${APP_OUT}"
+
+echo "Build complete. Signed bundle is under ${APP_OUT}"
