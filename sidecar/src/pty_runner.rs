@@ -447,7 +447,7 @@ mod tests {
         let cwd: PathBuf = std::env::temp_dir();
 
         let info = manager
-            .start_background("echo bg_started && sleep 10", &cwd)
+            .start_background("echo bg_started && cat", &cwd)
             .unwrap();
         assert!(info.running);
         assert_eq!(manager.list_processes().len(), 1);
@@ -465,6 +465,21 @@ mod tests {
         assert!(
             accumulated.contains("bg_started"),
             "Expected 'bg_started' in PTY output, got: {accumulated:?}"
+        );
+
+        manager.write_input(&info.proc_id, "pty_ping\n").unwrap();
+        let mut echoed = String::new();
+        for _ in 0..30 {
+            let out = manager.read_output(&info.proc_id).unwrap();
+            echoed.push_str(&out.output);
+            if echoed.contains("pty_ping") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            echoed.contains("pty_ping"),
+            "Expected 'pty_ping' echoed in PTY output, got: {echoed:?}"
         );
 
         let stopped = manager.stop_process(&info.proc_id).unwrap();

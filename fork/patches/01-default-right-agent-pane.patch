@@ -1,0 +1,68 @@
+diff --git a/src/vs/workbench/browser/layout.ts b/src/vs/workbench/browser/layout.ts
+index eb8657f..4b1772c 100644
+--- a/src/vs/workbench/browser/layout.ts
++++ b/src/vs/workbench/browser/layout.ts
+@@ -713,9 +713,9 @@ export abstract class Layout extends Disposable implements IWorkbenchLayoutServi
+ 					viewContainerToRestore = 'workbench.panel.chat'; // TODO@bpasero remove me after some months
+ 				}
+ 				this.state.initialization.views.containerToRestore.auxiliaryBar = viewContainerToRestore;
+-			} else {
+-				this.stateModel.setRuntimeValue(LayoutStateKeys.AUXILIARYBAR_HIDDEN, true);
+ 			}
++			// Keep AUXILIARYBAR_HIDDEN=false so the right-side Agent pane remains visible by default
++			// even if the default AuxiliaryBar view container registers asynchronously with extensions.
+ 		}
+ 
+ 		// Window border
+@@ -1062,14 +1062,21 @@ export abstract class Layout extends Disposable implements IWorkbenchLayoutServi
+ 			// restored, as such we need to test again
+ 			await restoreDefaultViewsPromise;
+ 			if (!this.state.initialization.views.containerToRestore.auxiliaryBar) {
+-				return;
++				await this.extensionService.whenInstalledExtensionsRegistered();
++				const fallbackId = this.viewDescriptorService.getDefaultViewContainer(ViewContainerLocation.AuxiliaryBar)?.id
++					?? this.viewDescriptorService.getViewContainersByLocation(ViewContainerLocation.AuxiliaryBar).find(viewContainer => this.hasViews(viewContainer.id))?.id;
++				if (!fallbackId) {
++					return;
++				}
++				this.state.initialization.views.containerToRestore.auxiliaryBar = fallbackId;
+ 			}
+ 
+ 			mark('code/willRestoreAuxiliaryBar');
+ 
+-			const panel = await this.paneCompositeService.openPaneComposite(this.state.initialization.views.containerToRestore.auxiliaryBar, ViewContainerLocation.AuxiliaryBar);
++			// Open without stealing focus from the editor on initial startup
++			const panel = await this.paneCompositeService.openPaneComposite(this.state.initialization.views.containerToRestore.auxiliaryBar, ViewContainerLocation.AuxiliaryBar, false);
+ 			if (!panel) {
+-				await this.paneCompositeService.openPaneComposite(this.viewDescriptorService.getDefaultViewContainer(ViewContainerLocation.AuxiliaryBar)?.id, ViewContainerLocation.AuxiliaryBar); // fallback to default panel as needed
++				await this.paneCompositeService.openPaneComposite(this.viewDescriptorService.getDefaultViewContainer(ViewContainerLocation.AuxiliaryBar)?.id, ViewContainerLocation.AuxiliaryBar, false); // fallback to default panel as needed
+ 			}
+ 
+ 			mark('code/didRestoreAuxiliaryBar');
+@@ -2533,7 +2540,7 @@ const LayoutStateKeys = {
+ 	// Part Sizing
+ 	GRID_SIZE: new InitializationStateKey('grid.size', StorageScope.PROFILE, StorageTarget.MACHINE, { width: 800, height: 600 }),
+ 	SIDEBAR_SIZE: new InitializationStateKey<number>('sideBar.size', StorageScope.PROFILE, StorageTarget.MACHINE, 200),
+-	AUXILIARYBAR_SIZE: new InitializationStateKey<number>('auxiliaryBar.size', StorageScope.PROFILE, StorageTarget.MACHINE, 200),
++	AUXILIARYBAR_SIZE: new InitializationStateKey<number>('auxiliaryBar.size', StorageScope.PROFILE, StorageTarget.MACHINE, 360),
+ 	PANEL_SIZE: new InitializationStateKey<number>('panel.size', StorageScope.PROFILE, StorageTarget.MACHINE, 300),
+ 
+ 	PANEL_LAST_NON_MAXIMIZED_HEIGHT: new RuntimeStateKey<number>('panel.lastNonMaximizedHeight', StorageScope.PROFILE, StorageTarget.MACHINE, 300),
+@@ -2550,7 +2557,7 @@ const LayoutStateKeys = {
+ 	SIDEBAR_HIDDEN: new RuntimeStateKey<boolean>('sideBar.hidden', StorageScope.WORKSPACE, StorageTarget.MACHINE, false),
+ 	EDITOR_HIDDEN: new RuntimeStateKey<boolean>('editor.hidden', StorageScope.WORKSPACE, StorageTarget.MACHINE, false),
+ 	PANEL_HIDDEN: new RuntimeStateKey<boolean>('panel.hidden', StorageScope.WORKSPACE, StorageTarget.MACHINE, true),
+-	AUXILIARYBAR_HIDDEN: new RuntimeStateKey<boolean>('auxiliaryBar.hidden', StorageScope.WORKSPACE, StorageTarget.MACHINE, true),
++	AUXILIARYBAR_HIDDEN: new RuntimeStateKey<boolean>('auxiliaryBar.hidden', StorageScope.WORKSPACE, StorageTarget.MACHINE, false),
+ 	STATUSBAR_HIDDEN: new RuntimeStateKey<boolean>('statusBar.hidden', StorageScope.WORKSPACE, StorageTarget.MACHINE, false, true)
+ 
+ } as const;
+@@ -2644,7 +2651,7 @@ class LayoutStateModel extends Disposable {
+ 		LayoutStateKeys.PANEL_POSITION.defaultValue = positionFromString(this.configurationService.getValue(WorkbenchLayoutSettings.PANEL_POSITION) ?? 'bottom');
+ 		LayoutStateKeys.GRID_SIZE.defaultValue = { height: workbenchDimensions.height, width: workbenchDimensions.width };
+ 		LayoutStateKeys.SIDEBAR_SIZE.defaultValue = Math.min(300, workbenchDimensions.width / 4);
+-		LayoutStateKeys.AUXILIARYBAR_SIZE.defaultValue = Math.min(300, workbenchDimensions.width / 4);
++		LayoutStateKeys.AUXILIARYBAR_SIZE.defaultValue = Math.min(360, Math.round(workbenchDimensions.width * 0.28));
+ 		LayoutStateKeys.PANEL_SIZE.defaultValue = (this.stateCache.get(LayoutStateKeys.PANEL_POSITION.name) ?? isHorizontal(LayoutStateKeys.PANEL_POSITION.defaultValue)) ? workbenchDimensions.height / 3 : workbenchDimensions.width / 4;
+ 		LayoutStateKeys.SIDEBAR_HIDDEN.defaultValue = this.contextService.getWorkbenchState() === WorkbenchState.EMPTY;
+ 

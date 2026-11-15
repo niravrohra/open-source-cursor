@@ -441,6 +441,16 @@ pub fn restore_checkpoint(
 /// Creates an isolated git worktree sandbox on a new branch `rursor/<task_slug>-<seq>` under
 /// `~/.rursor/worktrees/<repo_hash>/`.
 pub fn create_worktree(repo_root: &Path, task_name: &str) -> Result<WorktreeInfo, String> {
+    let base_dir = rursor_home_dir().join("worktrees");
+    create_worktree_in(repo_root, task_name, &base_dir)
+}
+
+/// Creates an isolated git worktree sandbox under an explicit `worktrees_base_dir`.
+pub fn create_worktree_in(
+    repo_root: &Path,
+    task_name: &str,
+    worktrees_base_dir: &Path,
+) -> Result<WorktreeInfo, String> {
     let canonical_root = repo_root
         .canonicalize()
         .map_err(|e| format!("Invalid repository root '{}': {e}", repo_root.display()))?;
@@ -450,8 +460,7 @@ pub fn create_worktree(repo_root: &Path, task_name: &str) -> Result<WorktreeInfo
     let seq = NEXT_WORKTREE_SEQ.fetch_add(1, Ordering::Relaxed);
     let ts = epoch_secs();
     let branch_name = format!("rursor/{slug}-{ts}-{seq}");
-    let worktree_dir = rursor_home_dir()
-        .join("worktrees")
+    let worktree_dir = worktrees_base_dir
         .join(workspace_hash(&canonical_root))
         .join(format!("{slug}-{ts}-{seq}"));
 
@@ -875,7 +884,8 @@ mod tests {
         store.restore_checkpoint(&repo, &cp.checkpoint_id).unwrap();
         fs::write(repo.join("main.txt"), "base\n").unwrap();
 
-        let wt = create_worktree(&repo, "Fix Auth Bug").unwrap();
+        let wt_base = temp_dir("rursor_wt_base");
+        let wt = create_worktree_in(&repo, "Fix Auth Bug", &wt_base).unwrap();
         let wt_path = PathBuf::from(&wt.path);
         assert!(wt_path.exists());
         let branch = wt.branch.clone().unwrap();
@@ -903,5 +913,6 @@ mod tests {
 
         let _ = fs::remove_dir_all(&repo);
         let _ = fs::remove_dir_all(&store_dir);
+        let _ = fs::remove_dir_all(&wt_base);
     }
 }

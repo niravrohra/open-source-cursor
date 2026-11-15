@@ -1,0 +1,773 @@
+diff --git a/src/vs/editor/contrib/rursorInlineEdit/browser/rursorInlineEdit.css b/src/vs/editor/contrib/rursorInlineEdit/browser/rursorInlineEdit.css
+new file mode 100644
+index 0000000..b12f0fd
+--- /dev/null
++++ b/src/vs/editor/contrib/rursorInlineEdit/browser/rursorInlineEdit.css
+@@ -0,0 +1,205 @@
++/*---------------------------------------------------------------------------------------------
++ *  Copyright (c) Microsoft Corporation. All rights reserved.
++ *  Licensed under the MIT License. See License.txt in the project root for license information.
++ *--------------------------------------------------------------------------------------------*/
++
++.monaco-editor .zone-widget.rursor-inline-edit-zone > .zone-widget-container {
++	border-top-width: 0 !important;
++	border-bottom-width: 0 !important;
++	background: transparent;
++	overflow: visible !important;
++}
++
++.monaco-editor .rursor-inline-edit-card {
++	display: flex;
++	flex-direction: column;
++	gap: 6px;
++	margin: 2px 16px 2px 4px;
++	padding: 8px 10px;
++	border-radius: 8px;
++	border: 1px solid var(--vscode-focusBorder, var(--vscode-editorWidget-border, rgba(128, 128, 128, 0.45)));
++	background-color: var(--vscode-editorWidget-background, var(--vscode-editor-background));
++	color: var(--vscode-editorWidget-foreground, var(--vscode-foreground));
++	box-shadow: 0 6px 20px rgba(0, 0, 0, 0.28);
++	font-family: var(--monaco-font-family, sans-serif);
++	font-size: 12px;
++	box-sizing: border-box;
++}
++
++.monaco-editor .rursor-inline-header {
++	display: flex;
++	align-items: center;
++	justify-content: space-between;
++	gap: 8px;
++}
++
++.monaco-editor .rursor-inline-title-group {
++	display: flex;
++	align-items: center;
++	gap: 6px;
++	font-weight: 600;
++	font-size: 11px;
++}
++
++.monaco-editor .rursor-inline-range-badge {
++	font-family: var(--monaco-monospace-font);
++	font-size: 10px;
++	font-weight: 500;
++	padding: 1px 6px;
++	border-radius: 4px;
++	background-color: rgba(128, 128, 128, 0.18);
++	opacity: 0.85;
++}
++
++.monaco-editor .rursor-inline-status {
++	font-size: 11px;
++	opacity: 0.8;
++	display: flex;
++	align-items: center;
++	gap: 4px;
++}
++
++.monaco-editor .rursor-inline-input-row {
++	display: flex;
++	align-items: center;
++	gap: 6px;
++}
++
++.monaco-editor .rursor-inline-input {
++	flex: 1;
++	min-width: 0;
++	height: 26px;
++	padding: 3px 8px;
++	border-radius: 5px;
++	border: 1px solid var(--vscode-input-border, rgba(128, 128, 128, 0.35));
++	background-color: var(--vscode-input-background, rgba(0, 0, 0, 0.2));
++	color: var(--vscode-input-foreground, inherit);
++	font-family: inherit;
++	font-size: 12px;
++	outline: none;
++	box-sizing: border-box;
++}
++
++.monaco-editor .rursor-inline-input:focus {
++	border-color: var(--vscode-focusBorder, #007fd4);
++}
++
++.monaco-editor .rursor-inline-input::placeholder {
++	color: var(--vscode-input-placeholderForeground, rgba(128, 128, 128, 0.75));
++}
++
++.monaco-editor .rursor-inline-btn {
++	height: 26px;
++	padding: 0 9px;
++	border-radius: 5px;
++	border: 1px solid var(--vscode-button-border, transparent);
++	background-color: var(--vscode-button-secondaryBackground, rgba(128, 128, 128, 0.18));
++	color: var(--vscode-button-secondaryForeground, inherit);
++	font-size: 11px;
++	font-weight: 500;
++	cursor: pointer;
++	white-space: nowrap;
++}
++
++.monaco-editor .rursor-inline-btn:hover {
++	background-color: var(--vscode-button-secondaryHoverBackground, rgba(128, 128, 128, 0.28));
++}
++
++.monaco-editor .rursor-inline-btn.primary {
++	background-color: var(--vscode-button-background, #0078d4);
++	color: var(--vscode-button-foreground, #ffffff);
++}
++
++.monaco-editor .rursor-inline-btn.primary:hover {
++	background-color: var(--vscode-button-hoverBackground, #106ebe);
++}
++
++.monaco-editor .rursor-inline-btn.accept {
++	background-color: rgba(46, 160, 67, 0.85);
++	color: #ffffff;
++}
++
++.monaco-editor .rursor-inline-btn.revert {
++	background-color: rgba(248, 81, 73, 0.22);
++	border-color: rgba(248, 81, 73, 0.5);
++}
++
++.monaco-editor .rursor-inline-presets {
++	display: flex;
++	flex-wrap: wrap;
++	align-items: center;
++	gap: 5px;
++}
++
++.monaco-editor .rursor-inline-chip {
++	padding: 2px 7px;
++	border-radius: 999px;
++	border: 1px solid rgba(128, 128, 128, 0.28);
++	background: rgba(128, 128, 128, 0.1);
++	color: inherit;
++	font-size: 10px;
++	cursor: pointer;
++}
++
++.monaco-editor .rursor-inline-chip:hover {
++	background: rgba(128, 128, 128, 0.22);
++}
++
++.monaco-editor .rursor-inline-diff-preview {
++	display: none;
++	max-height: 110px;
++	overflow-y: auto;
++	border-radius: 5px;
++	border: 1px solid rgba(128, 128, 128, 0.28);
++	background-color: var(--vscode-editor-background);
++	font-family: var(--monaco-monospace-font);
++	font-size: 11px;
++	line-height: 16px;
++	padding: 4px 0;
++}
++
++.monaco-editor .rursor-inline-diff-preview.visible {
++	display: block;
++}
++
++.monaco-editor .rursor-inline-diff-line {
++	padding: 0 8px;
++	white-space: pre;
++	overflow: hidden;
++	text-overflow: ellipsis;
++}
++
++.monaco-editor .rursor-inline-diff-line.added {
++	background-color: rgba(46, 160, 67, 0.18);
++	border-left: 3px solid rgba(46, 160, 67, 0.9);
++}
++
++.monaco-editor .rursor-inline-diff-line.removed {
++	background-color: rgba(248, 81, 73, 0.18);
++	border-left: 3px solid rgba(248, 81, 73, 0.9);
++	text-decoration: line-through;
++	opacity: 0.85;
++}
++
++.monaco-editor .rursor-inline-diff-line.same {
++	opacity: 0.7;
++	border-left: 3px solid transparent;
++}
++
++/* Editor Model Decorations for target range and live streaming hunks */
++.monaco-editor .rursor-inline-target-range {
++	background-color: rgba(56, 139, 253, 0.12);
++	border-left: 2px solid rgba(56, 139, 253, 0.75);
++}
++
++.monaco-editor .rursor-inline-diff-added-line {
++	background-color: rgba(46, 160, 67, 0.22);
++	border-left: 3px solid rgba(46, 160, 67, 0.9);
++}
++
++.monaco-editor .rursor-inline-diff-removed-line {
++	background-color: rgba(248, 81, 73, 0.22);
++	border-left: 3px solid rgba(248, 81, 73, 0.9);
++	text-decoration: line-through;
++	opacity: 0.82;
++}
+diff --git a/src/vs/editor/contrib/rursorInlineEdit/browser/rursorInlineEdit.ts b/src/vs/editor/contrib/rursorInlineEdit/browser/rursorInlineEdit.ts
+new file mode 100644
+index 0000000..9bb0548
+--- /dev/null
++++ b/src/vs/editor/contrib/rursorInlineEdit/browser/rursorInlineEdit.ts
+@@ -0,0 +1,544 @@
++/*---------------------------------------------------------------------------------------------
++ *  Copyright (c) Microsoft Corporation. All rights reserved.
++ *  Licensed under the MIT License. See License.txt in the project root for license information.
++ *--------------------------------------------------------------------------------------------*/
++
++import * as dom from '../../../../base/browser/dom.js';
++import { StandardKeyboardEvent } from '../../../../base/browser/keyboardEvent.js';
++import { Codicon } from '../../../../base/common/codicons.js';
++import { KeyCode, KeyMod } from '../../../../base/common/keyCodes.js';
++import { Disposable, MutableDisposable } from '../../../../base/common/lifecycle.js';
++import { ThemeIcon } from '../../../../base/common/themables.js';
++import { localize, localize2 } from '../../../../nls.js';
++import { CommandsRegistry, ICommandService } from '../../../../platform/commands/common/commands.js';
++import { ContextKeyExpr, IContextKey, IContextKeyService, RawContextKey } from '../../../../platform/contextkey/common/contextkey.js';
++import { KeybindingWeight } from '../../../../platform/keybinding/common/keybindingsRegistry.js';
++import { EditorAction, EditorContributionInstantiation, ServicesAccessor, registerEditorAction, registerEditorContribution } from '../../../browser/editorExtensions.js';
++import { ICodeEditor } from '../../../browser/editorBrowser.js';
++import { ICodeEditorService } from '../../../browser/services/codeEditorService.js';
++import { EditorOption } from '../../../common/config/editorOptions.js';
++import { Range } from '../../../common/core/range.js';
++import { IEditorContribution, IEditorDecorationsCollection } from '../../../common/editorCommon.js';
++import { EditorContextKeys } from '../../../common/editorContextKeys.js';
++import { IModelDeltaDecoration, TrackedRangeStickiness } from '../../../common/model.js';
++import { ModelDecorationOptions } from '../../../common/model/textModel.js';
++import { ZoneWidget } from '../../zoneWidget/browser/zoneWidget.js';
++import './rursorInlineEdit.css';
++
++export const RursorInlineEditVisible = new RawContextKey<boolean>(
++	'rursorInlineEditVisible',
++	false,
++	localize('rursorInlineEditVisible', "Whether the native Rursor inline edit ZoneWidget is visible")
++);
++
++export interface IRursorDiffHunk {
++	readonly kind: 'same' | 'added' | 'removed';
++	readonly text: string;
++	readonly lineNumber?: number;
++}
++
++const TARGET_RANGE_DECORATION = ModelDecorationOptions.register({
++	description: 'rursor-inline-target-range',
++	className: 'rursor-inline-target-range',
++	isWholeLine: true,
++	stickiness: TrackedRangeStickiness.NeverGrowsWhenTypingAtEdges,
++});
++
++const ADDED_LINE_DECORATION = ModelDecorationOptions.register({
++	description: 'rursor-inline-diff-added-line',
++	className: 'rursor-inline-diff-added-line',
++	isWholeLine: true,
++	stickiness: TrackedRangeStickiness.NeverGrowsWhenTypingAtEdges,
++});
++
++const REMOVED_LINE_DECORATION = ModelDecorationOptions.register({
++	description: 'rursor-inline-diff-removed-line',
++	className: 'rursor-inline-diff-removed-line',
++	isWholeLine: true,
++	stickiness: TrackedRangeStickiness.NeverGrowsWhenTypingAtEdges,
++});
++
++interface IRursorInlineEditWidgetCallbacks {
++	onSubmit(prompt: string): void;
++	onCancel(): void;
++	onAccept(): void;
++	onRevert(): void;
++}
++
++class RursorInlineEditZoneWidget extends ZoneWidget {
++
++	private _cardElement!: HTMLElement;
++	private _rangeBadge!: HTMLElement;
++	private _statusElement!: HTMLElement;
++	private _inputElement!: HTMLInputElement;
++	private _submitButton!: HTMLButtonElement;
++	private _acceptButton!: HTMLButtonElement;
++	private _revertButton!: HTMLButtonElement;
++	private _presetsRow!: HTMLElement;
++	private _diffPreviewElement!: HTMLElement;
++
++	private _anchorRange: Range = new Range(1, 1, 1, 1);
++	private _hasDiffPreview = false;
++	private readonly _promptHistory: string[] = [];
++	private _historyIndex = -1;
++
++	constructor(
++		editor: ICodeEditor,
++		private readonly callbacks: IRursorInlineEditWidgetCallbacks,
++	) {
++		super(editor, {
++			showFrame: false,
++			showArrow: false,
++			isAccessible: true,
++			keepEditorSelection: true,
++			allowUnlimitedHeight: true,
++		});
++		this.create();
++	}
++
++	protected override _fillContainer(container: HTMLElement): void {
++		this.domNode.classList.add('rursor-inline-edit-zone');
++
++		this._cardElement = dom.append(container, dom.$('.rursor-inline-edit-card'));
++
++		// Header row: Rursor branding + selection range + streaming status
++		const header = dom.append(this._cardElement, dom.$('.rursor-inline-header'));
++		const titleGroup = dom.append(header, dom.$('.rursor-inline-title-group'));
++		const sparkle = dom.append(titleGroup, dom.$('span'));
++		sparkle.classList.add(...ThemeIcon.asClassNameArray(Codicon.sparkle));
++		const titleText = dom.append(titleGroup, dom.$('span'));
++		titleText.textContent = localize('rursor.inline.title', "Rursor Inline Edit");
++
++		this._rangeBadge = dom.append(titleGroup, dom.$('span.rursor-inline-range-badge'));
++		this._statusElement = dom.append(header, dom.$('.rursor-inline-status'));
++
++		// Input row
++		const inputRow = dom.append(this._cardElement, dom.$('.rursor-inline-input-row'));
++		this._inputElement = dom.append(inputRow, dom.$('input.rursor-inline-input')) as HTMLInputElement;
++		this._inputElement.type = 'text';
++		this._inputElement.placeholder = localize('rursor.inline.placeholder', "Describe an edit… (Enter to run, Esc to close)");
++		this._inputElement.setAttribute('aria-label', localize('rursor.inline.inputAria', "Rursor inline edit instruction"));
++
++		this._submitButton = dom.append(inputRow, dom.$('button.rursor-inline-btn.primary')) as HTMLButtonElement;
++		this._submitButton.type = 'button';
++		this._submitButton.textContent = localize('rursor.inline.generate', "Generate ↵");
++
++		this._acceptButton = dom.append(inputRow, dom.$('button.rursor-inline-btn.accept')) as HTMLButtonElement;
++		this._acceptButton.type = 'button';
++		this._acceptButton.textContent = localize('rursor.inline.accept', "Accept (⌘Y)");
++		this._acceptButton.style.display = 'none';
++
++		this._revertButton = dom.append(inputRow, dom.$('button.rursor-inline-btn.revert')) as HTMLButtonElement;
++		this._revertButton.type = 'button';
++		this._revertButton.textContent = localize('rursor.inline.revert', "Revert (⌘N)");
++		this._revertButton.style.display = 'none';
++
++		const closeButton = dom.append(inputRow, dom.$('button.rursor-inline-btn')) as HTMLButtonElement;
++		closeButton.type = 'button';
++		closeButton.textContent = '✕';
++		closeButton.title = localize('rursor.inline.close', "Close (Esc)");
++
++		// Quick preset chips
++		this._presetsRow = dom.append(this._cardElement, dom.$('.rursor-inline-presets'));
++		const presets = [
++			{ label: localize('rursor.preset.refactor', "Refactor"), prompt: 'Refactor and improve readability' },
++			{ label: localize('rursor.preset.errors', "Add Error Handling"), prompt: 'Add robust error handling and edge-case checks' },
++			{ label: localize('rursor.preset.tests', "Write Tests"), prompt: 'Write unit tests for this code' },
++			{ label: localize('rursor.preset.fix', "Fix Diagnostics"), prompt: 'Fix the diagnostics in this code' },
++		];
++		for (const preset of presets) {
++			const chip = dom.append(this._presetsRow, dom.$('button.rursor-inline-chip')) as HTMLButtonElement;
++			chip.type = 'button';
++			chip.textContent = preset.label;
++			this._disposables.add(dom.addDisposableListener(chip, dom.EventType.CLICK, () => {
++				this._inputElement.value = preset.prompt;
++				this._submitPrompt();
++			}));
++		}
++
++		// Live streaming hunk diff preview area
++		this._diffPreviewElement = dom.append(this._cardElement, dom.$('.rursor-inline-diff-preview'));
++
++		// Event listeners
++		this._disposables.add(dom.addDisposableListener(this._inputElement, dom.EventType.KEY_DOWN, e => {
++			const event = new StandardKeyboardEvent(e);
++			if (event.equals(KeyCode.Enter)) {
++				dom.EventHelper.stop(e, true);
++				this._submitPrompt();
++			} else if (event.equals(KeyCode.Escape)) {
++				dom.EventHelper.stop(e, true);
++				if (this._hasDiffPreview) {
++					this.callbacks.onRevert();
++				} else {
++					this.callbacks.onCancel();
++				}
++			} else if (event.equals(KeyCode.UpArrow) && this._promptHistory.length > 0) {
++				dom.EventHelper.stop(e, true);
++				this._historyIndex = Math.min(this._historyIndex + 1, this._promptHistory.length - 1);
++				this._inputElement.value = this._promptHistory[this._historyIndex];
++			} else if (event.equals(KeyCode.DownArrow)) {
++				dom.EventHelper.stop(e, true);
++				this._historyIndex = Math.max(this._historyIndex - 1, -1);
++				this._inputElement.value = this._historyIndex >= 0 ? this._promptHistory[this._historyIndex] : '';
++			}
++		}));
++
++		this._disposables.add(dom.addDisposableListener(this._submitButton, dom.EventType.CLICK, () => this._submitPrompt()));
++		this._disposables.add(dom.addDisposableListener(this._acceptButton, dom.EventType.CLICK, () => this.callbacks.onAccept()));
++		this._disposables.add(dom.addDisposableListener(this._revertButton, dom.EventType.CLICK, () => this.callbacks.onRevert()));
++		this._disposables.add(dom.addDisposableListener(closeButton, dom.EventType.CLICK, () => this.callbacks.onCancel()));
++	}
++
++	private _submitPrompt(): void {
++		const prompt = this._inputElement.value.trim();
++		if (!prompt) {
++			this._inputElement.focus();
++			return;
++		}
++		if (this._promptHistory[0] !== prompt) {
++			this._promptHistory.unshift(prompt);
++			if (this._promptHistory.length > 16) {
++				this._promptHistory.pop();
++			}
++		}
++		this._historyIndex = -1;
++		this.callbacks.onSubmit(prompt);
++	}
++
++	showAboveRange(targetRange: Range, initialPrompt?: string): void {
++		this._anchorRange = targetRange;
++		this._rangeBadge.textContent = targetRange.startLineNumber === targetRange.endLineNumber
++			? `L${targetRange.startLineNumber}`
++			: `L${targetRange.startLineNumber}–L${targetRange.endLineNumber}`;
++
++		if (initialPrompt !== undefined) {
++			this._inputElement.value = initialPrompt;
++		}
++
++		// Anchor the view zone above the selection's start line.
++		const anchorLine = Math.max(1, targetRange.startLineNumber - 1);
++		const heightInLines = this._computeHeightInLines();
++		super.show(new Range(anchorLine, 1, anchorLine, 1), heightInLines);
++
++		if (targetRange.startLineNumber === 1 && this._viewZone) {
++			this._viewZone.afterLineNumber = 0;
++			this.editor.changeViewZones(accessor => {
++				if (this._viewZone) {
++					accessor.layoutZone(this._viewZone.id);
++				}
++			});
++		}
++
++		this._inputElement.focus();
++		this._inputElement.select();
++	}
++
++	setStreamingStatus(streaming: boolean, statusText?: string): void {
++		this._statusElement.textContent = statusText ?? (streaming ? localize('rursor.inline.streaming', "Streaming edit…") : '');
++		this._submitButton.disabled = streaming;
++	}
++
++	setPreviewHunks(hunks: readonly IRursorDiffHunk[]): void {
++		dom.clearNode(this._diffPreviewElement);
++		this._hasDiffPreview = hunks.length > 0;
++		this._diffPreviewElement.classList.toggle('visible', this._hasDiffPreview);
++		this._acceptButton.style.display = this._hasDiffPreview ? '' : 'none';
++		this._revertButton.style.display = this._hasDiffPreview ? '' : 'none';
++
++		let added = 0;
++		let removed = 0;
++		for (const hunk of hunks) {
++			const row = dom.append(this._diffPreviewElement, dom.$(`.rursor-inline-diff-line.${hunk.kind}`));
++			const prefix = hunk.kind === 'added' ? '+ ' : hunk.kind === 'removed' ? '- ' : '  ';
++			row.textContent = `${prefix}${hunk.text}`;
++			if (hunk.kind === 'added') {
++				added++;
++			} else if (hunk.kind === 'removed') {
++				removed++;
++			}
++		}
++
++		if (this._hasDiffPreview) {
++			this._statusElement.textContent = `+${added} / -${removed}`;
++		}
++
++		this._refreshZoneHeight();
++	}
++
++	clearPreview(): void {
++		this._hasDiffPreview = false;
++		dom.clearNode(this._diffPreviewElement);
++		this._diffPreviewElement.classList.remove('visible');
++		this._acceptButton.style.display = 'none';
++		this._revertButton.style.display = 'none';
++		this._statusElement.textContent = '';
++		this._submitButton.disabled = false;
++		this._refreshZoneHeight();
++	}
++
++	private _computeHeightInLines(): number {
++		const lineHeight = Math.max(16, this.editor.getOption(EditorOption.lineHeight));
++		const basePx = 88;
++		const previewPx = this._hasDiffPreview ? Math.min(118, Math.max(44, this._diffPreviewElement.childElementCount * 16 + 12)) : 0;
++		return Math.max(4, Math.ceil((basePx + previewPx) / lineHeight));
++	}
++
++	private _refreshZoneHeight(): void {
++		if (!this._viewZone) {
++			return;
++		}
++		const anchorLine = Math.max(0, this._anchorRange.startLineNumber - 1);
++		this._viewZone.afterLineNumber = anchorLine;
++		this._viewZone.heightInLines = this._computeHeightInLines();
++		this.editor.changeViewZones(accessor => {
++			if (this._viewZone) {
++				accessor.layoutZone(this._viewZone.id);
++			}
++		});
++	}
++
++	protected override _doLayout(_heightInPixel: number, widthInPixel: number): void {
++		if (this._cardElement) {
++			this._cardElement.style.maxWidth = `${Math.max(320, widthInPixel - 28)}px`;
++		}
++	}
++}
++
++export class RursorInlineEditController extends Disposable implements IEditorContribution {
++
++	public static readonly ID = 'editor.contrib.rursorInlineEdit';
++
++	static get(editor: ICodeEditor): RursorInlineEditController | null {
++		return editor.getContribution<RursorInlineEditController>(RursorInlineEditController.ID);
++	}
++
++	private readonly _visibleContextKey: IContextKey<boolean>;
++	private readonly _widget = this._register(new MutableDisposable<RursorInlineEditZoneWidget>());
++	private readonly _targetDecorations: IEditorDecorationsCollection;
++	private readonly _diffDecorations: IEditorDecorationsCollection;
++	private _activeRange: Range | undefined;
++
++	constructor(
++		private readonly _editor: ICodeEditor,
++		@IContextKeyService contextKeyService: IContextKeyService,
++		@ICommandService private readonly _commandService: ICommandService,
++	) {
++		super();
++		this._visibleContextKey = RursorInlineEditVisible.bindTo(contextKeyService);
++		this._targetDecorations = this._editor.createDecorationsCollection();
++		this._diffDecorations = this._editor.createDecorationsCollection();
++
++		this._register(this._editor.onDidChangeModel(() => this.hide()));
++		this._register(this._editor.onDidDispose(() => this.hide()));
++	}
++
++	show(initialPrompt?: string): void {
++		const model = this._editor.getModel();
++		if (!model) {
++			return;
++		}
++
++		const selection = this._editor.getSelection() ?? new Range(1, 1, 1, 1);
++		const targetRange = selection.isEmpty()
++			? new Range(selection.startLineNumber, 1, selection.startLineNumber, model.getLineMaxColumn(selection.startLineNumber))
++			: new Range(selection.startLineNumber, selection.startColumn, selection.endLineNumber, selection.endColumn);
++
++		this._activeRange = targetRange;
++		this._targetDecorations.set([{
++			range: targetRange,
++			options: TARGET_RANGE_DECORATION,
++		}]);
++
++		if (!this._widget.value) {
++			this._widget.value = new RursorInlineEditZoneWidget(this._editor, {
++				onSubmit: (prompt) => this._handleSubmit(prompt),
++				onCancel: () => this.hide(),
++				onAccept: () => { void this.acceptInlineEdit(); },
++				onRevert: () => { void this.revertInlineEdit(); },
++			});
++		}
++
++		this._visibleContextKey.set(true);
++		this._widget.value.showAboveRange(targetRange, initialPrompt);
++	}
++
++	hide(): void {
++		this._visibleContextKey.set(false);
++		this._targetDecorations.clear();
++		this._diffDecorations.clear();
++		this._activeRange = undefined;
++		this._widget.value?.clearPreview();
++		this._widget.value?.hide();
++	}
++
++	setStreamingState(streaming: boolean, statusText?: string): void {
++		this._widget.value?.setStreamingStatus(streaming, statusText);
++	}
++
++	updateDiffPreview(hunks: readonly IRursorDiffHunk[], startLineNumber?: number): void {
++		const model = this._editor.getModel();
++		if (!model) {
++			return;
++		}
++
++		const baseLine = startLineNumber ?? this._activeRange?.startLineNumber ?? this._editor.getPosition()?.lineNumber ?? 1;
++		const decorations: IModelDeltaDecoration[] = [];
++		let lineOffset = 0;
++
++		for (const hunk of hunks) {
++			const lineNum = Math.max(1, Math.min(model.getLineCount(), hunk.lineNumber ?? (baseLine + lineOffset)));
++			if (hunk.kind === 'added') {
++				decorations.push({
++					range: new Range(lineNum, 1, lineNum, 1),
++					options: ADDED_LINE_DECORATION,
++				});
++			} else if (hunk.kind === 'removed') {
++				decorations.push({
++					range: new Range(lineNum, 1, lineNum, 1),
++					options: REMOVED_LINE_DECORATION,
++				});
++			}
++			lineOffset++;
++		}
++
++		this._diffDecorations.set(decorations);
++		this._widget.value?.setPreviewHunks(hunks);
++	}
++
++	clearDiffPreview(): void {
++		this._diffDecorations.clear();
++		this._widget.value?.clearPreview();
++	}
++
++	async acceptInlineEdit(): Promise<void> {
++		this.hide();
++		this._editor.focus();
++		await this._commandService.executeCommand('rursor.acceptInlineEdit').catch(() => undefined);
++	}
++
++	async revertInlineEdit(): Promise<void> {
++		this.hide();
++		this._editor.focus();
++		await this._commandService.executeCommand('rursor.revertInlineEdit').catch(() => undefined);
++	}
++
++	private async _handleSubmit(prompt: string): Promise<void> {
++		const range = this._activeRange;
++		const uri = this._editor.getModel()?.uri;
++
++		this.setStreamingState(true, localize('rursor.inline.running', "Running Rursor edit…"));
++		if (range) {
++			this._editor.setSelection(range);
++		}
++		this._editor.focus();
++
++		try {
++			await this._commandService.executeCommand('rursor.inlineEdit', {
++				prompt,
++				range: range ? {
++					startLineNumber: range.startLineNumber,
++					startColumn: range.startColumn,
++					endLineNumber: range.endLineNumber,
++					endColumn: range.endColumn,
++				} : undefined,
++				uri: uri?.toString(),
++			});
++		} finally {
++			this.setStreamingState(false);
++		}
++	}
++}
++
++class RursorShowInlineEditWidgetAction extends EditorAction {
++	constructor() {
++		super({
++			id: 'rursor.action.inlineEditWidget',
++			label: localize2('rursor.action.inlineEditWidget', "Rursor: Open Native Inline Edit Widget"),
++			precondition: EditorContextKeys.writable,
++			kbOpts: {
++				kbExpr: EditorContextKeys.editorTextFocus,
++				primary: KeyMod.CtrlCmd | KeyMod.Shift | KeyCode.KeyK,
++				weight: KeybindingWeight.EditorContrib,
++			}
++		});
++	}
++
++	override run(_accessor: ServicesAccessor, editor: ICodeEditor): void {
++		RursorInlineEditController.get(editor)?.show();
++	}
++}
++
++class RursorAcceptInlineEditWidgetAction extends EditorAction {
++	constructor() {
++		super({
++			id: 'rursor.action.acceptInlineEditWidget',
++			label: localize2('rursor.action.acceptInlineEditWidget', "Rursor: Accept Native Inline Edit"),
++			precondition: RursorInlineEditVisible,
++			kbOpts: {
++				kbExpr: RursorInlineEditVisible,
++				primary: KeyMod.CtrlCmd | KeyCode.KeyY,
++				weight: KeybindingWeight.EditorContrib + 10,
++			}
++		});
++	}
++
++	override run(_accessor: ServicesAccessor, editor: ICodeEditor): void {
++		void RursorInlineEditController.get(editor)?.acceptInlineEdit();
++	}
++}
++
++class RursorRevertInlineEditWidgetAction extends EditorAction {
++	constructor() {
++		super({
++			id: 'rursor.action.revertInlineEditWidget',
++			label: localize2('rursor.action.revertInlineEditWidget', "Rursor: Revert Native Inline Edit"),
++			precondition: RursorInlineEditVisible,
++			kbOpts: {
++				kbExpr: ContextKeyExpr.and(RursorInlineEditVisible),
++				primary: KeyMod.CtrlCmd | KeyCode.KeyN,
++				secondary: [KeyCode.Escape],
++				weight: KeybindingWeight.EditorContrib + 10,
++			}
++		});
++	}
++
++	override run(_accessor: ServicesAccessor, editor: ICodeEditor): void {
++		void RursorInlineEditController.get(editor)?.revertInlineEdit();
++	}
++}
++
++CommandsRegistry.registerCommand('rursor.inlineEdit.showWidget', (accessor, initialPrompt?: string) => {
++	const codeEditorService = accessor.get(ICodeEditorService);
++	const editor = codeEditorService.getFocusedCodeEditor() ?? codeEditorService.getActiveCodeEditor();
++	if (editor) {
++		RursorInlineEditController.get(editor)?.show(typeof initialPrompt === 'string' ? initialPrompt : undefined);
++	}
++});
++
++CommandsRegistry.registerCommand('rursor.inlineEdit.hideWidget', (accessor) => {
++	const codeEditorService = accessor.get(ICodeEditorService);
++	const editor = codeEditorService.getFocusedCodeEditor() ?? codeEditorService.getActiveCodeEditor();
++	if (editor) {
++		RursorInlineEditController.get(editor)?.hide();
++	}
++});
++
++CommandsRegistry.registerCommand('rursor.inlineEdit.updateDiffPreview', (accessor, payload?: { hunks?: IRursorDiffHunk[]; startLineNumber?: number; streaming?: boolean; statusText?: string }) => {
++	const codeEditorService = accessor.get(ICodeEditorService);
++	const editor = codeEditorService.getFocusedCodeEditor() ?? codeEditorService.getActiveCodeEditor();
++	const controller = editor ? RursorInlineEditController.get(editor) : null;
++	if (!controller || !payload) {
++		return;
++	}
++	if (typeof payload.streaming === 'boolean') {
++		controller.setStreamingState(payload.streaming, payload.statusText);
++	}
++	if (Array.isArray(payload.hunks)) {
++		controller.updateDiffPreview(payload.hunks, payload.startLineNumber);
++	}
++});
++
++registerEditorContribution(RursorInlineEditController.ID, RursorInlineEditController, EditorContributionInstantiation.Lazy);
++registerEditorAction(RursorShowInlineEditWidgetAction);
++registerEditorAction(RursorAcceptInlineEditWidgetAction);
++registerEditorAction(RursorRevertInlineEditWidgetAction);
+diff --git a/src/vs/editor/editor.all.ts b/src/vs/editor/editor.all.ts
+index 3af59c9..b4279ce 100644
+--- a/src/vs/editor/editor.all.ts
++++ b/src/vs/editor/editor.all.ts
+@@ -61,6 +61,7 @@ import './contrib/wordOperations/browser/wordOperations.js';
+ import './contrib/wordPartOperations/browser/wordPartOperations.js';
+ import './contrib/readOnlyMessage/browser/contribution.js';
+ import './contrib/diffEditorBreadcrumbs/browser/contribution.js';
++import './contrib/rursorInlineEdit/browser/rursorInlineEdit.js';
+ 
+ // Load up these strings even in VSCode, even if they are not used
+ // in order to get them translated

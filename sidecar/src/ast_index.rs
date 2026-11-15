@@ -83,6 +83,7 @@ pub struct SyncStats {
 #[derive(Debug)]
 pub struct AstIndex {
     conn: Connection,
+    #[allow(dead_code)]
     db_path: PathBuf,
 }
 
@@ -1135,6 +1136,7 @@ impl AstIndex {
         Ok(index)
     }
 
+    #[allow(dead_code)]
     pub fn db_path(&self) -> &Path {
         &self.db_path
     }
@@ -1601,6 +1603,7 @@ impl AstIndex {
         Ok(map)
     }
 
+    #[allow(dead_code)]
     pub fn chunk_count(&self) -> Result<usize, String> {
         let count: i64 = self
             .conn
@@ -1609,6 +1612,7 @@ impl AstIndex {
         Ok(count.max(0) as usize)
     }
 
+    #[allow(dead_code)]
     pub fn file_count(&self) -> Result<usize, String> {
         let count: i64 = self
             .conn
@@ -1889,6 +1893,42 @@ func (s *Server) Start(ctx context.Context) error {
             .find(|c| c.name == "Start" && c.kind == "method")
             .expect("Start method");
         assert!(start_chunk.calls.contains(&"listenAndServe".to_string()));
+
+        let tsx_src = r#"
+import React from "react";
+
+export function Badge({ label }: { label: string }) {
+    return renderTag(label);
+}
+"#;
+        let (tsx_imports, tsx_chunks) = parse_file_ast("src/Badge.tsx", tsx_src);
+        assert!(tsx_imports.iter().any(|i| i.contains("react")));
+        let badge_chunk = tsx_chunks
+            .iter()
+            .find(|c| c.name == "Badge" && c.kind == "function")
+            .expect("Badge TSX component");
+        assert!(badge_chunk.calls.contains(&"renderTag".to_string()));
+
+        let js_src = r#"
+class EventBus {
+    emit(name) {
+        notifyListeners(name);
+    }
+}
+"#;
+        let (_, js_chunks) = parse_file_ast("src/bus.js", js_src);
+        assert!(js_chunks
+            .iter()
+            .any(|c| c.name == "EventBus" && c.kind == "class"));
+        let emit_chunk = js_chunks
+            .iter()
+            .find(|c| c.name == "emit" && c.kind == "method")
+            .expect("emit JS method");
+        assert!(emit_chunk.calls.contains(&"notifyListeners".to_string()));
+
+        let (_, md_chunks) = parse_file_ast("README.md", "# Title\nSome documentation text.\n");
+        assert_eq!(md_chunks.len(), 1);
+        assert_eq!(md_chunks[0].kind, "chunk");
     }
 
     #[test]
@@ -1935,9 +1975,12 @@ pub fn compute_matrix_determinant(size: usize) -> f64 {
         assert_eq!(outline[0].name, "verify_jwt_token");
         assert_eq!(outline[1].name, "decode_claims");
 
-        // Test custom embedding upsert.
+        // Test custom embedding upsert and count helpers.
         let custom_vec = compute_local_embedding("custom semantic embedding");
         assert!(idx.upsert_chunk_embedding(hits[0].chunk_id, &custom_vec).unwrap());
+        assert_eq!(idx.file_count().unwrap(), 2);
+        assert_eq!(idx.chunk_count().unwrap(), 3);
+        assert_eq!(idx.db_path(), Path::new(":memory:"));
     }
 
     #[test]

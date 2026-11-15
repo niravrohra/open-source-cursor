@@ -31,12 +31,17 @@ pub struct RpcEvent {
 #[serde(rename_all = "camelCase")]
 pub struct SetConfigParams {
     pub api_key: Option<String>,
+    pub anthropic_api_key: Option<String>,
+    pub openai_api_key: Option<String>,
     pub model: Option<String>,
     pub autocomplete_model: Option<String>,
     pub autocomplete_backend: Option<String>,
     pub local_endpoint: Option<String>,
     pub local_model: Option<String>,
     pub workspace_root: Option<String>,
+    pub thinking_budget: Option<u32>,
+    pub enable_prompt_cache: Option<bool>,
+    pub auto_verify: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -153,6 +158,125 @@ pub struct AgentChatParams {
     #[serde(default = "default_mode")]
     pub mode: String,
     pub model: Option<String>,
+    #[serde(default)]
+    pub auto_verify: Option<bool>,
+    #[serde(default)]
+    pub thinking_budget: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NextEditPredictParams {
+    pub file_path: String,
+    pub language_id: String,
+    #[serde(default)]
+    pub window_before: String,
+    #[serde(default)]
+    pub focus_block: String,
+    #[serde(default)]
+    pub window_after: String,
+    #[serde(default = "default_one")]
+    pub focus_start_line: usize,
+    #[serde(default)]
+    pub recent_edits: Vec<String>,
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FindCallersParams {
+    pub symbol: String,
+    #[serde(default = "default_grep_limit")]
+    pub limit: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileOutlineParams {
+    pub path: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveMemoryParams {
+    #[serde(default = "default_workspace_scope")]
+    pub scope: String,
+    #[serde(default = "default_memory_category")]
+    pub category: String,
+    pub content: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteMemoryParams {
+    pub id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateCheckpointParams {
+    pub label: String,
+    #[serde(default)]
+    pub paths: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RestoreCheckpointParams {
+    pub checkpoint_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateWorktreeParams {
+    pub task_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorktreePathParams {
+    pub worktree_path: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MergeWorktreeParams {
+    pub branch_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunPtyCommandParams {
+    pub command: String,
+    pub cwd: Option<String>,
+    pub timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartBgProcessParams {
+    pub command: String,
+    pub cwd: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BgProcessIdParams {
+    pub proc_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WriteBgProcessParams {
+    pub proc_id: String,
+    pub input: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunParallelSubagentsParams {
+    pub tasks: Value,
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -181,6 +305,18 @@ pub struct SaveSessionParams {
 #[serde(rename_all = "camelCase")]
 pub struct CancelParams {
     pub request_id: u64,
+}
+
+fn default_one() -> usize {
+    1
+}
+
+fn default_workspace_scope() -> String {
+    "workspace".to_string()
+}
+
+fn default_memory_category() -> String {
+    "general".to_string()
 }
 
 fn default_limit() -> usize {

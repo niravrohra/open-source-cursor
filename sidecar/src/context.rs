@@ -1,8 +1,14 @@
+#[path = "ast_index.rs"]
+pub mod ast_index;
+
+use ast_index::{parse_chunks, AstChunk, AstIndex, CallerHit, SyncCandidate};
 use serde::Serialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAX_FILE_BYTES: u64 = 512 * 1024;
 const MAX_INDEXED_FILES: usize = 8_000;
@@ -62,6 +68,13 @@ pub struct WorkspaceIndex {
     pub root: Option<PathBuf>,
     pub files: Vec<IndexedFile>,
     gitignore_rules: Vec<GitIgnoreRule>,
+    ast_index: Option<Arc<Mutex<AstIndex>>>,
+}
+
+struct WalkedFile {
+    rel_path: String,
+    mtime_ns: i64,
+    content: String,
 }
 
 fn ignored_dir_names() -> HashSet<&'static str> {
@@ -83,28 +96,112 @@ fn ignored_dir_names() -> HashSet<&'static str> {
     .collect()
 }
 
+fn metadata_mtime_ns(meta: &fs::Metadata) -> i64 {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
+fn now_mtime_ns() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
+fn chunks_to_symbol_infos(chunks: &[AstChunk]) -> Vec<SymbolInfo> {
+    chunks
+        .iter()
+        .filter(|c| c.kind != "chunk" && c.kind != "module")
+        .take(120)
+        .map(|c| SymbolInfo {
+            name: c.name.clone(),
+            kind: c.kind.clone(),
+            line: c.start_line,
+        })
+        .collect()
+}
+
 impl WorkspaceIndex {
     pub fn index_directory(&mut self, root: &Path) -> Result<usize, String> {
         if !root.is_dir() {
             return Err(format!("Workspace root is not a directory: {}", root.display()));
         }
-
         let canonical_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-        let ignore_names = ignored_dir_names();
+        let ast = AstIndex::open_for_workspace(&canonical_root)
+            .or_else(|_| AstIndex::open_in_memory())?;
+        self.index_directory_inner(&canonical_root, ast)
+    }
 
+    pub fn index_directory_with_db(&mut self, root: &Path, db_path: &Path) -> Result<usize, String> {
+        if !root.is_dir() {
+            return Err(format!("Workspace root is not a directory: {}", root.display()));
+        }
+        let canonical_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        let ast = AstIndex::open_at(db_path)?;
+        self.index_directory_inner(&canonical_root, ast)
+    }
+
+    fn index_directory_inner(
+        &mut self,
+        canonical_root: &Path,
+        mut ast: AstIndex,
+    ) -> Result<usize, String> {
+        let ignore_names = ignored_dir_names();
         let mut rules = Vec::new();
-        let mut collected = Vec::new();
+        let mut walked = Vec::new();
         walk_dir(
-            &canonical_root,
-            &canonical_root,
+            canonical_root,
+            canonical_root,
             &ignore_names,
             &mut rules,
-            &mut collected,
+            &mut walked,
         );
 
-        self.root = Some(canonical_root);
+        let candidates: Vec<SyncCandidate> = walked
+            .iter()
+            .map(|f| SyncCandidate {
+                rel_path: f.rel_path.clone(),
+                mtime_ns: f.mtime_ns,
+                abs_path: None,
+                content: Some(f.content.clone()),
+            })
+            .collect();
+
+        ast.sync_incremental(&candidates)?;
+        let symbol_map = ast.load_all_symbols().unwrap_or_default();
+
+        let collected = walked
+            .into_iter()
+            .map(|f| {
+                let symbols = symbol_map
+                    .get(&f.rel_path)
+                    .map(|entries| {
+                        entries
+                            .iter()
+                            .take(120)
+                            .map(|(name, kind, line)| SymbolInfo {
+                                name: name.clone(),
+                                kind: kind.clone(),
+                                line: *line,
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                IndexedFile {
+                    rel_path: f.rel_path,
+                    content: f.content,
+                    symbols,
+                }
+            })
+            .collect();
+
+        self.root = Some(canonical_root.to_path_buf());
         self.gitignore_rules = rules;
         self.files = collected;
+        self.ast_index = Some(Arc::new(Mutex::new(ast)));
         Ok(self.files.len())
     }
 
@@ -118,12 +215,16 @@ impl WorkspaceIndex {
             return Ok(false);
         }
 
-        let content = match content_override {
+        let (content, mtime_ns) = match content_override {
             Some(c) => {
                 if c.len() as u64 > MAX_FILE_BYTES || c.as_bytes().contains(&0) {
                     return Ok(false);
                 }
-                c
+                let disk_mtime = fs::metadata(root.join(&rel_path))
+                    .ok()
+                    .map(|m| metadata_mtime_ns(&m))
+                    .unwrap_or_else(now_mtime_ns);
+                (c, disk_mtime)
             }
             None => {
                 let full_path = root.join(&rel_path);
@@ -137,12 +238,21 @@ impl WorkspaceIndex {
                 if bytes.contains(&0) {
                     return Ok(false);
                 }
-                String::from_utf8(bytes)
-                    .map_err(|_| format!("File is not valid UTF-8: {rel_path}"))?
+                let text = String::from_utf8(bytes)
+                    .map_err(|_| format!("File is not valid UTF-8: {rel_path}"))?;
+                (text, metadata_mtime_ns(&meta))
             }
         };
 
-        let symbols = extract_symbols(&content);
+        let chunks = parse_chunks(&rel_path, &content);
+        let symbols = chunks_to_symbol_infos(&chunks);
+
+        if let Some(ast) = &self.ast_index {
+            if let Ok(mut guard) = ast.lock() {
+                let _ = guard.upsert_file(&rel_path, mtime_ns, &content);
+            }
+        }
+
         if let Some(existing) = self.files.iter_mut().find(|f| f.rel_path == rel_path) {
             existing.content = content;
             existing.symbols = symbols;
@@ -165,6 +275,11 @@ impl WorkspaceIndex {
         };
         let before = self.files.len();
         self.files.retain(|f| f.rel_path != rel_path);
+        if let Some(ast) = &self.ast_index {
+            if let Ok(mut guard) = ast.lock() {
+                let _ = guard.remove_file(&rel_path);
+            }
+        }
         self.files.len() != before
     }
 
@@ -219,8 +334,69 @@ impl WorkspaceIndex {
         Ok(out)
     }
 
-    /// Weighted search combining path match, symbol definitions, and BM25-style term frequency.
+    /// Hybrid search using SQLite FTS5 BM25 + 128-dim vector cosine similarity with RRF when
+    /// backed by `AstIndex`, falling back to in-memory BM25 if not yet persisted.
     pub fn search(&self, query: &str, limit: usize) -> Vec<SearchHit> {
+        if limit == 0 || query.trim().is_empty() {
+            return Vec::new();
+        }
+
+        if let Some(ast) = &self.ast_index {
+            if let Ok(guard) = ast.lock() {
+                if let Ok(chunk_hits) = guard.search_hybrid(query, (limit * 4).max(16)) {
+                    if !chunk_hits.is_empty() {
+                        let file_map: HashMap<&str, &IndexedFile> = self
+                            .files
+                            .iter()
+                            .map(|f| (f.rel_path.as_str(), f))
+                            .collect();
+                        let mut seen_files = HashSet::new();
+                        let mut out = Vec::new();
+
+                        for hit in chunk_hits {
+                            if !seen_files.insert(hit.rel_path.clone()) {
+                                continue;
+                            }
+                            let symbols = file_map
+                                .get(hit.rel_path.as_str())
+                                .map(|f| f.symbols.iter().take(12).cloned().collect())
+                                .unwrap_or_else(|| {
+                                    vec![SymbolInfo {
+                                        name: hit.name.clone(),
+                                        kind: hit.kind.clone(),
+                                        line: hit.start_line,
+                                    }]
+                                });
+                            let preview_lines: Vec<&str> = hit.content.lines().take(20).collect();
+                            let preview = if preview_lines.is_empty() {
+                                hit.signature.clone()
+                            } else {
+                                preview_lines.join("\n")
+                            };
+                            let score = (hit.rrf_score * 10_000.0).round().max(1.0) as usize;
+                            out.push(SearchHit {
+                                path: hit.rel_path,
+                                score,
+                                preview,
+                                symbols,
+                            });
+                            if out.len() >= limit {
+                                break;
+                            }
+                        }
+
+                        if !out.is_empty() {
+                            return out;
+                        }
+                    }
+                }
+            }
+        }
+
+        self.in_memory_bm25_search(query, limit)
+    }
+
+    fn in_memory_bm25_search(&self, query: &str, limit: usize) -> Vec<SearchHit> {
         let terms: Vec<String> = query
             .split(|c: char| !c.is_alphanumeric() && c != '_')
             .filter(|t| t.len() >= 2)
@@ -239,7 +415,6 @@ impl WorkspaceIndex {
             .sum::<usize>() as f64)
             / total_docs;
 
-        // Precompute document frequencies per query term for IDF weighting.
         let dfs: Vec<usize> = terms
             .iter()
             .map(|term| {
@@ -302,6 +477,67 @@ impl WorkspaceIndex {
         scored.sort_by(|a, b| b.score.cmp(&a.score));
         scored.truncate(limit);
         scored
+    }
+
+    pub fn find_callers(&self, symbol: &str, limit: usize) -> Vec<CallerHit> {
+        if let Some(ast) = &self.ast_index {
+            if let Ok(guard) = ast.lock() {
+                if let Ok(hits) = guard.find_callers(symbol, limit) {
+                    return hits;
+                }
+            }
+        }
+
+        let needle = symbol.trim();
+        if needle.is_empty() || limit == 0 {
+            return Vec::new();
+        }
+        let mut hits = Vec::new();
+        for file in &self.files {
+            for chunk in parse_chunks(&file.rel_path, &file.content) {
+                let matched = chunk.calls.iter().any(|call| {
+                    call == needle
+                        || call.rsplit("::").next() == Some(needle)
+                        || call.rsplit('.').next() == Some(needle)
+                });
+                if matched {
+                    hits.push(CallerHit {
+                        rel_path: file.rel_path.clone(),
+                        caller_name: chunk.name,
+                        caller_kind: chunk.kind,
+                        start_line: chunk.start_line,
+                        end_line: chunk.end_line,
+                        signature: chunk.signature,
+                    });
+                    if hits.len() >= limit {
+                        return hits;
+                    }
+                }
+            }
+        }
+        hits
+    }
+
+    pub fn file_outline(&self, rel_path: &str) -> Vec<AstChunk> {
+        let normalized = rel_path
+            .trim()
+            .trim_start_matches("./")
+            .replace('\\', "/");
+
+        if let Some(ast) = &self.ast_index {
+            if let Ok(guard) = ast.lock() {
+                if let Ok(outline) = guard.file_outline(&normalized) {
+                    if !outline.is_empty() {
+                        return outline;
+                    }
+                }
+            }
+        }
+
+        if let Some(file) = self.files.iter().find(|f| f.rel_path == normalized) {
+            return parse_chunks(&file.rel_path, &file.content);
+        }
+        Vec::new()
     }
 
     pub fn search_symbols(&self, query: &str, limit: usize) -> Vec<SymbolSearchHit> {
@@ -419,6 +655,18 @@ impl WorkspaceIndex {
             rel_path: rel.to_string_lossy().replace('\\', "/"),
         })
     }
+}
+
+#[allow(dead_code)]
+pub fn format_context_block(hits: &[SearchHit]) -> String {
+    let mut out = String::new();
+    for hit in hits {
+        out.push_str(&format!(
+            "\n--- Workspace Match: {} (score {}) ---\n{}\n",
+            hit.path, hit.score, hit.preview
+        ));
+    }
+    out
 }
 
 struct ResolvedPath {
@@ -593,7 +841,7 @@ fn walk_dir(
     dir: &Path,
     ignore_names: &HashSet<&str>,
     rules: &mut Vec<GitIgnoreRule>,
-    out: &mut Vec<IndexedFile>,
+    out: &mut Vec<WalkedFile>,
 ) {
     if out.len() >= MAX_INDEXED_FILES {
         return;
@@ -645,11 +893,10 @@ fn walk_dir(
             let Ok(content) = String::from_utf8(bytes) else {
                 continue;
             };
-            let symbols = extract_symbols(&content);
-            out.push(IndexedFile {
+            out.push(WalkedFile {
                 rel_path,
+                mtime_ns: metadata_mtime_ns(&meta),
                 content,
-                symbols,
             });
         }
     }
@@ -673,7 +920,6 @@ fn extract_preview(content: &str, terms: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn make_temp_dir(name: &str) -> PathBuf {
         let nanos = SystemTime::now()
@@ -716,7 +962,8 @@ mod tests {
     #[test]
     fn respects_gitignore_rules() {
         let root = make_temp_dir("gitignore");
-        fs::write(root.join(".gitignore"), "*.log\nignored_dir/\n!keep.log\n").unwrap();
+        let db_path = root.join(".test_index.db");
+        fs::write(root.join(".gitignore"), "*.log\nignored_dir/\n!keep.log\n.test_index.db*\n").unwrap();
         fs::create_dir_all(root.join("ignored_dir")).unwrap();
         fs::write(root.join("ignored_dir/secret.txt"), "hidden").unwrap();
         fs::write(root.join("debug.log"), "skip me").unwrap();
@@ -724,7 +971,7 @@ mod tests {
         fs::write(root.join("main.rs"), "fn main() {}").unwrap();
 
         let mut index = WorkspaceIndex::default();
-        index.index_directory(&root).unwrap();
+        index.index_directory_with_db(&root, &db_path).unwrap();
         let paths = index.list_files(None, 20);
         assert!(paths.contains(&"main.rs".to_string()));
         assert!(paths.contains(&"keep.log".to_string()));
@@ -737,11 +984,12 @@ mod tests {
     #[test]
     fn read_file_blocks_path_traversal_and_upserts() {
         let root = make_temp_dir("read_confine");
+        let db_path = make_temp_dir("read_confine_db").join("index.db");
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(root.join("src/hello.txt"), "line1\nline2\nline3\n").unwrap();
 
         let mut index = WorkspaceIndex::default();
-        assert_eq!(index.index_directory(&root).unwrap(), 1);
+        assert_eq!(index.index_directory_with_db(&root, &db_path).unwrap(), 1);
 
         let content = index.read_file("src/hello.txt", Some(2), Some(3)).unwrap();
         assert_eq!(content, "2: line2\n3: line3\n");
@@ -756,5 +1004,61 @@ mod tests {
         assert_eq!(index.files.len(), 1);
 
         let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(db_path.parent().unwrap());
+    }
+
+    #[test]
+    fn workspace_index_uses_ast_hybrid_search_callers_and_outline() {
+        let root = make_temp_dir("ast_workspace");
+        let db_path = make_temp_dir("ast_workspace_db").join("index.db");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("src/auth.rs"),
+            r#"
+pub fn login(user: &str) -> bool {
+    verify_session_token(user)
+}
+
+pub fn verify_session_token(token: &str) -> bool {
+    !token.is_empty()
+}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/routes.ts"),
+            r#"
+export function handleAuthRequest(req: string): boolean {
+    return validateHeader(req);
+}
+"#,
+        )
+        .unwrap();
+
+        let mut index = WorkspaceIndex::default();
+        assert_eq!(index.index_directory_with_db(&root, &db_path).unwrap(), 2);
+
+        let hits = index.search("verify_session_token", 5);
+        assert!(!hits.is_empty());
+        assert_eq!(hits[0].path, "src/auth.rs");
+
+        let callers = index.find_callers("verify_session_token", 5);
+        assert_eq!(callers.len(), 1);
+        assert_eq!(callers[0].caller_name, "login");
+
+        let outline = index.file_outline("src/auth.rs");
+        assert_eq!(outline.len(), 2);
+        assert_eq!(outline[0].name, "login");
+        assert_eq!(outline[1].name, "verify_session_token");
+
+        let ts_syms = index.search_symbols("handleAuthRequest", 5);
+        assert_eq!(ts_syms.len(), 1);
+        assert_eq!(ts_syms[0].kind, "function");
+
+        let block = format_context_block(&hits);
+        assert!(block.contains("src/auth.rs"));
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(db_path.parent().unwrap());
     }
 }
