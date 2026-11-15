@@ -5,6 +5,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 const GEMINI_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta/models";
+const GEMINI_V1BETA_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
+const DEFAULT_EMBEDDING_MODEL: &str = "text-embedding-004";
+const DEFAULT_COMPACTION_MODEL: &str = "gemini-2.5-flash";
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -16,6 +19,14 @@ struct GeminiRequest {
     tools: Option<Vec<Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     generation_config: Option<GenerationConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cached_content: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ThinkingConfig {
+    thinking_budget: u32,
 }
 
 #[derive(Debug, Serialize)]
@@ -24,6 +35,14 @@ struct GenerationConfig {
     temperature: f32,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_output_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking_config: Option<ThinkingConfig>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct GeminiTurnOptions {
+    pub thinking_budget: Option<u32>,
+    pub cached_content: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -69,8 +88,15 @@ struct ParsedChunk {
     raw_parts: Vec<Value>,
 }
 
+#[derive(Debug, Clone)]
 pub struct GeminiClient {
     http: Client,
+}
+
+impl Default for GeminiClient {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl GeminiClient {
@@ -126,28 +152,51 @@ impl GeminiClient {
         tools: Option<Vec<Value>>,
         temperature: f32,
         max_output_tokens: Option<u32>,
+        on_chunk: F,
+    ) -> Result<GeminiTurnOutput, String>
+    where
+        F: FnMut(&str),
+    {
+        self.stream_turn_with_options(
+            api_key,
+            model,
+            system_prompt,
+            contents,
+            tools,
+            temperature,
+            max_output_tokens,
+            GeminiTurnOptions::default(),
+            on_chunk,
+        )
+        .await
+    }
+
+    /// Streams a single Gemini turn with optional thinking budget and cached context reference.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn stream_turn_with_options<F>(
+        &self,
+        api_key: &str,
+        model: &str,
+        system_prompt: Option<&str>,
+        contents: &[Value],
+        tools: Option<Vec<Value>>,
+        temperature: f32,
+        max_output_tokens: Option<u32>,
+        options: GeminiTurnOptions,
         mut on_chunk: F,
     ) -> Result<GeminiTurnOutput, String>
     where
         F: FnMut(&str),
     {
         let url = format!("{GEMINI_BASE_URL}/{model}:streamGenerateContent?alt=sse");
-
-        let system_instruction = system_prompt.map(|text| {
-            json!({
-                "parts": [{ "text": text }]
-            })
-        });
-
-        let body = GeminiRequest {
-            system_instruction,
-            contents: contents.to_vec(),
+        let body = build_gemini_request(
+            system_prompt,
+            contents,
             tools,
-            generation_config: Some(GenerationConfig {
-                temperature,
-                max_output_tokens,
-            }),
-        };
+            temperature,
+            max_output_tokens,
+            options,
+        );
 
         let resp = self
             .http
@@ -192,6 +241,221 @@ impl GeminiClient {
 
         Ok(output)
     }
+
+    /// Creates a Gemini Context Cache (`v1beta/cachedContents`) for static workspace/system context
+    /// and returns the resulting resource name (e.g. `cachedContents/...`).
+    pub async fn create_cached_content(
+        &self,
+        api_key: &str,
+        model: &str,
+        system_prompt: Option<&str>,
+        static_context: &str,
+        ttl_seconds: u64,
+    ) -> Result<String, String> {
+        let url = format!("{GEMINI_V1BETA_URL}/cachedContents");
+        let qualified_model = if model.starts_with("models/") {
+            model.to_string()
+        } else {
+            format!("models/{model}")
+        };
+
+        let mut payload = json!({
+            "model": qualified_model,
+            "contents": [{
+                "role": "user",
+                "parts": [{ "text": static_context }]
+            }],
+            "ttl": format!("{ttl_seconds}s")
+        });
+
+        if let Some(sys) = system_prompt {
+            if !sys.trim().is_empty() {
+                payload["systemInstruction"] = json!({
+                    "parts": [{ "text": sys }]
+                });
+            }
+        }
+
+        let resp = self
+            .http
+            .post(&url)
+            .header("x-goog-api-key", api_key)
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| format!("Gemini cachedContents request failed: {e}"))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let err_body = resp.text().await.unwrap_or_default();
+            return Err(format!("Gemini cachedContents API error ({status}): {err_body}"));
+        }
+
+        let val: Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("Invalid cachedContents response JSON: {e}"))?;
+        val.get("name")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| format!("Missing 'name' in cachedContents response: {val}"))
+    }
+
+    /// Compacts older conversation turns into a concise summary message via Gemini Flash
+    /// while preserving the most recent `keep_recent` messages verbatim.
+    pub async fn compact_messages(
+        &self,
+        api_key: &str,
+        model: &str,
+        messages: &[ChatMessage],
+        keep_recent: usize,
+    ) -> Result<Vec<ChatMessage>, String> {
+        if messages.len() <= keep_recent || messages.len() <= 2 {
+            return Ok(messages.to_vec());
+        }
+
+        let split_idx = messages.len().saturating_sub(keep_recent);
+        if split_idx == 0 {
+            return Ok(messages.to_vec());
+        }
+
+        let older = &messages[..split_idx];
+        let recent = &messages[split_idx..];
+
+        let mut transcript = String::new();
+        for (idx, msg) in older.iter().enumerate() {
+            transcript.push_str(&format!(
+                "[Turn {} - {}]:\n{}\n\n",
+                idx + 1,
+                msg.role,
+                msg.content
+            ));
+        }
+
+        let compaction_model = if model.trim().is_empty() {
+            DEFAULT_COMPACTION_MODEL
+        } else {
+            model
+        };
+
+        let prompt_messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: format!(
+                "Summarize the following earlier conversation turns concisely. Preserve all key technical decisions, file paths, symbol names, commands, errors, and open action items.\n\n{transcript}"
+            ),
+            images: Vec::new(),
+        }];
+
+        let summary = self
+            .stream_chat(
+                api_key,
+                compaction_model,
+                Some("You are a precise technical conversation compactor. Output a structured, factual summary only."),
+                &prompt_messages,
+                0.1,
+                Some(2048),
+                |_| {},
+            )
+            .await?;
+
+        let mut compacted = Vec::with_capacity(1 + recent.len());
+        compacted.push(ChatMessage {
+            role: "user".to_string(),
+            content: format!("[Compacted Earlier Conversation Summary]\n{}", summary.trim()),
+            images: Vec::new(),
+        });
+        compacted.extend_from_slice(recent);
+        Ok(compacted)
+    }
+
+    /// Generates a dense embedding vector using `text-embedding-004:embedContent`.
+    pub async fn embed_text(&self, api_key: &str, text: &str) -> Result<Vec<f32>, String> {
+        let url = format!("{GEMINI_BASE_URL}/{DEFAULT_EMBEDDING_MODEL}:embedContent");
+        let payload = json!({
+            "model": format!("models/{DEFAULT_EMBEDDING_MODEL}"),
+            "content": {
+                "parts": [{ "text": text }]
+            }
+        });
+
+        let resp = self
+            .http
+            .post(&url)
+            .header("x-goog-api-key", api_key)
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| format!("Gemini embedContent request failed: {e}"))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let err_body = resp.text().await.unwrap_or_default();
+            return Err(format!("Gemini embedContent API error ({status}): {err_body}"));
+        }
+
+        let val: Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("Invalid embedContent response JSON: {e}"))?;
+        let values = val
+            .get("embedding")
+            .and_then(|e| e.get("values"))
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| format!("Missing embedding.values in response: {val}"))?;
+
+        let mut out = Vec::with_capacity(values.len());
+        for item in values {
+            let num = item
+                .as_f64()
+                .ok_or_else(|| format!("Non-numeric embedding value in response: {item}"))?;
+            out.push(num as f32);
+        }
+        Ok(out)
+    }
+}
+
+fn build_gemini_request(
+    system_prompt: Option<&str>,
+    contents: &[Value],
+    tools: Option<Vec<Value>>,
+    temperature: f32,
+    max_output_tokens: Option<u32>,
+    options: GeminiTurnOptions,
+) -> GeminiRequest {
+    let system_instruction = system_prompt.map(|text| {
+        json!({
+            "parts": [{ "text": text }]
+        })
+    });
+
+    let thinking_config = options
+        .thinking_budget
+        .map(|thinking_budget| ThinkingConfig { thinking_budget });
+
+    GeminiRequest {
+        system_instruction,
+        contents: contents.to_vec(),
+        tools,
+        generation_config: Some(GenerationConfig {
+            temperature,
+            max_output_tokens,
+            thinking_config,
+        }),
+        cached_content: options.cached_content,
+    }
+}
+
+/// Estimates the total token count for a slice of chat messages using a ~4 chars/token heuristic
+/// plus per-message framing and image attachment overhead.
+pub fn estimate_messages_tokens(messages: &[ChatMessage]) -> usize {
+    messages
+        .iter()
+        .map(|msg| {
+            let text_tokens = (msg.content.chars().count() + 3) / 4;
+            let image_tokens = msg.images.len() * 258;
+            4 + text_tokens + image_tokens
+        })
+        .sum()
 }
 
 fn apply_parsed_chunk<F: FnMut(&str)>(
@@ -309,5 +573,70 @@ mod tests {
         let raw = r#"{"error":{"message":"API key not valid"}}"#;
         let err = parse_sse_data(raw).unwrap_err();
         assert!(err.contains("API key not valid"));
+    }
+
+    #[test]
+    fn estimates_tokens_for_messages_and_images() {
+        use crate::protocol::ImageAttachment;
+
+        let empty: Vec<ChatMessage> = Vec::new();
+        assert_eq!(estimate_messages_tokens(&empty), 0);
+
+        let msgs = vec![
+            ChatMessage {
+                role: "user".into(),
+                content: "12345678".into(), // 8 chars -> 2 tokens + 4 overhead = 6
+                images: vec![],
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: "abcd".into(), // 4 chars -> 1 token + 4 overhead + 258 image = 263
+                images: vec![ImageAttachment {
+                    mime_type: "image/png".into(),
+                    data: "AAAA".into(),
+                    name: None,
+                }],
+            },
+        ];
+        assert_eq!(estimate_messages_tokens(&msgs), 6 + 263);
+    }
+
+    #[test]
+    fn serializes_request_with_thinking_config_and_cached_content() {
+        let req = build_gemini_request(
+            None,
+            &[json!({ "role": "user", "parts": [{ "text": "hi" }] })],
+            None,
+            0.3,
+            Some(4096),
+            GeminiTurnOptions {
+                thinking_budget: Some(2048),
+                cached_content: Some("cachedContents/ws-ctx-1".to_string()),
+            },
+        );
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["cachedContent"], "cachedContents/ws-ctx-1");
+        assert_eq!(
+            v["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            2048
+        );
+        assert_eq!(v["generationConfig"]["maxOutputTokens"], 4096);
+        assert!(v.get("systemInstruction").is_none());
+
+        let default_req = build_gemini_request(
+            Some("Be helpful"),
+            &[json!({ "role": "user", "parts": [{ "text": "hi" }] })],
+            None,
+            0.2,
+            None,
+            GeminiTurnOptions::default(),
+        );
+        let default_v = serde_json::to_value(&default_req).unwrap();
+        assert!(default_v.get("cachedContent").is_none());
+        assert!(default_v["generationConfig"].get("thinkingConfig").is_none());
+        assert_eq!(
+            default_v["systemInstruction"]["parts"][0]["text"],
+            "Be helpful"
+        );
     }
 }
