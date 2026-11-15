@@ -168,6 +168,7 @@ impl ApfsCloneManager {
             )
         })?;
 
+        let mut nested_partial_dirs: Vec<(PathBuf, Vec<PathBuf>)> = Vec::new();
         for entry_res in read_dir {
             let entry = entry_res.map_err(|e| {
                 let _ = fs::remove_dir_all(&clone_root);
@@ -183,23 +184,53 @@ impl ApfsCloneManager {
             if entry_path == self.base_dir || entry_path == canonical_base {
                 continue;
             }
+            // Also skip `.vscode-src` / `VSCode-darwin-arm64` when nested one level deep (e.g. `fork/.vscode-src`).
+            if entry_path.is_dir()
+                && CLONE_SKIPPED_TOP_LEVEL
+                    .iter()
+                    .any(|skip| entry_path.join(skip).exists())
+            {
+                let mut sub_entries = Vec::new();
+                if let Ok(sub_dir) = fs::read_dir(&entry_path) {
+                    for sub_entry in sub_dir.flatten() {
+                        let sub_name = sub_entry.file_name();
+                        if !CLONE_SKIPPED_TOP_LEVEL.contains(&sub_name.to_string_lossy().as_ref()) {
+                            sub_entries.push(sub_entry.path());
+                        }
+                    }
+                }
+                nested_partial_dirs.push((clone_root.join(&file_name), sub_entries));
+                continue;
+            }
             entries_to_clone.push(entry_path);
         }
 
-        if !entries_to_clone.is_empty() {
-            if let Err(cow_err) = run_cp_clone(&entries_to_clone, &clone_root, true) {
-                // Clean partial destination before falling back to standard recursive copy so
-                // directories are never nested inside partially created directories.
-                let _ = fs::remove_dir_all(&clone_root);
-                fs::create_dir_all(&clone_root).map_err(|e| {
-                    format!("Failed to recreate clone directory during fallback after '{cow_err}': {e}")
-                })?;
-                if let Err(fallback_err) = run_cp_clone(&entries_to_clone, &clone_root, false) {
-                    let _ = fs::remove_dir_all(&clone_root);
-                    return Err(format!(
-                        "Failed to clone workspace (CoW error: {cow_err}; fallback copy error: {fallback_err})"
-                    ));
+        let clone_all = |use_cow: bool| -> Result<(), String> {
+            if !entries_to_clone.is_empty() {
+                run_cp_clone(&entries_to_clone, &clone_root, use_cow)?;
+            }
+            for (dest_subdir, sub_entries) in &nested_partial_dirs {
+                fs::create_dir_all(dest_subdir)
+                    .map_err(|e| format!("Failed creating '{}': {e}", dest_subdir.display()))?;
+                if !sub_entries.is_empty() {
+                    run_cp_clone(sub_entries, dest_subdir, use_cow)?;
                 }
+            }
+            Ok(())
+        };
+
+        if let Err(cow_err) = clone_all(true) {
+            // Clean partial destination before falling back to standard recursive copy so
+            // directories are never nested inside partially created directories.
+            let _ = fs::remove_dir_all(&clone_root);
+            fs::create_dir_all(&clone_root).map_err(|e| {
+                format!("Failed to recreate clone directory during fallback after '{cow_err}': {e}")
+            })?;
+            if let Err(fallback_err) = clone_all(false) {
+                let _ = fs::remove_dir_all(&clone_root);
+                return Err(format!(
+                    "Failed to clone workspace (CoW error: {cow_err}; fallback copy error: {fallback_err})"
+                ));
             }
         }
 

@@ -2,8 +2,21 @@ import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { spawn } from 'node:child_process';
 import * as vscode from 'vscode';
+import {
+  captureDiagnostics,
+  TemporalIntentLedger,
+  waitForLspDiagnosticsDelta,
+} from './lspContext';
+import { RursorSessionBaselineTracker } from './nativeForkFeatures';
 import { SidecarClient, ToolEventPayload, ToolRequestPayload } from './sidecarClient';
+import { TelemetryTracker } from './voiceAndTelemetry';
 import { inspectWebUrl, RursorWebPreviewPanel } from './webPreview';
+
+export interface AgentPanelDeps {
+  intentLedger?: TemporalIntentLedger;
+  telemetry?: TelemetryTracker;
+  baselineTracker?: RursorSessionBaselineTracker;
+}
 
 interface ImageAttachment {
   mimeType: string;
@@ -101,8 +114,26 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
     private readonly client: SidecarClient,
     private readonly diffProvider: RursorDiffContentProvider,
     private readonly extensionUri: vscode.Uri,
-    private readonly onModelChange: (model: string) => Promise<void>
+    private readonly onModelChange: (model: string) => Promise<void>,
+    private readonly deps?: AgentPanelDeps
   ) {}
+
+  public async submitExternalPrompt(
+    prompt: string,
+    images: ImageAttachment[] = [],
+    mode: 'agent' | 'ask' = 'agent'
+  ): Promise<void> {
+    await vscode.commands.executeCommand('rursor.openAgent');
+    void this.view?.webview.postMessage({
+      type: 'externalUserMessage',
+      text: prompt,
+      images,
+    });
+    const autoVerify = vscode.workspace
+      .getConfiguration('rursor')
+      .get<boolean>('agent.autoVerify', false);
+    await this.handleUserPrompt(prompt, images, mode, true, false, false, autoVerify);
+  }
 
   resolveWebviewView(webviewView: vscode.WebviewView): void {
     this.view = webviewView;
@@ -156,6 +187,8 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
           await this.deleteCurrentSession();
         } else if (msg.type === 'setKey') {
           await vscode.commands.executeCommand('rursor.setApiKey');
+        } else if (msg.type === 'openSettings') {
+          await vscode.commands.executeCommand('rursor.openSettings');
         } else if (msg.type === 'modelChanged' && msg.model) {
           await this.onModelChange(msg.model);
         } else if (msg.type === 'pickFile') {
@@ -530,6 +563,17 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
     const diagnostics = collectWorkspaceDiagnostics();
     const cfg = vscode.workspace.getConfiguration('rursor');
     const thinkingBudget = cfg.get<number>('agent.thinkingBudget', 0);
+    const activeModel = model ?? cfg.get<string>('defaultModel', 'gemini-2.5-flash');
+    const developerIntent = this.deps?.intentLedger?.formatRecentIntent() || undefined;
+    const estInputChars =
+      this.history.reduce((acc, m) => acc + m.content.length, 0) +
+      contextFiles.reduce((acc, c) => acc + c.content.length, 0);
+    const turnTimer = this.deps?.telemetry?.startTurn(
+      mode,
+      activeModel,
+      Math.ceil(estInputChars / 4),
+      0
+    );
 
     const { id, promise } = this.client.request<{ text: string }>(
       'agent_chat',
@@ -542,6 +586,7 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
         })),
         contextFiles,
         diagnostics,
+        developerIntent,
         useWorkspaceSearch: includeWorkspace,
         includeGitDiff,
         autoVerify: autoVerify || cfg.get<boolean>('agent.autoVerify', false),
@@ -551,6 +596,7 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
       },
       {
         onStream: (delta) => {
+          turnTimer?.markFirstToken();
           void this.view?.webview.postMessage({ type: 'delta', text: delta });
         },
         onToolEvent: (ev) => {
@@ -571,6 +617,7 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
     this.activeRequestId = id;
     try {
       const result = await promise;
+      turnTimer?.finish(result.text.length);
       this.history.push({ role: 'assistant', content: result.text });
       void this.view?.webview.postMessage({ type: 'done' });
       void this.refreshSessions();
@@ -731,6 +778,32 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
       afterContent = String(req.args.content ?? '');
     }
 
+    // Stage 1: Pre-write Tree-sitter syntax gate (<2ms in Rust sidecar) before touching disk.
+    try {
+      const { promise: syntaxPromise } = this.client.request<{
+        validation?: { supported?: boolean; valid?: boolean; message?: string };
+      }>('validate_syntax', {
+        path: relPath,
+        before: beforeContent,
+        after: afterContent,
+      });
+      const syntaxRes = await syntaxPromise;
+      if (syntaxRes.validation?.supported && syntaxRes.validation.valid === false) {
+        await this.client.submitToolResult(req.callId, false, {
+          syntaxError: true,
+          error:
+            syntaxRes.validation.message ||
+            `Proposed edit to '${relPath}' introduced Tree-sitter syntax errors. Fix the syntax and retry.`,
+        });
+        return;
+      }
+    } catch {
+      // Proceed if syntax gate RPC is unavailable
+    }
+
+    const fileUri = vscode.Uri.file(absPath);
+    this.deps?.baselineTracker?.recordBaselineBeforeEdit(fileUri, beforeContent);
+
     const beforeUri = vscode.Uri.parse(`rursor-diff:/${req.callId}/before/${relPath}`);
     const afterUri = vscode.Uri.parse(`rursor-diff:/${req.callId}/after/${relPath}`);
     this.diffProvider.setContent(beforeUri, beforeContent);
@@ -750,8 +823,11 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
 
     if (autoApply) {
       try {
+        const diagBefore = captureDiagnostics(fileUri);
         await applyFileWrite(absPath, afterContent);
         await this.refreshSidecarFile(absPath, afterContent);
+        this.deps?.baselineTracker?.markFileModified(fileUri, afterContent);
+        const diagDelta = await waitForLspDiagnosticsDelta(fileUri, diagBefore, 220);
         snapshot.status = 'applied';
         this.syncReviewBar();
         void this.view?.webview.postMessage({
@@ -768,6 +844,10 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
         await this.client.submitToolResult(req.callId, true, {
           applied: true,
           path: relPath,
+          ...(diagDelta.introduced.length > 0
+            ? { introducedDiagnostics: diagDelta.summary }
+            : {}),
+          resolvedDiagnostics: diagDelta.resolved.length,
         });
       } catch (err) {
         snapshot.status = 'error';
@@ -813,8 +893,11 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
     }
 
     try {
+      const diagBefore = captureDiagnostics(fileUri);
       await applyFileWrite(absPath, afterContent);
       await this.refreshSidecarFile(absPath, afterContent);
+      this.deps?.baselineTracker?.markFileModified(fileUri, afterContent);
+      const diagDelta = await waitForLspDiagnosticsDelta(fileUri, diagBefore, 220);
       snapshot.status = snapshot.autoAcceptOnApply ? 'accepted' : 'applied';
       this.syncReviewBar();
       void this.view?.webview.postMessage({
@@ -825,6 +908,10 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
       await this.client.submitToolResult(req.callId, true, {
         applied: true,
         path: relPath,
+        ...(diagDelta.introduced.length > 0
+          ? { introducedDiagnostics: diagDelta.summary }
+          : {}),
+        resolvedDiagnostics: diagDelta.resolved.length,
       });
     } catch (err) {
       snapshot.status = 'error';
@@ -973,6 +1060,7 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
       } else {
         await applyFileWrite(snap.absPath, snap.beforeContent);
         await this.refreshSidecarFile(snap.absPath, snap.beforeContent);
+        this.deps?.baselineTracker?.markFileModified(snap.absPath, snap.beforeContent);
       }
       snap.status = 'reverted';
       this.syncReviewBar();
@@ -1472,11 +1560,18 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
         const imgsDiv = document.createElement('div');
         imgsDiv.className = 'msg-images';
         for (const img of images) {
-          const el = document.createElement('img');
-          el.src = 'data:' + img.mimeType + ';base64,' + img.data;
-          el.alt = img.name || 'image';
-          el.title = img.name || 'image';
-          imgsDiv.appendChild(el);
+          if (typeof img.mimeType === 'string' && img.mimeType.startsWith('audio/')) {
+            const badge = document.createElement('span');
+            badge.className = 'chip';
+            badge.textContent = '🎤 ' + (img.name || 'Voice Recording');
+            imgsDiv.appendChild(badge);
+          } else {
+            const el = document.createElement('img');
+            el.src = 'data:' + img.mimeType + ';base64,' + img.data;
+            el.alt = img.name || 'image';
+            el.title = img.name || 'image';
+            imgsDiv.appendChild(el);
+          }
         }
         div.appendChild(imgsDiv);
       }
@@ -1950,6 +2045,10 @@ export class AgentPanelProvider implements vscode.WebviewViewProvider {
       activeAssistantRaw += msg.text;
       activeAssistantEl.innerHTML = renderMarkdown(activeAssistantRaw);
       messagesEl.scrollTop = messagesEl.scrollHeight;
+    } else if (msg.type === 'externalUserMessage') {
+      addMessage('user', msg.text || '', msg.images || []);
+      activeAssistantEl = addMessage('assistant', '');
+      activeAssistantRaw = '';
     } else if (msg.type === 'done') {
       if (activeAssistantEl && !activeAssistantRaw.trim()) {
         activeAssistantEl.remove();

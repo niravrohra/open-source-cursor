@@ -163,6 +163,33 @@
       "description": "Verify `save_session` -> `load_session` -> `delete_session` integrity & latency."
     },
     {
+      "id": "ast_syntax_gate_roundtrip",
+      "category": "syntax_gate",
+      "kind": "syntax_gate_check",
+      "description": "Verify Tree-sitter AST pre-write `validate_syntax` accepts valid code and catches broken syntax."
+    },
+    {
+      "id": "pagerank_repomap_generation",
+      "category": "repomap",
+      "kind": "repo_map_check",
+      "focusFiles": ["extension/src/extension.ts", "sidecar/src/main.rs"],
+      "tokenBudget": 1200,
+      "expectedSubstring": "SidecarClient",
+      "description": "Generate Personalized PageRank `repo_map` across indexed symbol graph."
+    },
+    {
+      "id": "seatbelt_command_classifier",
+      "category": "sandbox",
+      "kind": "seatbelt_classify_check",
+      "description": "Verify macOS Seatbelt command risk classifier (`safe` vs `destructive`)."
+    },
+    {
+      "id": "apfs_cow_clone_roundtrip",
+      "category": "apfs_cow",
+      "kind": "cow_clone_roundtrip",
+      "description": "Measure APFS Copy-on-Write (`cp -c -R`) clone -> isolated mutation -> diff -> destroy round-trip."
+    },
+    {
       "id": "live_gemini_inline_edit_clamp",
       "category": "live_gemini",
       "kind": "live_inline_edit",

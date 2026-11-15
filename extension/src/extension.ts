@@ -2,7 +2,11 @@ import * as vscode from 'vscode';
 import { AgentPanelProvider, RursorDiffContentProvider } from './agentPanel';
 import { registerInlineCompletionCommands, RursorInlineCompletionProvider } from './inlineCompletion';
 import { InlineEditSessionManager, RursorCodeActionProvider } from './inlineEdit';
+import { TemporalIntentLedger } from './lspContext';
+import { registerNativeForkFeatures } from './nativeForkFeatures';
+import { RursorSettingsPanel } from './settingsPanel';
 import { SidecarClient } from './sidecarClient';
+import { registerVoiceAndTelemetry } from './voiceAndTelemetry';
 import { RursorWebPreviewPanel } from './webPreview';
 
 const SECRET_GEMINI_KEY = 'rursor.geminiApiKey';
@@ -13,10 +17,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const client = new SidecarClient(context.extensionPath);
   context.subscriptions.push(client);
 
+  const intentLedger = new TemporalIntentLedger();
+  context.subscriptions.push(intentLedger);
+
   const mainStatus = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
   mainStatus.text = '$(sparkle) Rursor';
-  mainStatus.tooltip = 'Click to view Rursor Sidecar status';
-  mainStatus.command = 'rursor.status';
+  mainStatus.tooltip = 'Open Rursor Settings (Cmd+Shift+J)';
+  mainStatus.command = 'rursor.openSettings';
   mainStatus.show();
   context.subscriptions.push(mainStatus);
 
@@ -27,13 +34,30 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       .getConfiguration('rursor')
       .get<boolean>('autocomplete.enabled', true);
     tabStatus.text = enabled ? '$(zap) Tab: On' : '$(circle-slash) Tab: Off';
-    tabStatus.tooltip = 'Toggle Rursor Tab Autocomplete';
+    tabStatus.tooltip = 'Toggle Rursor Tab & Next-Edit Autocomplete';
   };
   refreshTabStatus();
   tabStatus.show();
   context.subscriptions.push(tabStatus);
 
   let agentProvider: AgentPanelProvider | undefined;
+
+  const { telemetry } = registerVoiceAndTelemetry(context, client, async (payload) => {
+    if (!agentProvider) {
+      return;
+    }
+    await agentProvider.submitExternalPrompt(
+      payload.formattedPrompt,
+      [
+        {
+          mimeType: payload.inlineData.mimeType,
+          data: payload.inlineData.data,
+          name: `voice-${Math.max(1, Math.round(payload.durationMs / 1000))}s.wav`,
+        },
+      ],
+      'agent'
+    );
+  });
 
   const syncConfig = async (modelOverride?: string): Promise<void> => {
     const cfg = vscode.workspace.getConfiguration('rursor');
@@ -51,6 +75,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     const thinkingBudget = cfg.get<number>('agent.thinkingBudget', 0);
     const enablePromptCache = cfg.get<boolean>('agent.promptCache', true);
     const autoVerify = cfg.get<boolean>('agent.autoVerify', false);
+    const permissionProfile = cfg.get<string>('agent.permissionProfile', 'safe-auto');
+    const sandboxAllowNetwork = cfg.get<boolean>('agent.sandboxAllowNetwork', false);
+
     const { promise } = client.request('set_config', {
       apiKey,
       anthropicApiKey,
@@ -63,6 +90,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       thinkingBudget,
       enablePromptCache,
       autoVerify,
+      permissionProfile,
+      sandboxAllowNetwork,
       workspaceRoot,
     });
     await promise.catch(() => undefined);
@@ -77,7 +106,21 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     vscode.workspace.registerTextDocumentContentProvider('rursor-diff', diffProvider)
   );
 
-  const inlineEditManager = new InlineEditSessionManager(client);
+  const inlineEditManager = new InlineEditSessionManager(client, {
+    intentLedger,
+    telemetry,
+  });
+
+  const baselineTracker = registerNativeForkFeatures(context, client, {
+    onTriggerAgentPrompt: async (prompt) => {
+      await agentProvider?.submitExternalPrompt(prompt, [], 'agent');
+    },
+    onRunInlineEditWithInstruction: async (instruction) => {
+      await inlineEditManager.runInlineEdit(instruction);
+    },
+  });
+  inlineEditManager.setBaselineTracker(baselineTracker);
+
   context.subscriptions.push(
     inlineEditManager,
     vscode.languages.registerCodeLensProvider({ scheme: 'file' }, inlineEditManager),
@@ -88,16 +131,29 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     )
   );
 
-  const completionProvider = new RursorInlineCompletionProvider(client);
+  const completionProvider = new RursorInlineCompletionProvider(client, {
+    intentLedger,
+    telemetry,
+  });
   context.subscriptions.push(
     completionProvider,
     vscode.languages.registerInlineCompletionItemProvider({ pattern: '**' }, completionProvider)
   );
   registerInlineCompletionCommands(context, completionProvider);
 
-  agentProvider = new AgentPanelProvider(client, diffProvider, context.extensionUri, async (model) => {
-    await syncConfig(model);
-  });
+  agentProvider = new AgentPanelProvider(
+    client,
+    diffProvider,
+    context.extensionUri,
+    async (model) => {
+      await syncConfig(model);
+    },
+    {
+      intentLedger,
+      telemetry,
+      baselineTracker,
+    }
+  );
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider(AgentPanelProvider.viewType, agentProvider, {
       webviewOptions: { retainContextWhenHidden: true },
@@ -134,6 +190,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   );
 
   context.subscriptions.push(
+    vscode.commands.registerCommand('rursor.openSettings', () => {
+      RursorSettingsPanel.openOrShow(context, client, () => syncConfig());
+    }),
     vscode.commands.registerCommand('rursor.setApiKey', async () => {
       const key = await vscode.window.showInputBox({
         title: 'Set Gemini Cloud API Key',
@@ -196,18 +255,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     vscode.commands.registerCommand('rursor.inlineEdit', async (arg?: unknown) => {
       await inlineEditManager.runInlineEdit(
         arg as
-        | string
-        | {
-          prompt?: string;
-          range?: {
-            startLineNumber: number;
-            startColumn: number;
-            endLineNumber: number;
-            endColumn: number;
-          };
-          uri?: string;
-        }
-        | undefined
+          | string
+          | {
+              prompt?: string;
+              range?: {
+                startLineNumber: number;
+                startColumn: number;
+                endLineNumber: number;
+                endColumn: number;
+              };
+              uri?: string;
+            }
+          | undefined
       );
     }),
     vscode.commands.registerCommand('rursor.openPreview', () => {
@@ -313,6 +372,101 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         );
       }
     }),
+    vscode.commands.registerCommand('rursor.manageCowClones', async () => {
+      try {
+        const action = await vscode.window.showQuickPick(
+          [
+            'Create APFS Copy-on-Write Sandbox',
+            'Diff APFS Sandbox',
+            'Apply APFS Sandbox Back to Workspace',
+            'Destroy APFS Sandbox',
+          ],
+          { placeHolder: 'Rursor macOS APFS Copy-on-Write Sandboxes' }
+        );
+        if (!action) {
+          return;
+        }
+        if (action === 'Create APFS Copy-on-Write Sandbox') {
+          const taskLabel = await vscode.window.showInputBox({
+            title: 'Create macOS APFS Copy-on-Write Sandbox',
+            prompt: 'Short task slug (uses instant APFS cp -c -R clonefile)',
+          });
+          if (!taskLabel?.trim()) {
+            return;
+          }
+          const { promise } = client.request<{
+            clone: { cloneId: string; cloneRoot: string };
+          }>('create_cow_clone', { taskLabel: taskLabel.trim() });
+          const created = await promise;
+          vscode.window.showInformationMessage(
+            `Created APFS CoW sandbox ${created.clone.cloneId} at ${created.clone.cloneRoot}`
+          );
+          return;
+        }
+
+        const { promise: listPromise } = client.request<{
+          clones: Array<{ cloneId: string; cloneRoot: string; taskLabel: string }>;
+        }>('list_cow_clones');
+        const listRes = await listPromise;
+        const clones = listRes.clones ?? [];
+        if (clones.length === 0) {
+          vscode.window.showInformationMessage('No active APFS Copy-on-Write sandboxes found.');
+          return;
+        }
+        const picked = await vscode.window.showQuickPick(
+          clones.map((c) => ({
+            label: `${c.taskLabel} (${c.cloneId})`,
+            description: c.cloneRoot,
+            clone: c,
+          })),
+          { placeHolder: `Select APFS sandbox for: ${action}` }
+        );
+        if (!picked) {
+          return;
+        }
+
+        if (action === 'Diff APFS Sandbox') {
+          const { promise } = client.request<{
+            diffs: Array<{
+              relPath: string;
+              status: string;
+              addedLines: number;
+              removedLines: number;
+            }>;
+          }>('diff_cow_clone', { cloneId: picked.clone.cloneId });
+          const res = await promise;
+          const summary =
+            res.diffs.length === 0
+              ? '(no file differences)'
+              : res.diffs
+                  .map(
+                    (d) =>
+                      `[${d.status.padEnd(8)}] ${d.relPath} (+${d.addedLines} / -${d.removedLines})`
+                  )
+                  .join('\n');
+          const doc = await vscode.workspace.openTextDocument({
+            content: `# APFS CoW Sandbox Diff: ${picked.clone.cloneId}\n\n${summary}\n`,
+            language: 'markdown',
+          });
+          await vscode.window.showTextDocument(doc);
+        } else if (action === 'Apply APFS Sandbox Back to Workspace') {
+          const { promise } = client.request<{ appliedFiles: string[] }>('apply_cow_clone', {
+            cloneId: picked.clone.cloneId,
+          });
+          const res = await promise;
+          vscode.window.showInformationMessage(
+            `Applied ${res.appliedFiles.length} file(s) from ${picked.clone.cloneId}.`
+          );
+        } else if (action === 'Destroy APFS Sandbox') {
+          await client.request('destroy_cow_clone', { cloneId: picked.clone.cloneId }).promise;
+          vscode.window.showInformationMessage(`Destroyed APFS sandbox ${picked.clone.cloneId}.`);
+        }
+      } catch (err) {
+        vscode.window.showErrorMessage(
+          `APFS CoW sandbox error: ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
+    }),
     vscode.commands.registerCommand('rursor.fixDiagnostics', async () => {
       await inlineEditManager.runInlineEdit('Fix the diagnostics in this code');
     }),
@@ -335,7 +489,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       );
     }),
     vscode.commands.registerCommand('rursor.openAgent', async () => {
-      await vscode.commands.executeCommand('workbench.view.extension.rursor-sidebar');
+      try {
+        await vscode.commands.executeCommand('rursor.agentView.focus');
+      } catch {
+        await vscode.commands.executeCommand('workbench.view.extension.rursor-sidebar');
+      }
     }),
     vscode.commands.registerCommand('rursor.reloadMcp', async () => {
       try {
@@ -358,4 +516,4 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   );
 }
 
-export function deactivate(): void { }
+export function deactivate(): void {}
