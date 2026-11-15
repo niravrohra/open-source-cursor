@@ -12,10 +12,13 @@ cargo build --release --manifest-path "${ROOT_DIR}/sidecar/Cargo.toml"
 
 echo "=== 2. Building built-in extension (rursor-ai) ==="
 pushd "${ROOT_DIR}/extension" >/dev/null
-npm install
+if [[ ! -d node_modules ]]; then
+  npm install
+fi
 npm run compile
 mkdir -p bin
 cp "${ROOT_DIR}/sidecar/target/release/rursor-sidecar" bin/rursor-sidecar
+chmod +x bin/rursor-sidecar
 popd >/dev/null
 
 echo "=== 3. Fetching Code - OSS (${VSCODE_TAG}) ==="
@@ -27,7 +30,13 @@ echo "=== 4. Applying Rursor product.json & bundling rursor-ai ==="
 cp "${ROOT_DIR}/fork/product.json" "${VSCODE_DIR}/product.json"
 rm -rf "${VSCODE_DIR}/extensions/rursor-ai"
 mkdir -p "${VSCODE_DIR}/extensions/rursor-ai"
-cp -R "${ROOT_DIR}/extension/package.json" "${ROOT_DIR}/extension/out" "${ROOT_DIR}/extension/bin" "${VSCODE_DIR}/extensions/rursor-ai/"
+cp -R \
+  "${ROOT_DIR}/extension/package.json" \
+  "${ROOT_DIR}/extension/.vscodeignore" \
+  "${ROOT_DIR}/extension/out" \
+  "${ROOT_DIR}/extension/bin" \
+  "${VSCODE_DIR}/extensions/rursor-ai/"
+chmod +x "${VSCODE_DIR}/extensions/rursor-ai/bin/rursor-sidecar"
 
 echo "=== 5. Building Rursor.app (darwin-arm64) ==="
 pushd "${VSCODE_DIR}" >/dev/null
@@ -35,4 +44,4 @@ npm ci
 npm run gulp vscode-darwin-arm64
 popd >/dev/null
 
-echo "Build complete. Output bundle is under ${ROOT_DIR}/fork/VSCode-darwin-arm64/"
+echo "Build complete. Output bundle is under ${ROOT_DIR}/fork/VSCode-darwin-arm64/Rursor.app"

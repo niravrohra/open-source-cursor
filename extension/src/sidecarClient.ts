@@ -10,16 +10,31 @@ export interface RpcResponse<T = Record<string, unknown>> {
   error?: string;
 }
 
-export interface StreamEvent {
-  event: string;
-  requestId: number;
-  payload: { text?: string };
+export interface ToolEventPayload {
+  callId: string;
+  phase: 'start' | 'done';
+  name: string;
+  args?: Record<string, unknown>;
+  ok?: boolean;
+  output?: Record<string, unknown>;
+}
+
+export interface ToolRequestPayload {
+  callId: string;
+  name: 'edit_file' | 'write_file' | 'run_command' | string;
+  args: Record<string, unknown>;
+}
+
+export interface StreamCallbacks {
+  onStream?: (text: string) => void;
+  onToolEvent?: (payload: ToolEventPayload) => void;
+  onToolRequest?: (payload: ToolRequestPayload) => void;
 }
 
 interface PendingCall {
   resolve: (value: unknown) => void;
   reject: (reason?: unknown) => void;
-  onStream?: (text: string) => void;
+  callbacks?: StreamCallbacks;
 }
 
 export class SidecarClient implements vscode.Disposable {
@@ -27,6 +42,7 @@ export class SidecarClient implements vscode.Disposable {
   private buffer = '';
   private nextId = 1;
   private pending = new Map<number, PendingCall>();
+  private readonly outputChannel = vscode.window.createOutputChannel('Rursor AI');
 
   constructor(private readonly extensionPath: string) {}
 
@@ -50,6 +66,7 @@ export class SidecarClient implements vscode.Disposable {
     }
 
     const binPath = this.resolveBinaryPath();
+    this.outputChannel.appendLine(`[sidecar] starting ${binPath}`);
     this.proc = spawn(binPath, [], { stdio: ['pipe', 'pipe', 'pipe'] });
 
     this.proc.stdout.on('data', (chunk: Buffer) => {
@@ -65,7 +82,15 @@ export class SidecarClient implements vscode.Disposable {
       }
     });
 
-    this.proc.on('exit', () => {
+    this.proc.stderr.on('data', (chunk: Buffer) => {
+      const text = chunk.toString('utf8').trim();
+      if (text) {
+        this.outputChannel.appendLine(`[sidecar:stderr] ${text}`);
+      }
+    });
+
+    this.proc.on('exit', (code, signal) => {
+      this.outputChannel.appendLine(`[sidecar] exited (code=${code}, signal=${signal})`);
       for (const call of this.pending.values()) {
         call.reject(new Error('Rursor sidecar exited unexpectedly.'));
       }
@@ -75,17 +100,31 @@ export class SidecarClient implements vscode.Disposable {
   }
 
   private handleMessage(raw: string): void {
-    let parsed: RpcResponse & Partial<StreamEvent>;
+    let parsed: RpcResponse & { event?: string; requestId?: number; payload?: unknown };
     try {
-      parsed = JSON.parse(raw) as RpcResponse & Partial<StreamEvent>;
+      parsed = JSON.parse(raw) as RpcResponse & {
+        event?: string;
+        requestId?: number;
+        payload?: unknown;
+      };
     } catch {
       return;
     }
 
-    if (parsed.event === 'stream_chunk' && typeof parsed.requestId === 'number') {
+    if (parsed.event && typeof parsed.requestId === 'number') {
       const call = this.pending.get(parsed.requestId);
-      if (call?.onStream && parsed.payload?.text) {
-        call.onStream(parsed.payload.text);
+      if (!call?.callbacks) {
+        return;
+      }
+      if (parsed.event === 'stream_chunk') {
+        const payload = parsed.payload as { text?: string } | undefined;
+        if (payload?.text) {
+          call.callbacks.onStream?.(payload.text);
+        }
+      } else if (parsed.event === 'tool_event') {
+        call.callbacks.onToolEvent?.(parsed.payload as ToolEventPayload);
+      } else if (parsed.event === 'tool_request') {
+        call.callbacks.onToolRequest?.(parsed.payload as ToolRequestPayload);
       }
       return;
     }
@@ -107,10 +146,13 @@ export class SidecarClient implements vscode.Disposable {
   request<T = Record<string, unknown>>(
     method: string,
     params: Record<string, unknown> = {},
-    onStream?: (text: string) => void
+    callbacks?: StreamCallbacks | ((text: string) => void)
   ): { id: number; promise: Promise<T> } {
     this.start();
     const id = this.nextId++;
+    const normalizedCallbacks: StreamCallbacks | undefined =
+      typeof callbacks === 'function' ? { onStream: callbacks } : callbacks;
+
     const promise = new Promise<T>((resolve, reject) => {
       if (!this.proc) {
         reject(new Error('Failed to start rursor-sidecar.'));
@@ -119,11 +161,22 @@ export class SidecarClient implements vscode.Disposable {
       this.pending.set(id, {
         resolve: resolve as (v: unknown) => void,
         reject,
-        onStream,
+        callbacks: normalizedCallbacks,
       });
       this.proc.stdin.write(`${JSON.stringify({ id, method, params })}\n`);
     });
     return { id, promise };
+  }
+
+  async submitToolResult(
+    callId: string,
+    ok: boolean,
+    output: Record<string, unknown>
+  ): Promise<void> {
+    const { promise } = this.request('submit_tool_result', { callId, ok, output });
+    await promise.catch((err) => {
+      this.outputChannel.appendLine(`[sidecar] submit_tool_result failed: ${String(err)}`);
+    });
   }
 
   async cancel(requestId: number): Promise<void> {
@@ -138,5 +191,6 @@ export class SidecarClient implements vscode.Disposable {
     this.proc?.kill();
     this.proc = undefined;
     this.pending.clear();
+    this.outputChannel.dispose();
   }
 }

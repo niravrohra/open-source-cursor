@@ -12,7 +12,22 @@ if [[ ! -d node_modules ]]; then
   npm install
 fi
 npm run compile
+mkdir -p bin
+cp "${ROOT_DIR}/sidecar/target/debug/rursor-sidecar" bin/rursor-sidecar
+chmod +x bin/rursor-sidecar
 popd >/dev/null
 
-echo "Launching VS Code with Rursor extension development host..."
-code --extensionDevelopmentPath="${ROOT_DIR}/extension" "${ROOT_DIR}"
+if command -v code >/dev/null 2>&1; then
+  HOST_CMD="code"
+elif [[ -x "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code" ]]; then
+  HOST_CMD="/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code"
+elif [[ -x "/Applications/Antigravity IDE.app/Contents/Resources/app/bin/antigravity" ]]; then
+  HOST_CMD="/Applications/Antigravity IDE.app/Contents/Resources/app/bin/antigravity"
+else
+  echo "Neither 'code' CLI nor VS Code / Antigravity IDE CLI was found in PATH."
+  echo "Extension compiled successfully at ${ROOT_DIR}/extension/out."
+  exit 1
+fi
+
+echo "Launching ${HOST_CMD} with Rursor extension development host..."
+"${HOST_CMD}" --extensionDevelopmentPath="${ROOT_DIR}/extension" "${ROOT_DIR}"

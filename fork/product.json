@@ -5,17 +5,23 @@
   "dataFolderName": ".rursor",
   "win32MutexName": "rursor",
   "licenseName": "MIT",
+  "licenseFileName": "LICENSE.txt",
   "licenseUrl": "https://github.com/microsoft/vscode/blob/main/LICENSE.txt",
   "serverApplicationName": "rursor-server",
   "serverDataFolderName": ".rursor-server",
+  "tunnelApplicationName": "rursor-tunnel",
   "darwinBundleIdentifier": "com.rursor.editor",
   "urlProtocol": "rursor",
+  "reportIssueUrl": "https://github.com/microsoft/vscode/issues/new",
+  "nodejsRepository": "https://nodejs.org",
+  "webviewContentExternalBaseUrlTemplate": "https://{{uuid}}.vscode-cdn.net/insider/ef65ac1ba57f57f2a3961bfe94aa20481caca4c6/out/vs/workbench/contrib/webview/browser/pre/",
   "extensionsGallery": {
     "serviceUrl": "https://open-vsx.org/vscode/gallery",
     "itemUrl": "https://open-vsx.org/vscode/item",
     "resourceUrlTemplate": "https://open-vsx.org/vscode/unpkg/{publisher}/{name}/{version}/{path}",
     "controlUrl": ""
   },
+  "builtInExtensions": [],
   "extensionEnabledApiProposals": {
     "rursor.rursor-ai": [
       "inlineCompletionsAdditions"

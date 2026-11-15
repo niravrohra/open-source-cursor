@@ -1,9 +1,9 @@
 {
   "name": "rursor-ai",
   "displayName": "Rursor AI",
-  "description": "Built-in AI editing, codebase context, and Gemini-powered agent runtime for Rursor.",
+  "description": "Built-in AI editing, Tab autocomplete, codebase context, and Gemini-powered agent runtime for Rursor.",
   "publisher": "rursor",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "engines": {
     "vscode": "^1.95.0"
   },
@@ -51,6 +51,26 @@
         "title": "Rursor: Inline Edit"
       },
       {
+        "command": "rursor.fixDiagnostics",
+        "title": "Rursor: Fix Diagnostics"
+      },
+      {
+        "command": "rursor.acceptInlineEdit",
+        "title": "Rursor: Accept Inline Edit"
+      },
+      {
+        "command": "rursor.revertInlineEdit",
+        "title": "Rursor: Revert Inline Edit"
+      },
+      {
+        "command": "rursor.refineInlineEdit",
+        "title": "Rursor: Refine Inline Edit"
+      },
+      {
+        "command": "rursor.toggleAutocomplete",
+        "title": "Rursor: Toggle Tab Autocomplete"
+      },
+      {
         "command": "rursor.openAgent",
         "title": "Rursor: Open Agent Panel"
       }
@@ -66,8 +86,45 @@
         "command": "rursor.openAgent",
         "key": "cmd+l",
         "mac": "cmd+l"
+      },
+      {
+        "command": "rursor.acceptInlineEdit",
+        "key": "cmd+y",
+        "mac": "cmd+y",
+        "when": "editorTextFocus && rursor.hasActiveInlineEdit"
+      },
+      {
+        "command": "rursor.revertInlineEdit",
+        "key": "cmd+n",
+        "mac": "cmd+n",
+        "when": "editorTextFocus && rursor.hasActiveInlineEdit"
       }
-    ]
+    ],
+    "configuration": {
+      "title": "Rursor AI",
+      "properties": {
+        "rursor.defaultModel": {
+          "type": "string",
+          "default": "gemini-2.5-flash",
+          "enum": [
+            "gemini-2.5-flash",
+            "gemini-2.5-pro",
+            "gemini-2.5-flash-lite"
+          ],
+          "description": "Default Gemini model for Rursor Agent and Inline Edit."
+        },
+        "rursor.autocomplete.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable low-latency Tab ghost-text autocomplete via Gemini."
+        },
+        "rursor.autocomplete.model": {
+          "type": "string",
+          "default": "gemini-2.5-flash-lite",
+          "description": "Gemini model used for Tab autocomplete."
+        }
+      }
+    }
   },
   "scripts": {
     "compile": "tsc -p ./",
